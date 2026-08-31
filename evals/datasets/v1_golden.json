@@ -1,0 +1,31 @@
+[
+  {
+    "id": "sufficient_two_sources",
+    "goal": "比较工业视觉检测技术路线",
+    "dimensions": ["traditional", "deep_learning"],
+    "claims": [
+      {"dimension": "traditional", "accepted_evidence": 2, "independent_sources": 2},
+      {"dimension": "deep_learning", "accepted_evidence": 2, "independent_sources": 2}
+    ],
+    "expected_verdict": "write"
+  },
+  {
+    "id": "missing_independence",
+    "goal": "评估市场规模",
+    "dimensions": ["market_size"],
+    "claims": [
+      {"dimension": "market_size", "accepted_evidence": 1, "independent_sources": 1}
+    ],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "unresolved_conflict",
+    "goal": "核验增长率",
+    "dimensions": ["growth"],
+    "claims": [
+      {"dimension": "growth", "accepted_evidence": 2, "independent_sources": 2}
+    ],
+    "unresolved_conflicts": 1,
+    "expected_verdict": "continue"
+  }
+]

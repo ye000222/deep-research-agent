@@ -1,0 +1,107 @@
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from app.domain.providers import (
+    AdapterType,
+    CanonicalModelResult,
+    TokenUsage,
+    UsageAccuracy,
+)
+from app.domain.research_tools import ReadPage
+from app.infrastructure.db.run_providers import RunProviderBinding
+from app.security.secrets import SecretCipher
+from app.services.evidence_extractor import EvidenceExtractorService, source_reliability
+from pydantic import SecretStr
+
+
+class FakeBindingRepository:
+    def __init__(self, binding: RunProviderBinding) -> None:
+        self.binding = binding
+
+    async def get(self, run_id: object) -> RunProviderBinding:
+        return self.binding
+
+
+class FakeGateway:
+    async def generate_structured(self, **kwargs: object) -> CanonicalModelResult:
+        return CanonicalModelResult(
+            parsed_object={
+                "items": [
+                    {
+                        "claim": "The platform supports electronics inspection.",
+                        "exact_quote": (
+                            "The platform supports electronics inspection on production lines."
+                        ),
+                        "relation": "supports",
+                        "relevance": 0.95,
+                        "confidence": 0.9,
+                    },
+                    {
+                        "claim": "This unsupported claim is not in the page.",
+                        "exact_quote": "A quote invented by the model and absent from the source.",
+                        "relation": "supports",
+                        "relevance": 0.9,
+                        "confidence": 0.9,
+                    },
+                ]
+            },
+            usage=TokenUsage(
+                input_tokens=80,
+                output_tokens=30,
+                total_tokens=110,
+                accuracy=UsageAccuracy.EXACT,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_extractor_accepts_only_exact_quotes_present_in_source() -> None:
+    run_id = uuid4()
+    credential_id = uuid4()
+    cipher = SecretCipher(b"x" * 32)
+    encrypted = cipher.encrypt(
+        SecretStr("test-provider-key"),
+        credential_id=credential_id,
+        adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT.value,
+        credential_version=1,
+    )
+    binding = RunProviderBinding(
+        run_id=run_id,
+        goal="Research industrial inspection",
+        adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT,
+        base_url="https://api.example.com",
+        model="test-model",
+        credential_id=credential_id,
+        credential_version=1,
+        encrypted_secret=encrypted,
+    )
+    page = ReadPage(
+        final_url="https://vendor.example.com/product",
+        title="Product",
+        clean_text=(
+            "The platform supports electronics inspection on production lines. "
+            "This public product documentation describes deployment and traceability. "
+        ),
+        content_hash="a" * 64,
+        fetched_at=datetime.now(UTC),
+    )
+    service = EvidenceExtractorService(  # type: ignore[arg-type]
+        FakeBindingRepository(binding), cipher, FakeGateway()
+    )
+
+    evidence, usage, manifest = await service.extract(
+        run_id, question="Which sectors does the platform support?", page=page
+    )
+
+    assert evidence[0].accepted is True
+    assert evidence[1].accepted is False
+    assert evidence[1].rejection_reason == "quote_not_found_in_source"
+    assert usage.total_tokens == 110
+    assert manifest["selected_chars"] == len(page.clean_text)
+
+
+def test_source_reliability_is_deterministic_by_source_class() -> None:
+    assert source_reliability("https://agency.gov/report") > source_reliability(
+        "https://vendor.example/product"
+    )

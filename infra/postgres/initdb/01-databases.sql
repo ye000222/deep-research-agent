@@ -1,0 +1,1 @@
+CREATE DATABASE deep_research_checkpoint OWNER deep_research;

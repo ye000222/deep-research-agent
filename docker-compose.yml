@@ -1,0 +1,155 @@
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: deep_research
+      POSTGRES_PASSWORD: deep_research
+      POSTGRES_DB: deep_research
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deep_research -d deep_research"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      # 8080 可能被 Docker Desktop 自身占用，映射到 8081
+      - "8081:8080"
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8081/
+    volumes:
+      - ./infra/searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+  migrate:
+    image: deep-research-agent-api:local
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      APP_ENV: development
+      PYTHONPATH: /app/apps/api
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
+    command: ["alembic", "upgrade", "head"]
+    volumes:
+      - ./apps/api:/app/apps/api:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: deep-research-agent-api:local
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      APP_ENV: development
+      PYTHONPATH: /app/apps/api
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
+      CHECKPOINT_DATABASE_URI: postgresql://deep_research:deep_research@postgres:5432/deep_research_checkpoint
+      REDIS_URL: redis://redis:6379/0
+      SEARXNG_BASE_URL: http://searxng:8080
+      ARTIFACT_ROOT: /app/artifacts
+      PERSIST_PROVIDER_CREDENTIALS: "true"
+      SECRET_MASTER_KEY_FILE: /app/artifacts/.secrets/provider_master_key
+      PROVIDER_SESSION_COOKIE_NAME: dr_client_session
+      ALLOW_INSECURE_PROVIDER_ENDPOINTS: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app/apps/api:ro
+      - artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: deep-research-agent-api:local
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      APP_ENV: development
+      PYTHONPATH: /app/apps/api
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
+      CHECKPOINT_DATABASE_URI: postgresql://deep_research:deep_research@postgres:5432/deep_research_checkpoint
+      REDIS_URL: redis://redis:6379/0
+      SEARXNG_BASE_URL: http://searxng:8080
+      ARTIFACT_ROOT: /app/artifacts
+      PERSIST_PROVIDER_CREDENTIALS: "true"
+      SECRET_MASTER_KEY_FILE: /app/artifacts/.secrets/provider_master_key
+      ALLOW_INSECURE_PROVIDER_ENDPOINTS: "true"
+    command:
+      ["celery", "-A", "app.worker.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    volumes:
+      - ./apps/api:/app/apps/api:ro
+      - artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  dispatcher:
+    image: deep-research-agent-api:local
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      APP_ENV: development
+      PYTHONPATH: /app/apps/api
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
+      REDIS_URL: redis://redis:6379/0
+    command: ["python", "-m", "app.worker.dispatcher"]
+    volumes:
+      - ./apps/api:/app/apps/api:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      # 5173 可能被其他本地项目（如 bm-web 容器）占用，映射到 5174
+      - "5174:5174"
+    volumes:
+      - ./apps/web/src:/workspace/apps/web/src:ro
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  artifacts:
