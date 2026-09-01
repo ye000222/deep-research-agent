@@ -6,7 +6,7 @@ from app.domain.providers import TokenUsage, UsageAccuracy
 from app.domain.research_tools import ReadPage, SearchResult
 from app.infrastructure.db.research_tools import IterationEvaluation, ResearchTarget
 from app.llm.adapters import ModelGatewayError
-from app.services.research_loop import ResearchLoopService
+from app.services.research_loop import ResearchLoopService, _prioritize_search_results
 
 
 class FakeRepository:
@@ -159,3 +159,21 @@ async def test_retryable_model_failure_is_isolated_to_page() -> None:
 
     assert outcome == "research_stopped:ready_to_write:iterations=1:pages=2:accepted=1"
     assert repository.extraction_failures == ["MODEL_TIMEOUT"]
+
+
+def test_public_html_sources_are_read_before_paywalls_and_pdfs() -> None:
+    results = [
+        SearchResult(title="Publisher", url="https://www.sciencedirect.com/article/1", rank=1),
+        SearchResult(title="PDF", url="https://example.com/paper.pdf", rank=2),
+        SearchResult(title="Arxiv", url="https://arxiv.org/abs/2109.11304", rank=3),
+        SearchResult(title="Public page", url="https://example.org/article", rank=4),
+    ]
+
+    ordered = _prioritize_search_results(results)
+
+    assert [item.title for item in ordered] == [
+        "Arxiv",
+        "Public page",
+        "Publisher",
+        "PDF",
+    ]
