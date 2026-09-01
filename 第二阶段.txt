@@ -725,3 +725,11 @@ M5：系统加固与发布（S2-7、S2-8、S2-9）
 - Docker Desktop 真实环境严格 Gate 通过：Ruff、MyPy（99 files / 0 errors）、全量 Pytest、2 个 PostgreSQL 集成测试、Web Build、Golden Eval（13/13，1.0）和 Secret Scan（0 命中）均通过；Compose 配置通过。
 
 第二阶段 S2-0 至 S2-9 已全部完成。后续仅剩 GitHub Actions 连续三次远端通过、人工现场端到端演示和用户决定是否创建 `v1.0.0` Tag。
+
+### 2026-09-01 08:43:08（Asia/Shanghai）
+
+【CI 修复：Alembic 工作目录】
+
+- 修复 GitHub Actions 中 `alembic upgrade head` 的工作目录错误：根目录 `alembic.ini` 的 `script_location=apps/api/alembic` 必须从仓库根目录执行。
+- Integration 与 Strict Release Gate 两个 Job 均已移除 `working-directory: apps/api`，改为从仓库根目录执行迁移和 Checkpoint 初始化。
+- 本地 `.venv\Scripts\alembic.exe current` 验证为 `20260831_0016 (head)`；CI YAML 解析通过。

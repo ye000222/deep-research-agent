@@ -66,10 +66,8 @@ jobs:
               admin.close()
           PY
       - name: Apply business migrations
-        working-directory: apps/api
         run: alembic upgrade head
       - name: Initialize LangGraph PostgreSQL checkpoint schema
-        working-directory: apps/api
         run: python -m app.cli.setup_checkpoints
       - name: Run PostgreSQL integration tests
         run: pytest tests/integration -q
@@ -166,7 +164,6 @@ jobs:
               admin.close()
           PY
       - name: Apply migrations and checkpoint schema
-        working-directory: apps/api
         run: |
           alembic upgrade head
           python -m app.cli.setup_checkpoints
