@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, ValidationError
 from app.context.manager import ContextBudgetInsufficientError, ContextBudgetManager
 from app.domain.context import ContextCandidate, ContextItemType
 from app.domain.providers import CanonicalModelRequest, ContentPart, TokenUsage
-from app.evaluation.report_verifier import verify_citation_integrity
+from app.evaluation.report_verifier import verify_citation_integrity, verify_evidence_support
 from app.infrastructure.db.reports import (
     PersistedCitation,
     PersistedSection,
@@ -276,6 +276,7 @@ def assemble_report(
     fallback_reason: str | None,
 ) -> AssembledReport:
     card_by_id = {str(card.evidence_id): card for card in selected}
+    card_by_uuid = {card.evidence_id: card for card in selected}
     citation_numbers: dict[UUID, int] = {}
     citations: list[PersistedCitation] = []
 
@@ -417,6 +418,18 @@ def assemble_report(
             numeric_lines,
             (item.citation_number for item in citations),
             evidence_ids=(item.evidence_id for item in citations),
+        )
+    )
+    verification.update(
+        verify_evidence_support(
+            factual_lines,
+            {
+                citation.citation_number: (
+                    card_by_uuid[citation.evidence_id].claim,
+                    card_by_uuid[citation.evidence_id].exact_quote,
+                )
+                for citation in citations
+            },
         )
     )
     return AssembledReport(

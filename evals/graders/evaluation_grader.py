@@ -17,7 +17,24 @@ def grade_case(case: Mapping[str, object]) -> dict[str, object]:
     )
     coverage = covered / len(dimensions) if dimensions else 0.0
     conflicts = int(case.get("unresolved_conflicts", 0) or 0)
-    verdict = "write" if coverage >= 0.85 and conflicts == 0 else "continue"
+    blocked_flags = (
+        "stale_claims",
+        "scope_mismatches",
+        "search_failures",
+        "repeated_queries",
+        "low_information_gain_rounds",
+        "unsupported_citations",
+        "analysis_errors",
+    )
+    blocked = conflicts > 0 or any(int(case.get(flag, 0) or 0) > 0 for flag in blocked_flags)
+    budget_exhausted = bool(case.get("budget_exhausted", False))
+    no_evidence = bool(case.get("no_verifiable_evidence", False))
+    if no_evidence:
+        verdict = "fail"
+    elif coverage >= 0.85 and not blocked:
+        verdict = "write_limited" if budget_exhausted else "write"
+    else:
+        verdict = "continue"
     expected = str(case.get("expected_verdict", ""))
     return {
         "case_id": str(case.get("id", "")),

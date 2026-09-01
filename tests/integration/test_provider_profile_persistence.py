@@ -23,9 +23,9 @@ def _settings() -> Settings:
     return Settings(
         app_env="test",
         database_url=database_url,
-        checkpoint_database_uri=database_url.replace(
-            "postgresql+psycopg://",
-            "postgresql://",
+        checkpoint_database_uri=os.getenv(
+            "CHECKPOINT_DATABASE_URI",
+            database_url.replace("postgresql+psycopg://", "postgresql://"),
         ),
         persist_provider_credentials=True,
         secret_master_key_file=Path("artifacts/.secrets/provider_integration_master_key"),
@@ -238,7 +238,7 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
         assert planner_status.status_code == 200
         assert planner_status.json()["phase"] == "researching"
         assert planner_status.json()["plan_version"] == 1
-        assert planner_status.json()["termination_reason"] == "tool_layer_not_implemented"
+        assert planner_status.json()["termination_reason"] is None
         assert planner_status.json()["usage_snapshot"]["planner"]["total_tokens"] == 30
 
         persisted_plan = restarted.get(f"/api/v1/research-runs/{planner_run_id}/plan")
@@ -250,7 +250,7 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
             f"/api/v1/research-runs/{planner_run_id}/events?follow=false"
         )
         assert "event: plan.generated" in planner_events.text
-        assert "event: run.interrupted" in planner_events.text
+        assert "event: run.interrupted" not in planner_events.text
 
         deleted = restarted.delete(f"/api/v1/llm/profiles/{profile_id}")
         assert deleted.status_code == 204

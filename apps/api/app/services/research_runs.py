@@ -13,6 +13,7 @@ from app.domain.controlled_tools import (
     EvidenceSearchInput,
     EvidenceSearchResult,
 )
+from app.domain.evaluation import EvaluationSnapshot
 from app.domain.evidence_graph import EvidenceGraphView
 from app.domain.memory import MemoryAccessView, MemoryItemView
 from app.domain.planning import ResearchPlan
@@ -96,6 +97,10 @@ class ResearchRunServiceProtocol(Protocol):
     async def list_memory_accesses(
         self, owner_hash: str, run_id: UUID
     ) -> list[MemoryAccessView]: ...
+
+    async def list_evaluations(
+        self, owner_hash: str, run_id: UUID
+    ) -> list[EvaluationSnapshot]: ...
 
     async def get_report(self, owner_hash: str, run_id: UUID) -> ReportView: ...
 
@@ -212,6 +217,11 @@ class ResearchRunService:
     ) -> list[MemoryAccessView]:
         await self._repository.get(owner_hash, run_id)
         return await self._memory_manager.list_accesses(owner_hash, run_id)
+
+    async def list_evaluations(
+        self, owner_hash: str, run_id: UUID
+    ) -> list[EvaluationSnapshot]:
+        return await self._research_repository.list_evaluations(owner_hash, run_id)
 
     async def get_report(self, owner_hash: str, run_id: UUID) -> ReportView:
         await self._repository.get(owner_hash, run_id)

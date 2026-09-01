@@ -12,6 +12,7 @@ from uuid import UUID
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.domain.evaluation import EvaluationScope, EvaluationSnapshot, EvaluationVerdict
 from app.domain.evidence_graph import (
     EvidenceGraphClaimEdgeView,
     EvidenceGraphClaimNode,
@@ -1424,6 +1425,50 @@ class ResearchToolRepository:
                     rejection_reason=evidence.rejection_reason,
                 )
                 for evidence, source in rows
+            ]
+
+    async def list_evaluations(
+        self, owner_hash: str, run_id: UUID
+    ) -> list[EvaluationSnapshot]:
+        async with self._sessions() as session:
+            owned = await session.scalar(
+                select(ResearchRunRow.id).where(
+                    ResearchRunRow.id == run_id,
+                    ResearchRunRow.owner_hash == owner_hash,
+                )
+            )
+            if owned is None:
+                raise ResearchRunNotFoundError(str(run_id))
+            rows = (
+                await session.scalars(
+                    select(EvaluationSnapshotRow)
+                    .where(EvaluationSnapshotRow.run_id == run_id)
+                    .order_by(EvaluationSnapshotRow.created_at, EvaluationSnapshotRow.id)
+                )
+            ).all()
+            return [
+                EvaluationSnapshot(
+                    evaluation_id=row.id,
+                    run_id=row.run_id,
+                    scope=EvaluationScope(row.scope),
+                    state_version=row.state_version,
+                    plan_version=row.plan_version,
+                    coverage=row.coverage,
+                    evidence_sufficiency=row.evidence_sufficiency,
+                    source_quality=row.source_quality,
+                    source_diversity=row.source_diversity,
+                    source_independence=row.source_independence,
+                    cross_validation=row.cross_validation,
+                    freshness=row.freshness,
+                    conflict_resolution=row.conflict_resolution,
+                    citation_completeness=row.citation_completeness,
+                    citation_support=row.citation_support,
+                    weak_claim_ids=tuple(row.weak_claim_ids),
+                    missing_dimension_keys=tuple(row.missing_dimension_keys),
+                    unresolved_conflict_ids=tuple(row.unresolved_conflict_ids),
+                    verdict=EvaluationVerdict(row.verdict),
+                )
+                for row in rows
             ]
 
     async def _enter_writing(

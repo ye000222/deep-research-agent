@@ -1,0 +1,60 @@
+import pytest
+from app.domain.planning import ResearchPlan, ResearchQuestion, append_dynamic_questions
+
+
+def _plan() -> ResearchPlan:
+    return ResearchPlan(
+        goal="研究工业视觉缺陷检测发展",
+        scope_summary="技术、厂商和趋势",
+        questions=[
+            ResearchQuestion(
+                id=f"q{index}",
+                question=f"研究维度 {index} 的公开证据",
+                priority=1,
+                rationale="用于覆盖研究目标",
+                evidence_requirements=["至少一个公开来源"],
+            )
+            for index in range(1, 6)
+        ],
+        completion_criteria=["覆盖核心维度", "记录证据来源"],
+    )
+
+
+def test_dynamic_questions_are_bounded_and_deduplicated() -> None:
+    plan = append_dynamic_questions(
+        _plan(),
+        [
+            ResearchQuestion(
+                id="q6",
+                question="  补充研究中国厂商  ",
+                priority=2,
+                rationale="发现厂商信息缺口",
+                evidence_requirements=["至少两个公开来源"],
+            ),
+            ResearchQuestion(
+                id="q7",
+                question="研究维度 1 的公开证据",
+                priority=2,
+                rationale="重复问题应被忽略",
+                evidence_requirements=["至少一个公开来源"],
+            ),
+        ],
+    )
+
+    assert len(plan.questions) == 6
+    assert plan.questions[-1].question == "补充研究中国厂商"
+
+
+def test_dynamic_question_append_limit_is_enforced() -> None:
+    with pytest.raises(ValueError, match="at most three"):
+        append_dynamic_questions(_plan(), [_question(f"q{index}") for index in range(6, 10)])
+
+
+def _question(identifier: str) -> ResearchQuestion:
+    return ResearchQuestion(
+        id=identifier,
+        question=f"动态问题 {identifier}",
+        priority=2,
+        rationale="由信息缺口触发",
+        evidence_requirements=["公开来源"],
+    )

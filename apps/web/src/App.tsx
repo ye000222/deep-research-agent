@@ -120,6 +120,25 @@ type CoverageDimension = {
   missing_reasons: string[];
 };
 
+type KnowledgeLedger = {
+  known: Array<Record<string, unknown>>;
+  coverage_map: CoverageDimension[];
+  quality: Record<string, unknown>;
+};
+type GapLedger = {
+  gaps: Array<Record<string, unknown>>;
+  open_count: number;
+};
+type ActionLedger = {
+  next_action: Record<string, unknown> | null;
+  events: AgentEvent[];
+};
+type EvaluationSnapshot = Record<string, unknown> & {
+  verdict?: string;
+  source_quality?: number;
+  citation_support?: number;
+};
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const STOPPED_STATUSES = new Set([
   "completed",
@@ -308,6 +327,10 @@ function App() {
   const [report, setReport] = useState<ResearchReport | null>(null);
   const [contextMetrics, setContextMetrics] = useState<ContextManifest[]>([]);
   const [memoryAccesses, setMemoryAccesses] = useState<Record<string, unknown>[]>([]);
+  const [knowledgeLedger, setKnowledgeLedger] = useState<KnowledgeLedger | null>(null);
+  const [gapLedger, setGapLedger] = useState<GapLedger | null>(null);
+  const [actionLedger, setActionLedger] = useState<ActionLedger | null>(null);
+  const [evaluations, setEvaluations] = useState<EvaluationSnapshot[]>([]);
   const eventCursor = useRef(0);
   const [query, setQuery] = useState(
     "研究工业视觉缺陷检测领域的发展情况，分析技术路线、厂商、代表产品、大模型应用与未来三年趋势。",
@@ -335,6 +358,10 @@ function App() {
           setReport(null);
           setContextMetrics([]);
           setMemoryAccesses([]);
+          setKnowledgeLedger(null);
+          setGapLedger(null);
+          setActionLedger(null);
+          setEvaluations([]);
           setActiveRun(runs[0]);
           setActiveRunId(runs[0].run_id);
         }
@@ -355,7 +382,7 @@ function App() {
         if (eventCursor.current > 0) {
           eventHeaders["Last-Event-ID"] = String(eventCursor.current);
         }
-        const [statusResponse, eventResponse, evidenceResponse, contextResponse, memoryResponse] = await Promise.all([
+        const [statusResponse, eventResponse, evidenceResponse, contextResponse, memoryResponse, knowledgeResponse, gapsResponse, actionsResponse, evaluationsResponse] = await Promise.all([
           fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId, {
             credentials: "include",
           }),
@@ -372,6 +399,18 @@ function App() {
           fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/memory-accesses", {
             credentials: "include",
           }),
+          fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/knowledge", {
+            credentials: "include",
+          }),
+          fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/gaps", {
+            credentials: "include",
+          }),
+          fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/actions", {
+            credentials: "include",
+          }),
+          fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/evaluations", {
+            credentials: "include",
+          }),
         ]);
         if (!statusResponse.ok) throw new Error(`状态接口 HTTP ${statusResponse.status}`);
         if (!eventResponse.ok) throw new Error(`事件接口 HTTP ${eventResponse.status}`);
@@ -384,6 +423,16 @@ function App() {
         const currentEvidence = (await evidenceResponse.json()) as EvidenceItem[];
         const currentContextMetrics = (await contextResponse.json()) as ContextManifest[];
         const currentMemoryAccesses = (await memoryResponse.json()) as Record<string, unknown>[];
+        const currentKnowledge = knowledgeResponse.ok
+          ? (await knowledgeResponse.json()) as KnowledgeLedger
+          : null;
+        const currentGaps = gapsResponse.ok ? (await gapsResponse.json()) as GapLedger : null;
+        const currentActions = actionsResponse.ok
+          ? (await actionsResponse.json()) as ActionLedger
+          : null;
+        const currentEvaluations = evaluationsResponse.ok
+          ? (await evaluationsResponse.json()) as EvaluationSnapshot[]
+          : [];
         if (incoming.length > 0) {
           eventCursor.current = Math.max(eventCursor.current, ...incoming.map((item) => item.seq));
           setEvents((current) => {
@@ -397,6 +446,10 @@ function App() {
           setEvidence(currentEvidence);
           setContextMetrics(currentContextMetrics);
           setMemoryAccesses(currentMemoryAccesses);
+          setKnowledgeLedger(currentKnowledge);
+          setGapLedger(currentGaps);
+          setActionLedger(currentActions);
+          setEvaluations(currentEvaluations);
           setMessage(runMessage(run));
           if (!STOPPED_STATUSES.has(run.status)) {
             timer = window.setTimeout(() => void poll(), 1000);
@@ -658,7 +711,15 @@ function App() {
   const memoryHits = memoryAccesses.filter((item) => item.result === "hit").length;
   const memoryMisses = memoryAccesses.filter((item) => item.result === "miss").length;
   const unknownDimensions = coverageMap.filter((item) => item.coverage < 1);
+  const openGapCount = gapLedger?.open_count ?? unknownDimensions.length;
   const nextAction = [...events].reverse().find((event) => event.event_type === "action.selected");
+  const serverNextAction = actionLedger?.next_action;
+  const latestEvaluation = evaluations.length > 0 ? evaluations[evaluations.length - 1] : null;
+  const nextActionText = typeof serverNextAction?.type === "string"
+    ? serverNextAction.type
+    : nextAction
+      ? eventLabel(nextAction.event_type)
+      : "等待评估";
   return (
     <main className="shell">
       <header className="topbar">
@@ -830,10 +891,12 @@ function App() {
           <section className="explainability-grid" aria-label="Agent Explainability">
             <article className="explainability-card">
               <div className="context-metrics__heading"><span>KNOWN / UNKNOWN / NEXT</span><b>STATE LEDGER</b></div>
-              <div className="ledger-row"><span>已知 Known</span><strong>{acceptedEvidence} 条 Evidence</strong></div>
-              <div className="ledger-row"><span>未知 Unknown</span><strong>{unknownDimensions.length} 个 Gap</strong></div>
-              <div className="ledger-row"><span>下一步 Next</span><strong>{nextAction ? eventLabel(nextAction.event_type) : "等待评估"}</strong></div>
-              <small>{nextAction?.public_summary ?? "Evaluator 将根据覆盖度、来源质量和信息增益决定下一动作。"}</small>
+              <div className="ledger-row"><span>已知 Known</span><strong>{knowledgeLedger?.known.length ?? acceptedEvidence} 条 Claim</strong></div>
+              <div className="ledger-row"><span>未知 Unknown</span><strong>{openGapCount} 个 Gap</strong></div>
+              <div className="ledger-row"><span>下一步 Next</span><strong>{nextActionText}</strong></div>
+              <small>{typeof serverNextAction?.public_decision_summary === "string"
+                ? serverNextAction.public_decision_summary
+                : nextAction?.public_summary ?? "Evaluator 将根据覆盖度、来源质量和信息增益决定下一动作。"}</small>
             </article>
             <article className="explainability-card">
               <div className="context-metrics__heading"><span>RESEARCH MEMORY</span><b>{memoryHits} HIT / {memoryMisses} MISS</b></div>
@@ -843,10 +906,12 @@ function App() {
             </article>
             <article className="explainability-card">
               <div className="context-metrics__heading"><span>EVALUATION</span><b>{Math.round(coverage * 100)}%</b></div>
-              <div className="ledger-row"><span>Source Quality</span><strong>{Math.round(metric(quality, "source_quality") * 100)}%</strong></div>
+              <div className="ledger-row"><span>Source Quality</span><strong>{Math.round(Number(latestEvaluation?.source_quality ?? metric(quality, "source_quality")) * 100)}%</strong></div>
               <div className="ledger-row"><span>Cross Validation</span><strong>{Math.round(metric(quality, "cross_validation") * 100)}%</strong></div>
               <div className="ledger-row"><span>Information Gain</span><strong>{Math.round(informationGain * 100)}%</strong></div>
-              <small>{latestResearchDecision?.public_summary ?? "尚未产生 Evaluation 决策。"}</small>
+              <small>{latestEvaluation?.verdict
+                ? `服务端 Evaluation verdict：${latestEvaluation.verdict}`
+                : latestResearchDecision?.public_summary ?? "尚未产生 Evaluation 决策。"}</small>
             </article>
           </section>
           <div className="timeline">

@@ -4,14 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
+from uuid import uuid4
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+def _async_url(url: str) -> str:
+    """Ensure the SQLAlchemy URL selects the installed psycopg 3 async dialect."""
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
 
 
 async def main() -> None:
     url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(url, pool_pre_ping=True)
+    engine = create_async_engine(_async_url(url), pool_pre_ping=True)
+    checkpoint_url = os.getenv("CHECKPOINT_DATABASE_URI")
+    checkpoint_engine = (
+        create_async_engine(_async_url(checkpoint_url), pool_pre_ping=True)
+        if checkpoint_url
+        else None
+    )
     try:
         async with engine.connect() as conn:
             version = (
@@ -74,6 +93,60 @@ async def main() -> None:
                 )
             ).scalar_one()
             assert outbox_columns == 3
+            duplicate_outbox_keys = (
+                await conn.execute(
+                    text(
+                        "select count(*) from ("
+                        "select dispatch_key from task_dispatch_outbox "
+                        "group by dispatch_key having count(*) > 1"
+                        ") duplicates"
+                    )
+                )
+            ).scalar_one()
+            assert duplicate_outbox_keys == 0
+            duplicate_outbox_probe = "no_fixture"
+            fixture = (
+                await conn.execute(
+                    text("select 1 from task_dispatch_outbox limit 1")
+                )
+            ).first()
+            if fixture is not None:
+                await conn.commit()
+                outer = await conn.begin()
+                nested = await conn.begin_nested()
+                try:
+                    await conn.execute(
+                        text(
+                            "insert into task_dispatch_outbox "
+                            "(id, run_id, dispatch_type, dispatch_key, payload_ref, status, "
+                            "attempt_count, next_attempt_at, created_at) "
+                            "select :id, run_id, dispatch_type, dispatch_key, payload_ref, "
+                            "'pending', 0, now(), now() from task_dispatch_outbox limit 1"
+                        ),
+                        {"id": str(uuid4())},
+                    )
+                except IntegrityError:
+                    await nested.rollback()
+                    duplicate_outbox_probe = "passed"
+                else:
+                    await nested.rollback()
+                    duplicate_outbox_probe = "failed"
+                await outer.commit()
+
+            checkpoint_tables = None
+            if checkpoint_engine is not None:
+                async with checkpoint_engine.connect() as checkpoint_conn:
+                    checkpoint_tables = (
+                        await checkpoint_conn.execute(
+                            text(
+                                "select count(*) from information_schema.tables "
+                                "where table_schema='public' and table_name in "
+                                "('checkpoints','checkpoint_blobs','checkpoint_writes',"
+                                "'checkpoint_migrations')"
+                            )
+                        )
+                    ).scalar_one()
+                    assert checkpoint_tables == 4, checkpoint_tables
 
             print(
                 {
@@ -84,10 +157,15 @@ async def main() -> None:
                     "duplicate_event_keys": int(duplicate_events),
                     "rollback_probe": "passed",
                     "outbox_contract": "passed",
+                    "duplicate_outbox_keys": int(duplicate_outbox_keys),
+                    "duplicate_outbox_probe": duplicate_outbox_probe,
+                    "checkpoint_tables": checkpoint_tables,
                 }
             )
     finally:
         await engine.dispose()
+        if checkpoint_engine is not None:
+            await checkpoint_engine.dispose()
 
 
 if __name__ == "__main__":

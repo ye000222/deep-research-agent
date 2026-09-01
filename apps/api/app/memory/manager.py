@@ -22,6 +22,8 @@ from app.domain.state import ResearchState
 from app.infrastructure.db.memory_models import MemoryAccessLogRow, MemoryItemRow
 from app.infrastructure.db.research_models import ResearchEvidenceRow
 from app.infrastructure.db.run_models import ResearchRunRow
+from app.retrieval.models import MemorySearchDocumentRow
+from app.retrieval.projections import rebuild_memory
 
 _WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*|[\u3400-\u9fff]")
 
@@ -100,6 +102,9 @@ class ResearchMemoryManager:
                     fingerprint=_fingerprint(f"semantic:evidence:{evidence.id}"),
                     now=now,
                 )
+            # Keep the searchable projection transactionally aligned with memory facts.
+            await session.flush()
+            await rebuild_memory(session, owner_hash=run.owner_hash)
 
     async def retrieve_for_run(
         self,
@@ -121,10 +126,17 @@ class ResearchMemoryManager:
             rows = (
                 await session.scalars(
                     select(MemoryItemRow)
+                    .join(
+                        MemorySearchDocumentRow,
+                        MemorySearchDocumentRow.memory_id == MemoryItemRow.id,
+                    )
                     .where(
                         MemoryItemRow.owner_hash == run.owner_hash,
                         MemoryItemRow.status == MemoryStatus.ACTIVE.value,
                         MemoryItemRow.memory_type.in_([item.value for item in memory_types]),
+                        MemorySearchDocumentRow.status == MemoryStatus.ACTIVE.value,
+                        MemorySearchDocumentRow.expires_at.is_(None)
+                        | (MemorySearchDocumentRow.expires_at > now),
                     )
                     .order_by(MemoryItemRow.updated_at.desc(), MemoryItemRow.id)
                     .limit(250)

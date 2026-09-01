@@ -27,5 +27,91 @@
     ],
     "unresolved_conflicts": 1,
     "expected_verdict": "continue"
+  },
+  {
+    "id": "no_verifiable_evidence",
+    "goal": "研究新兴市场",
+    "dimensions": ["market"],
+    "claims": [{"dimension": "market", "accepted_evidence": 0, "independent_sources": 0}],
+    "no_verifiable_evidence": true,
+    "expected_verdict": "fail"
+  },
+  {
+    "id": "reposted_same_source",
+    "goal": "识别主要厂商",
+    "dimensions": ["vendors"],
+    "claims": [{"dimension": "vendors", "accepted_evidence": 3, "independent_sources": 1}],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "stale_sources",
+    "goal": "评估当前技术",
+    "dimensions": ["technology"],
+    "claims": [{"dimension": "technology", "accepted_evidence": 2, "independent_sources": 2}],
+    "stale_claims": 1,
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "scope_mismatch",
+    "goal": "比较中国市场规模",
+    "dimensions": ["market_size"],
+    "claims": [{"dimension": "market_size", "accepted_evidence": 2, "independent_sources": 2}],
+    "scope_mismatches": 1,
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "search_exhausted",
+    "goal": "核验产品参数",
+    "dimensions": ["specification"],
+    "claims": [{"dimension": "specification", "accepted_evidence": 0, "independent_sources": 0}],
+    "search_failures": 2,
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "repeated_query_stagnation",
+    "goal": "寻找行业预测",
+    "dimensions": ["forecast"],
+    "claims": [{"dimension": "forecast", "accepted_evidence": 1, "independent_sources": 1}],
+    "repeated_queries": 2,
+    "low_information_gain_rounds": 2,
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "budget_exhausted_with_evidence",
+    "goal": "总结技术路线",
+    "dimensions": ["technology", "application"],
+    "claims": [
+      {"dimension": "technology", "accepted_evidence": 2, "independent_sources": 2},
+      {"dimension": "application", "accepted_evidence": 2, "independent_sources": 2}
+    ],
+    "budget_exhausted": true,
+    "expected_verdict": "write_limited"
+  },
+  {
+    "id": "unsupported_citation",
+    "goal": "输出带引用报告",
+    "dimensions": ["report"],
+    "claims": [{"dimension": "report", "accepted_evidence": 2, "independent_sources": 2}],
+    "unsupported_citations": 1,
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "analysis_recompute_error",
+    "goal": "计算市场增长率",
+    "dimensions": ["growth"],
+    "claims": [{"dimension": "growth", "accepted_evidence": 2, "independent_sources": 2}],
+    "analysis_errors": 1,
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "dynamic_question_added",
+    "goal": "研究工业视觉趋势",
+    "dimensions": ["technology", "new_dimension"],
+    "claims": [
+      {"dimension": "technology", "accepted_evidence": 2, "independent_sources": 2},
+      {"dimension": "new_dimension", "accepted_evidence": 0, "independent_sources": 0}
+    ],
+    "dynamic_questions_added": 1,
+    "expected_verdict": "continue"
   }
 ]
