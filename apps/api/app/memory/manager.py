@@ -7,7 +7,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.identifiers import uuid7
@@ -22,6 +22,9 @@ from app.domain.state import ResearchState
 from app.infrastructure.db.memory_models import MemoryAccessLogRow, MemoryItemRow
 from app.infrastructure.db.research_models import ResearchEvidenceRow
 from app.infrastructure.db.run_models import ResearchRunRow
+from app.retrieval.models import MemorySearchDocumentRow
+from app.retrieval.normalization import normalize_text, reciprocal_rank_fusion
+from app.retrieval.projections import rebuild_memory
 
 _WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*|[\u3400-\u9fff]")
 
@@ -100,6 +103,9 @@ class ResearchMemoryManager:
                     fingerprint=_fingerprint(f"semantic:evidence:{evidence.id}"),
                     now=now,
                 )
+            # Keep the searchable projection transactionally aligned with memory facts.
+            await session.flush()
+            await rebuild_memory(session, owner_hash=run.owner_hash)
 
     async def retrieve_for_run(
         self,
@@ -118,25 +124,79 @@ class ResearchMemoryManager:
             if run is None:
                 raise ValueError("research run not found")
             normalized_query = " ".join((query or run.normalized_goal).split())
-            rows = (
-                await session.scalars(
-                    select(MemoryItemRow)
-                    .where(
-                        MemoryItemRow.owner_hash == run.owner_hash,
-                        MemoryItemRow.status == MemoryStatus.ACTIVE.value,
-                        MemoryItemRow.memory_type.in_([item.value for item in memory_types]),
+            normalized = normalize_text(normalized_query)
+            query_text = normalized.cjk_lexemes or normalized.latin_text or normalized.raw
+            ts_query = func.plainto_tsquery("simple", query_text)
+            lexical_score = func.ts_rank_cd(
+                MemorySearchDocumentRow.search_vector,
+                ts_query,
+            )
+            fuzzy_score = func.similarity(
+                MemorySearchDocumentRow.fuzzy_text,
+                normalized.fuzzy_text,
+            )
+            filters = (
+                MemoryItemRow.owner_hash == run.owner_hash,
+                MemoryItemRow.status == MemoryStatus.ACTIVE.value,
+                MemoryItemRow.memory_type.in_([item.value for item in memory_types]),
+                MemorySearchDocumentRow.status == MemoryStatus.ACTIVE.value,
+                MemorySearchDocumentRow.expires_at.is_(None)
+                | (MemorySearchDocumentRow.expires_at > now),
+            )
+            lexical_rows = (
+                await session.execute(
+                    select(MemoryItemRow, lexical_score.label("rank"))
+                    .join(
+                        MemorySearchDocumentRow,
+                        MemorySearchDocumentRow.memory_id == MemoryItemRow.id,
                     )
-                    .order_by(MemoryItemRow.updated_at.desc(), MemoryItemRow.id)
-                    .limit(250)
+                    .where(
+                        *filters,
+                        MemorySearchDocumentRow.search_vector.op("@@")(ts_query),
+                    )
+                    .order_by(lexical_score.desc(), MemoryItemRow.id)
+                    .limit(50)
                 )
             ).all()
-            query_terms = _terms(normalized_query)
+            fuzzy_rows = (
+                await session.execute(
+                    select(MemoryItemRow, fuzzy_score.label("rank"))
+                    .join(
+                        MemorySearchDocumentRow,
+                        MemorySearchDocumentRow.memory_id == MemoryItemRow.id,
+                    )
+                    .where(*filters, fuzzy_score >= 0.05)
+                    .order_by(fuzzy_score.desc(), MemoryItemRow.id)
+                    .limit(50)
+                )
+            ).all()
+            lexical_ids = tuple(str(row.id) for row, _rank in lexical_rows)
+            fuzzy_ids = tuple(str(row.id) for row, _rank in fuzzy_rows)
+            fused = reciprocal_rank_fusion(lexical_ids, fuzzy_ids)
+            rows_by_id = {
+                str(row.id): row
+                for row, _rank in [*lexical_rows, *fuzzy_rows]
+            }
+            maximum_rrf = 2.0 / 61.0
             scored = [
-                (row, _memory_score(query_terms, row))
-                for row in rows
+                (
+                    rows_by_id[memory_id],
+                    min(
+                        1.0,
+                        0.65 * min(1.0, rrf_score / maximum_rrf)
+                        + 0.20 * rows_by_id[memory_id].confidence
+                        + 0.10 * rows_by_id[memory_id].importance
+                        + (
+                            0.05
+                            if rows_by_id[memory_id].origin_run_id == run_id
+                            else 0.0
+                        ),
+                    ),
+                )
+                for memory_id, rrf_score in fused.items()
             ]
             scored.sort(key=lambda item: (-item[1], str(item[0].id)))
-            selected = [item for item in scored if item[1] > 0][: max(1, min(top_k, 20))]
+            selected = scored[: max(1, min(top_k, 20))]
             access_id = uuid7()
             revalidation_count = sum(1 for row, _score in selected if row.origin_run_id != run_id)
             result = "hit" if selected else "miss"

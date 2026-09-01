@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.domain.evaluation import EvaluationSnapshot
+
 
 class ReportCitationView(BaseModel):
     citation_number: int
@@ -50,3 +52,16 @@ class ReportView(BaseModel):
     created_at: datetime
     sections: list[ReportSectionView]
     citations: list[ReportCitationView]
+
+
+class VerificationView(BaseModel):
+    """Public, fully traceable verification snapshot for a completed report."""
+
+    run_id: UUID
+    report_id: UUID
+    report_status: str
+    verified: bool
+    citation_count: int
+    analysis_artifact_citation_count: int
+    verification_result: dict[str, Any]
+    latest_report_evaluation: EvaluationSnapshot | None = None

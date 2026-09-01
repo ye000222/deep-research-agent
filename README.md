@@ -43,7 +43,17 @@ V1 的自主 Research Loop 与证据驱动报告主链路已经可以端到端�
 
 当前 Worker 会调用用户明确选择的 Provider Adapter 生成并持久化研究计划，依据当前 Known / Unknown / Next Action 状态选择工具，自主执行多轮搜索、网页安全读取、证据抽取、质量评估和动态补缺。满足质量阈值或达到资源上限后进入 Writer；Writer 只接收经过验证的有限 Evidence Cards，并通过稳定引用和确定性校验生成报告。预算不足时会生成明确标注限制的证据报告；没有有效证据时会失败，而不会伪造结论、来源或质量指标。
 
-V1 已进入 Release Gate 阶段；后续版本可继续增强来源冲突归因、语义向量检索、PDF/多模态来源和 Multi-Agent 协作。
+V1 已进入严格 Release Gate 阶段；本地可用以下命令生成可审计 JSON 报告（严格模式要求 PostgreSQL 集成开关）：
+
+```powershell
+$env:RUN_POSTGRES_INTEGRATION = "1"
+$env:DATABASE_URL = "postgresql+psycopg://deep_research:deep_research@localhost:5432/deep_research"
+$env:TEST_DATABASE_URL = $env:DATABASE_URL
+$env:CHECKPOINT_DATABASE_URI = "postgresql://deep_research:deep_research@localhost:5432/deep_research_checkpoint"
+python scripts/release_gate.py --skip-compose --report-path artifacts/release_gate.json
+```
+
+该 Gate 会执行 Ruff、MyPy、全量测试、零跳过 PostgreSQL 集成测试、前端构建、13 条 Golden Eval 和高置信度 Secret 扫描；后续版本可继续增强来源冲突归因、语义向量检索、PDF/多模态来源和 Multi-Agent 协作。
 
 ## 技术栈
 

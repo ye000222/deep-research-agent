@@ -9,6 +9,71 @@ permissions:
   contents: read
 
 jobs:
+  integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: deep_research
+          POSTGRES_PASSWORD: deep_research
+          POSTGRES_DB: deep_research
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deep_research -d deep_research"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUN_POSTGRES_INTEGRATION: "1"
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@localhost:5432/deep_research
+      TEST_DATABASE_URL: postgresql+psycopg://deep_research:deep_research@localhost:5432/deep_research
+      CHECKPOINT_DATABASE_URI: postgresql://deep_research:deep_research@localhost:5432/deep_research_checkpoint
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install API dependencies
+        run: pip install -e ".[dev]"
+      - name: Prepare PostgreSQL databases and extensions
+        run: |
+          python - <<'PY'
+          import psycopg
+
+          business = "postgresql://deep_research:deep_research@localhost:5432/deep_research"
+          admin = psycopg.connect(business, autocommit=True)
+          admin.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+          admin.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+          try:
+              admin.execute("CREATE DATABASE deep_research_checkpoint")
+          except psycopg.errors.DuplicateDatabase:
+              pass
+          finally:
+              admin.close()
+          PY
+      - name: Apply business migrations
+        run: alembic upgrade head
+      - name: Initialize LangGraph PostgreSQL checkpoint schema
+        run: python -m app.cli.setup_checkpoints
+      - name: Run PostgreSQL integration tests
+        run: pytest tests/integration -q
+      - name: Run PostgreSQL recovery smoke test
+        run: python scripts/verify_postgres_recovery.py
+
   api:
     runs-on: ubuntu-latest
     steps:
@@ -41,3 +106,73 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config
+
+  release:
+    name: Strict V1 release gate
+    needs: [integration, api, web, compose]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: deep_research
+          POSTGRES_PASSWORD: deep_research
+          POSTGRES_DB: deep_research
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deep_research -d deep_research"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUN_POSTGRES_INTEGRATION: "1"
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@localhost:5432/deep_research
+      TEST_DATABASE_URL: postgresql+psycopg://deep_research:deep_research@localhost:5432/deep_research
+      CHECKPOINT_DATABASE_URI: postgresql://deep_research:deep_research@localhost:5432/deep_research_checkpoint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pnpm install --no-frozen-lockfile
+      - name: Prepare release databases
+        run: |
+          python - <<'PY'
+          import psycopg
+
+          business = "postgresql://deep_research:deep_research@localhost:5432/deep_research"
+          admin = psycopg.connect(business, autocommit=True)
+          admin.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+          admin.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+          try:
+              admin.execute("CREATE DATABASE deep_research_checkpoint")
+          except psycopg.errors.DuplicateDatabase:
+              pass
+          finally:
+              admin.close()
+          PY
+      - name: Apply migrations and checkpoint schema
+        run: |
+          alembic upgrade head
+          python -m app.cli.setup_checkpoints
+      - name: Run strict release gate
+        run: python scripts/release_gate.py --skip-compose --report-path artifacts/release_gate.json
+      - name: Upload release gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-research-release-gate
+          path: artifacts/release_gate.json
+          if-no-files-found: warn

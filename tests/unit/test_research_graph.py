@@ -5,7 +5,13 @@ from app.agent.reducers.state_reducer import apply_patch
 from app.domain.identifiers import uuid7
 from app.domain.planning import ResearchPlan, ResearchQuestion
 from app.domain.providers import TokenUsage, UsageAccuracy
-from app.domain.state import ResearchPhase, ResearchState, RunStatus, StatePatch
+from app.domain.state import (
+    CoverageDimensionSnapshot,
+    ResearchPhase,
+    ResearchState,
+    RunStatus,
+    StatePatch,
+)
 from app.services.research_graph import ResearchGraphService
 from app.services.research_loop import ResearchIterationResult
 from langgraph.checkpoint.memory import InMemorySaver
@@ -34,6 +40,7 @@ class FakeRuns:
     def __init__(self) -> None:
         self.plan: ResearchPlan | None = None
         self.saved = 0
+        self.replanned = 0
 
     async def get_plan_for_execution(self, run_id: UUID) -> ResearchPlan | None:
         return self.plan
@@ -44,6 +51,15 @@ class FakeRuns:
         return True
 
     async def record_model_retry(self, *args: object, **kwargs: object) -> bool:
+        return True
+
+    async def save_replanned_questions(self, run_id: UUID, **kwargs: object) -> bool:
+        assert self.plan is not None
+        additions = kwargs["additions"]
+        self.plan = self.plan.model_copy(
+            update={"questions": [*self.plan.questions, *additions]}  # type: ignore[misc]
+        )
+        self.replanned += 1
         return True
 
 
@@ -63,7 +79,7 @@ class FakeStates:
         worker_task_id: str | None,
     ) -> ResearchState:
         self.nodes.append(node_name)
-        if node_name in {"planner", "research_iteration"}:
+        if node_name in {"planner", "research_iteration", "replan"}:
             phase, status = ResearchPhase.RESEARCH, RunStatus.RESEARCHING
         else:
             phase, status = ResearchPhase.FINALIZE, RunStatus.COMPLETED
@@ -74,6 +90,21 @@ class FakeStates:
                 base_version=self.state.state_version,
                 phase=phase,
                 status=status,
+                coverage_map=(
+                    (
+                        CoverageDimensionSnapshot(
+                            dimension_key="q1",
+                            question="Which independent source closes the market gap?",
+                            priority=1,
+                            coverage=0.5,
+                            accepted_evidence=1,
+                            independent_sources=1,
+                            missing_reasons=("A second independent source is required.",),
+                        ),
+                    )
+                    if node_name == "replan"
+                    else self.state.coverage_map
+                ),
             ),
         )
         return self.state
@@ -122,6 +153,27 @@ class FakeReportWriter:
         return "report_completed:completed:citations=5"
 
 
+class FakeReplanResearchLoop(FakeResearchLoop):
+    async def run_one_iteration(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+    ) -> ResearchIterationResult:
+        self.calls += 1
+        replan = self.calls == 1
+        return ResearchIterationResult(
+            outcome="research_stopped:replan" if replan else "research_stopped:ready_to_write",
+            continue_research=replan,
+            decision="replan" if replan else "ready_to_write",
+            pages_read=1,
+            accepted_evidence=1,
+            coverage=0.5 if replan else 0.9,
+            information_gain=0.2,
+            low_information_gain_streak=0,
+        )
+
+
 @pytest.mark.asyncio
 async def test_graph_checkpoints_all_stage_boundaries_and_applies_state_patches() -> None:
     run_id = uuid4()
@@ -156,3 +208,37 @@ async def test_graph_checkpoints_all_stage_boundaries_and_applies_state_patches(
     assert states.state.state_version == 4
     assert states.state.status is RunStatus.COMPLETED
     assert checkpoint is not None
+
+
+@pytest.mark.asyncio
+async def test_graph_routes_evaluator_replan_through_persisted_plan_revision() -> None:
+    run_id = uuid4()
+    runs = FakeRuns()
+    states = FakeStates(run_id)
+    research_loop = FakeReplanResearchLoop()
+    service = ResearchGraphService(  # type: ignore[arg-type]
+        runs,
+        states,
+        FakePlanner(),
+        research_loop,
+        FakeReportWriter(),
+    )
+
+    outcome = await service.execute(
+        run_id,
+        worker_task_id="worker-1",
+        checkpointer=InMemorySaver(),
+    )
+
+    assert outcome == "report_completed:completed:citations=5"
+    assert runs.replanned == 1
+    assert runs.plan is not None
+    assert len(runs.plan.questions) == 6
+    assert states.nodes == [
+        "planner",
+        "research_iteration",
+        "replan",
+        "replan",
+        "research_iteration",
+        "report_writer",
+    ]
