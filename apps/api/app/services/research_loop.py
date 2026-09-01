@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from app.domain.controlled_tools import ControlledToolName, EvidenceSearchInput, ToolDecisionRequest
 from app.domain.identifiers import uuid7
+from app.domain.research_tools import SearchResult
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.db.research_tools import ResearchTarget, ResearchToolRepository
 from app.llm.adapters import ModelGatewayError
@@ -27,6 +29,20 @@ _ISOLATED_EXTRACTION_ERRORS = {
     "MODEL_NETWORK_ERROR",
     "MODEL_RATE_LIMITED",
     "MODEL_PROVIDER_UNAVAILABLE",
+}
+_PREFERRED_READABLE_DOMAINS = {
+    "arxiv.org",
+    "openaccess.thecvf.com",
+    "pmc.ncbi.nlm.nih.gov",
+    "pubmed.ncbi.nlm.nih.gov",
+}
+_RESTRICTED_SOURCE_DOMAINS = {
+    "doi.org",
+    "ieeexplore.ieee.org",
+    "link.springer.com",
+    "researchgate.net",
+    "sciencedirect.com",
+    "tandfonline.com",
 }
 
 
@@ -174,7 +190,7 @@ class ResearchLoopService:
         )
         pages_read = 0
         accepted = 0
-        for result in results[:_MAX_PAGE_ATTEMPTS]:
+        for result in _prioritize_search_results(results)[:_MAX_PAGE_ATTEMPTS]:
             if pages_read >= _MAX_PAGES_READ:
                 break
             try:
@@ -239,3 +255,26 @@ class ResearchLoopService:
         return (
             f"research_stopped:{decision}:iterations={iterations}:pages={pages}:accepted={accepted}"
         )
+
+
+def _prioritize_search_results(results: list[SearchResult]) -> list[SearchResult]:
+    """Prefer public HTML candidates before known paywalls and PDF-only URLs."""
+
+    def sort_key(result: SearchResult) -> tuple[int, int]:
+        parsed = urlsplit(result.url)
+        hostname = (parsed.hostname or "").lower()
+        path = parsed.path.lower().rstrip("/")
+        penalty = 0
+        if _matches_domain(hostname, _PREFERRED_READABLE_DOMAINS):
+            penalty -= 20
+        if _matches_domain(hostname, _RESTRICTED_SOURCE_DOMAINS):
+            penalty += 20
+        if path.endswith(".pdf") or "/pdf" in path:
+            penalty += 30
+        return penalty, result.rank
+
+    return sorted(results, key=sort_key)
+
+
+def _matches_domain(hostname: str, domains: set[str]) -> bool:
+    return any(hostname == domain or hostname.endswith(f".{domain}") for domain in domains)

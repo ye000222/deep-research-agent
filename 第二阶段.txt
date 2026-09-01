@@ -805,3 +805,24 @@ M5：系统加固与发布（S2-7、S2-8、S2-9）
 - Golden：Stop Accuracy=1.0、Gap Recall=1.0、Gap Precision=1.0、Evidence Support Precision/Recall=1.0、Early-stop Error Rate=0.0。
 
 本轮 6 项后续强化已全部完成并通过本地严格 Release Gate；下一步是提交当前变更并由 GitHub Actions 远端复验。
+
+### 2026-09-01 12:20:46（Asia/Shanghai）
+
+【端到端热修复已完成：搜索提供商退化与不可读来源】
+
+- 人工演示暴露 REPORT_NO_ACCEPTED_EVIDENCE；报告拒绝无证据写作的安全边界正确，实际缺陷位于 Search → Read 链路。
+- SearXNG 通用引擎受限流、CAPTCHA 和超时影响时，Adapter 现在自动回退 OpenAIRE publications，并对学术回退执行一次受控瞬态重试。
+- 所有搜索策略都不可用时返回 SEARCH_PROVIDER_DEGRADED，不再把基础设施故障记录为合法零结果。
+- 来源读取排序优先 arXiv、PubMed、PMC、CVF 公开 HTML，已知付费墙、DOI 跳转和 PDF-only URL 后置。
+- 新增回归测试并通过；真实本地 SearXNG 返回 10 个候选，PublicWebReader 已成功读取第一优先 arXiv 来源并提取 1,939 字正文。
+- 修复后的严格 Release Gate passed=true，PostgreSQL Integration 3/3 未跳过。
+
+下一步：重启 API、Worker、Dispatcher 与 SearXNG，重新执行一条真实研究任务；成功产生 accepted Evidence 和可追溯报告后，再提交本修复分支并创建 PR。
+
+### 2026-09-01 12:22:41（Asia/Shanghai）
+
+【本地运行环境已加载热修复】
+
+- SearXNG、API、Worker、Dispatcher 已重启。
+- /readyz 状态为 ready，PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部健康。
+- 旧失败任务保持终态用于审计；下一步必须从网页发起全新研究任务完成最终人工验收。
