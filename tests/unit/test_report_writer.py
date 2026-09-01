@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -59,7 +60,14 @@ def test_selection_keeps_question_coverage_and_is_bounded() -> None:
 
 
 def test_assembler_maps_only_known_evidence_to_stable_citations() -> None:
-    first = _card(1, "q1")
+    artifact_id = UUID(int=9_001)
+    first = replace(
+        _card(1, "q1"),
+        analysis_artifact_id=artifact_id,
+        analysis_operation="cagr",
+        analysis_formula="(end/start)^(1/years)-1",
+        analysis_result={"value": 0.249},
+    )
     second = _card(2, "q2")
     draft = ReportDraft(
         title="工业视觉缺陷检测研究报告",
@@ -118,6 +126,8 @@ def test_assembler_maps_only_known_evidence_to_stable_citations() -> None:
         first.chunk_id,
         second.chunk_id,
     ]
+    assert report.citations[0].analysis_artifact_id == artifact_id
+    assert report.verification_result["analysis_artifact_citations"] == 1
     assert "[99]" not in report.final_markdown
     assert report.verification_result["citation_completeness"] == 1.0
     assert report.verification_result["numeric_citation_rate"] == 1.0

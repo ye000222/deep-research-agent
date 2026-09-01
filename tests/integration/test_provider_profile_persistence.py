@@ -1,16 +1,23 @@
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 from app.core.config import Settings
+from app.domain.identifiers import uuid7
 from app.domain.planning import ResearchPlan
 from app.domain.providers import TokenUsage, UsageAccuracy
+from app.infrastructure.db.memory_models import MemoryItemRow
 from app.infrastructure.db.postgres import PostgresRuntime
 from app.infrastructure.db.research_runs import ResearchRunRepository
+from app.infrastructure.db.run_models import AgentEventRow, ResearchRunRow
 from app.main import create_app
+from app.memory.manager import ResearchMemoryManager
+from app.retrieval.projections import rebuild_memory
 from fastapi.testclient import TestClient
+from sqlalchemy import select, update
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
@@ -90,6 +97,118 @@ async def _exercise_plan_persistence(settings: Settings, run_id: UUID) -> None:
                 accuracy=UsageAccuracy.EXACT,
             ),
         )
+    finally:
+        await database.close()
+
+
+async def _exercise_memory_hybrid_retrieval(settings: Settings, run_id: UUID) -> None:
+    database = PostgresRuntime(settings.database_url)
+    manager = ResearchMemoryManager(database.session_factory)
+    now = datetime.now(UTC)
+    try:
+        async with database.session_factory() as session, session.begin():
+            run = await session.get(ResearchRunRow, run_id)
+            assert run is not None
+            session.add_all(
+                [
+                    MemoryItemRow(
+                        id=uuid7(),
+                        origin_run_id=run_id,
+                        owner_hash=run.owner_hash,
+                        scope_type="run",
+                        scope_id=str(run_id),
+                        memory_type="semantic",
+                        content_summary="工业视觉缺陷检测正在验证多模态视觉语言模型.",
+                        source_ref_ids=["evidence:integration-relevant"],
+                        keywords=["工业视觉", "缺陷检测", "多模态"],
+                        confidence=0.95,
+                        importance=0.9,
+                        fingerprint="a" * 64,
+                        status="active",
+                        access_count=0,
+                        utility_count=0,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    MemoryItemRow(
+                        id=uuid7(),
+                        origin_run_id=run_id,
+                        owner_hash=run.owner_hash,
+                        scope_type="run",
+                        scope_id=str(run_id),
+                        memory_type="semantic",
+                        content_summary="农业供应链研究关注季节性库存.",
+                        source_ref_ids=["evidence:integration-irrelevant"],
+                        keywords=["农业", "供应链"],
+                        confidence=0.95,
+                        importance=0.9,
+                        fingerprint="b" * 64,
+                        status="active",
+                        access_count=0,
+                        utility_count=0,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                ]
+            )
+            await session.flush()
+            assert await rebuild_memory(session, owner_hash=run.owner_hash) >= 2
+
+        result = await manager.retrieve_for_run(
+            run_id,
+            query="工业视觉 缺陷检测 多模态",
+            top_k=2,
+        )
+        assert result.result == "hit"
+        assert result.items
+        assert "工业视觉缺陷检测" in result.items[0].content_summary
+    finally:
+        await database.close()
+
+
+async def _exercise_expired_worker_redelivery(settings: Settings, run_id: UUID) -> None:
+    database = PostgresRuntime(settings.database_url)
+    repository = ResearchRunRepository(database.session_factory)
+    try:
+        assert await repository.acquire_for_execution(
+            run_id,
+            worker_task_id="crashed-worker",
+            lease_seconds=300,
+        )
+        async with database.session_factory() as session, session.begin():
+            await session.execute(
+                update(ResearchRunRow)
+                .where(ResearchRunRow.id == run_id)
+                .values(lease_until=datetime.now(UTC) - timedelta(seconds=1))
+            )
+        assert await repository.acquire_for_execution(
+            run_id,
+            worker_task_id="redelivered-worker",
+            lease_seconds=300,
+        )
+        assert not await repository.acquire_for_execution(
+            run_id,
+            worker_task_id="duplicate-redelivery",
+            lease_seconds=300,
+        )
+        await repository.fail_execution(
+            run_id,
+            worker_task_id="crashed-worker",
+            error_code="STALE_WORKER_MUST_NOT_COMMIT",
+        )
+        async with database.session_factory() as session:
+            row = await session.get(ResearchRunRow, run_id)
+            assert row is not None
+            assert row.status == "running"
+            assert row.worker_task_id == "redelivered-worker"
+            event_types = list(
+                await session.scalars(
+                    select(AgentEventRow.event_type)
+                    .where(AgentEventRow.run_id == run_id)
+                    .order_by(AgentEventRow.run_seq)
+                )
+            )
+            assert event_types == ["run.created", "run.started", "run.recovered"]
     finally:
         await database.close()
 
@@ -246,11 +365,26 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
         assert len(persisted_plan.json()["questions"]) == 5
         assert persisted_plan.json()["questions"][0]["id"] == "q1"
 
+        asyncio.run(_exercise_memory_hybrid_retrieval(settings, UUID(planner_run_id)))
+
         planner_events = restarted.get(
             f"/api/v1/research-runs/{planner_run_id}/events?follow=false"
         )
         assert "event: plan.generated" in planner_events.text
         assert "event: run.interrupted" not in planner_events.text
+
+        redelivery_run = restarted.post(
+            "/api/v1/research-runs",
+            json={**run_request, "query": "Recover from an expired Celery worker lease."},
+            headers={"Idempotency-Key": "integration-redelivery-run-v1"},
+        )
+        assert redelivery_run.status_code == 202
+        asyncio.run(
+            _exercise_expired_worker_redelivery(
+                settings,
+                UUID(redelivery_run.json()["run_id"]),
+            )
+        )
 
         deleted = restarted.delete(f"/api/v1/llm/profiles/{profile_id}")
         assert deleted.status_code == 204

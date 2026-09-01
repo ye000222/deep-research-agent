@@ -156,6 +156,16 @@ class ReportWriterService:
                 "source_title": card.source_title,
                 "source_domain": card.source_domain,
                 "evidence_score": card.evidence_score,
+                "analysis": (
+                    {
+                        "analysis_artifact_id": str(card.analysis_artifact_id),
+                        "operation": card.analysis_operation,
+                        "formula": card.analysis_formula,
+                        "result": card.analysis_result,
+                    }
+                    if card.analysis_artifact_id is not None
+                    else None
+                ),
             }
             for card in evidence
         }
@@ -305,6 +315,7 @@ def assemble_report(
                         source_content_hash=card.source_content_hash,
                         url=card.source_url,
                         accessed_at=card.fetched_at,
+                        analysis_artifact_id=card.analysis_artifact_id,
                     )
                 )
             markers.append(f"[{number}]")
@@ -431,6 +442,9 @@ def assemble_report(
                 for citation in citations
             },
         )
+    )
+    verification["analysis_artifact_citations"] = sum(
+        citation.analysis_artifact_id is not None for citation in citations
     )
     return AssembledReport(
         title=(draft.title if draft else context.goal).strip(),

@@ -24,6 +24,7 @@ from app.domain.evidence_graph import (
     derive_claim_status,
 )
 from app.domain.identifiers import uuid7
+from app.domain.planning import MAX_DYNAMIC_QUESTIONS
 from app.domain.providers import TokenUsage
 from app.domain.research_management import ResearchFactCounts, calculate_information_gain
 from app.domain.research_runs import RunPhase, RunStatus
@@ -1107,6 +1108,13 @@ class ResearchToolRepository:
             elif information_stagnated:
                 decision = "stop_information_gain"
                 stop_reason = "stagnation"
+            elif (
+                remaining == 0
+                and total_questions < MAX_DYNAMIC_QUESTIONS
+                and critical_gaps > 0
+            ):
+                decision = "replan"
+                stop_reason = None
             elif remaining == 0:
                 decision = "write_with_limitations"
                 stop_reason = "sources_exhausted"
@@ -1126,6 +1134,8 @@ class ResearchToolRepository:
                     "stop_budget",
                     "stop_information_gain",
                 )
+                else "replan"
+                if decision == "replan"
                 else "continue"
             )
             session.add(

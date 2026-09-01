@@ -14,6 +14,7 @@ from app.domain.identifiers import uuid7
 from app.domain.providers import TokenUsage
 from app.domain.reports import ReportCitationView, ReportSectionView, ReportView
 from app.domain.research_runs import RunPhase, RunStatus
+from app.infrastructure.db.analysis_models import AnalysisArtifactRow, AnalysisInputRow
 from app.infrastructure.db.evidence_graph_models import (
     ResearchSourceChunkRow,
     ResearchSourceSnapshotRow,
@@ -53,6 +54,10 @@ class ReportEvidenceCard:
     source_domain: str
     source_content_hash: str
     fetched_at: datetime
+    analysis_artifact_id: UUID | None = None
+    analysis_operation: str | None = None
+    analysis_formula: str | None = None
+    analysis_result: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +148,49 @@ class ReportRepository:
                 .tuples()
                 .all()
             )
+            evidence_ids = [evidence.id for evidence, _source, _snapshot, _chunk in evidence_rows]
+            analysis_rows = (
+                (
+                    await session.execute(
+                        select(AnalysisInputRow.evidence_id, AnalysisArtifactRow)
+                        .join(
+                            AnalysisArtifactRow,
+                            AnalysisArtifactRow.id == AnalysisInputRow.analysis_artifact_id,
+                        )
+                        .where(
+                            AnalysisArtifactRow.run_id == run_id,
+                            AnalysisInputRow.evidence_id.in_(evidence_ids),
+                        )
+                        .order_by(
+                            AnalysisArtifactRow.created_at.desc(),
+                            AnalysisArtifactRow.id,
+                        )
+                    )
+                )
+                .tuples()
+                .all()
+                if evidence_ids
+                else []
+            )
+            analysis_by_evidence: dict[UUID, AnalysisArtifactRow] = {}
+            for evidence_id, artifact in analysis_rows:
+                analysis_by_evidence.setdefault(evidence_id, artifact)
+            analysis_ids = {
+                evidence_id: artifact.id
+                for evidence_id, artifact in analysis_by_evidence.items()
+            }
+            analysis_operations = {
+                evidence_id: artifact.operation
+                for evidence_id, artifact in analysis_by_evidence.items()
+            }
+            analysis_formulas = {
+                evidence_id: artifact.formula
+                for evidence_id, artifact in analysis_by_evidence.items()
+            }
+            analysis_results = {
+                evidence_id: artifact.result
+                for evidence_id, artifact in analysis_by_evidence.items()
+            }
             return ReportContext(
                 run_id=run.id,
                 goal=run.normalized_goal,
@@ -170,6 +218,10 @@ class ReportRepository:
                         source_domain=source.domain,
                         source_content_hash=snapshot.content_hash,
                         fetched_at=snapshot.fetched_at,
+                        analysis_artifact_id=analysis_ids.get(evidence.id),
+                        analysis_operation=analysis_operations.get(evidence.id),
+                        analysis_formula=analysis_formulas.get(evidence.id),
+                        analysis_result=analysis_results.get(evidence.id),
                     )
                     for evidence, source, snapshot, chunk in evidence_rows
                 ),

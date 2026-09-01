@@ -10,7 +10,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.domain.memory import MemoryItemView
-from app.domain.planning import ResearchPlan
+from app.domain.planning import ResearchPlan, build_gap_driven_questions
 from app.domain.providers import TokenUsage
 from app.infrastructure.db.research_runs import ResearchRunRepository
 from app.infrastructure.db.state_runtime import ResearchStateRuntimeRepository
@@ -29,6 +29,7 @@ class ResearchGraphState(TypedDict):
     outcome: str
     continue_research: bool
     iteration: int
+    replan_required: bool
 
 
 class ResearchGraphService:
@@ -97,6 +98,7 @@ class ResearchGraphService:
                 "outcome": "planned",
                 "continue_research": True,
                 "iteration": 0,
+                "replan_required": False,
             }
 
         async def research_node(graph_state: ResearchGraphState) -> ResearchGraphState:
@@ -118,6 +120,53 @@ class ResearchGraphService:
                 "outcome": result.outcome,
                 "continue_research": result.continue_research,
                 "iteration": iteration,
+                "replan_required": result.decision == "replan",
+            }
+
+        async def replan_node(graph_state: ResearchGraphState) -> ResearchGraphState:
+            plan = await self._runs.get_plan_for_execution(run_id)
+            if plan is None:
+                raise RuntimeError("REPLAN requires a persisted plan")
+            state = await self._states.synchronize(
+                run_id,
+                node_name="replan",
+                worker_task_id=worker_task_id,
+            )
+            gaps = [
+                (
+                    dimension.dimension_key,
+                    dimension.question,
+                    dimension.missing_reasons,
+                    dimension.priority,
+                )
+                for dimension in sorted(
+                    state.coverage_map,
+                    key=lambda item: (item.priority, item.coverage, item.dimension_key),
+                )
+                if dimension.coverage < 1.0
+            ]
+            additions = build_gap_driven_questions(plan, gaps)
+            if not additions:
+                raise RuntimeError("REPLAN was selected without an actionable coverage gap")
+            saved = await self._runs.save_replanned_questions(
+                run_id,
+                worker_task_id=worker_task_id,
+                additions=additions,
+            )
+            if not saved:
+                raise RuntimeError("REPLAN lost the worker lease or produced no new question")
+            state = await self._states.synchronize(
+                run_id,
+                node_name="replan",
+                worker_task_id=worker_task_id,
+            )
+            return {
+                "run_id": str(run_id),
+                "research_state": state.model_dump(mode="json"),
+                "outcome": f"replanned:added={len(additions)}",
+                "continue_research": True,
+                "iteration": int(graph_state.get("iteration", 0)),
+                "replan_required": False,
             }
 
         async def writer_node(_graph_state: ResearchGraphState) -> ResearchGraphState:
@@ -138,11 +187,14 @@ class ResearchGraphService:
                 "outcome": outcome,
                 "continue_research": False,
                 "iteration": int(_graph_state.get("iteration", 0)),
+                "replan_required": False,
             }
 
         def route_after_research(
             graph_state: ResearchGraphState,
-        ) -> Literal["research_iteration", "report_writer"]:
+        ) -> Literal["research_iteration", "replan", "report_writer"]:
+            if graph_state.get("replan_required", False):
+                return "replan"
             return (
                 "research_iteration"
                 if graph_state.get("continue_research", False)
@@ -153,6 +205,7 @@ class ResearchGraphService:
         # this total TypedDict under strict MyPy, although they are valid runtime nodes.
         workflow.add_node("planner", cast(Any, planner_node))
         workflow.add_node("research_iteration", cast(Any, research_node))
+        workflow.add_node("replan", cast(Any, replan_node))
         workflow.add_node("report_writer", cast(Any, writer_node))
         workflow.add_edge(START, "planner")
         workflow.add_edge("planner", "research_iteration")
@@ -161,9 +214,11 @@ class ResearchGraphService:
             route_after_research,
             {
                 "research_iteration": "research_iteration",
+                "replan": "replan",
                 "report_writer": "report_writer",
             },
         )
+        workflow.add_edge("replan", "research_iteration")
         workflow.add_edge("report_writer", END)
         graph = workflow.compile(checkpointer=checkpointer, name="deep_research_v1")
         result = await graph.ainvoke(
@@ -173,6 +228,7 @@ class ResearchGraphService:
                 "outcome": "initialized",
                 "continue_research": True,
                 "iteration": 0,
+                "replan_required": False,
             },
             config={"configurable": {"thread_id": str(run_id)}},
             durability="sync",

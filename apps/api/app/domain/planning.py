@@ -53,3 +53,43 @@ def append_dynamic_questions(
         merged.append(question.model_copy(update={"question": normalized}))
         existing_text.add(normalized.casefold())
     return plan.model_copy(update={"questions": merged})
+
+
+def build_gap_driven_questions(
+    plan: ResearchPlan,
+    gaps: list[tuple[str, str, tuple[str, ...], int]],
+) -> list[ResearchQuestion]:
+    """Turn evaluator-visible coverage gaps into bounded follow-up questions."""
+
+    used_ids = {item.id for item in plan.questions}
+    next_number = max(int(item.id[1:]) for item in plan.questions) + 1
+    additions: list[ResearchQuestion] = []
+    available = min(MAX_DYNAMIC_APPEND, MAX_DYNAMIC_QUESTIONS - len(plan.questions))
+    for dimension_key, question, missing_reasons, priority in gaps:
+        if len(additions) >= available:
+            break
+        while f"q{next_number}" in used_ids:
+            next_number += 1
+        reason_text = "; ".join(missing_reasons) or "缺少满足验收标准的独立证据"
+        follow_up = (
+            f"针对研究问题「{question}」, 还需哪些独立公开证据补齐缺口: {reason_text}?"
+        )[:500]
+        additions.append(
+            ResearchQuestion(
+                id=f"q{next_number}",
+                question=follow_up,
+                priority=max(1, min(priority, 3)),
+                rationale=f"Evaluator 发现维度 {dimension_key} 尚未满足验收标准.",
+                evidence_requirements=[
+                    *missing_reasons[:4],
+                    "至少一个此前未使用的独立来源",
+                ][:5],
+                search_hints=[
+                    question[:300],
+                    f"{question[:260]} independent source",
+                ],
+            )
+        )
+        used_ids.add(f"q{next_number}")
+        next_number += 1
+    return additions

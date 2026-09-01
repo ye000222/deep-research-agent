@@ -733,3 +733,75 @@ M5：系统加固与发布（S2-7、S2-8、S2-9）
 - 修复 GitHub Actions 中 `alembic upgrade head` 的工作目录错误：根目录 `alembic.ini` 的 `script_location=apps/api/alembic` 必须从仓库根目录执行。
 - Integration 与 Strict Release Gate 两个 Job 均已移除 `working-directory: apps/api`，改为从仓库根目录执行迁移和 Checkpoint 初始化。
 - 本地 `.venv\Scripts\alembic.exe current` 验证为 `20260831_0016 (head)`；CI YAML 解析通过。
+
+### 2026-09-01 08:56:58（Asia/Shanghai）
+
+【GitHub 推送已完成：等待远端 CI 验证】
+
+- 分支 `codex/v1-integration-hardening` 已成功推送到 `origin`。
+- 修复提交：`2c5249c fix: run alembic from repository root in CI`。
+- 本地分支已建立 `origin/codex/v1-integration-hardening` 跟踪关系；下一步需在 GitHub Actions 确认 PostgreSQL integration、Strict V1 release gate 及其余 Job 均通过。
+
+### 2026-09-01 09:34:08（Asia/Shanghai）
+
+【后续强化 1/6 已完成：Verification 与质量账本 API】
+
+- 新增 GET /api/v1/research-runs/{run_id}/verification，直接返回已持久化报告核验门、引用数量、Analysis Artifact 引用数量和最新 Report Evaluation。
+- Evaluation、Gap、Action、Verification 四组 API 已补齐成功路径契约测试；Verification 另覆盖 REPORT_NOT_READY 409 边界。
+- 定向 Ruff、MyPy 和 5 个 API 测试全部通过。
+
+下一项：把动态问题追加接入真实 REPLAN 图节点与持久化计划版本。
+
+### 2026-09-01 09:41:00（Asia/Shanghai）
+
+【后续强化 2/6 已完成：真实 REPLAN】
+
+- Evaluator 在计划遍历完但仍有关键覆盖缺口、且动态问题预算未耗尽时返回 replan。
+- LangGraph 新增独立 REPLAN 节点，基于 Coverage Map 生成最多 3 个 gap-driven 问题，Repository 创建新 plan_version 并保留旧问题状态。
+- REPLAN 图路由、动态问题边界、MyPy 与 5 个定向测试通过。
+
+### 2026-09-01 09:47:32（Asia/Shanghai）
+
+【后续强化 3/6 已完成：PostgreSQL Memory 混合检索】
+
+- Memory 使用 PostgreSQL tsvector/GIN 与 pg_trgm 两路 Top-50 召回，再用 RRF 融合并按置信度、重要性和当前 Run 相关性重排。
+- 删除运行路径中的 250 行全量候选拉取与纯 Python 词频排序。
+- Docker PostgreSQL 中文 Memory 投影与检索集成测试通过。
+
+### 2026-09-01 10:06:57（Asia/Shanghai）
+
+【后续强化 4/6 已完成：Analysis Artifact Citation】
+
+- Report Evidence Card 加载 Analysis Artifact 的 operation、formula、result 与 artifact_id。
+- 报告生成的 Citation 正式写入 analysis_artifact_id，Verification 统计派生分析引用数量。
+- Analysis Provenance 与 Report Writer 联合测试 5 个通过。
+
+### 2026-09-01 10:14:19（Asia/Shanghai）
+
+【后续强化 5/6 已完成：Checkpoint 与 Celery 崩溃重投】
+
+- AsyncPostgresSaver 真实数据库测试覆盖 aput、Pending Writes、两版本 Time Travel、旧 Checkpoint 读取和 adelete_thread。
+- 过期 Worker Lease 可由唯一 Celery 重投 Worker 接管；旧 Worker 不能提交，重复重投被拒绝。
+- task_acks_late、task_reject_on_worker_lost、prefetch=1 策略测试与 2 个 PostgreSQL 集成测试通过。
+
+### 2026-09-01 10:19:55（Asia/Shanghai）
+
+【后续强化 6/6 已完成：Prompt Injection 与完整 Golden Eval】
+
+- 增加恶意网页 Fixture；网页指令始终位于 UNTRUSTED_WEBPAGE 边界，命中注入规则的候选证据被确定性拒绝。
+- Golden Eval 新增 Stop Decision Accuracy、Gap Recall/Precision、Evidence Support Precision/Recall 和 Early-stop Error Rate。
+- 当前指标：Stop Accuracy 1.0、Gap Recall 1.0、Evidence Support Precision 1.0、Early-stop Error Rate 0.0；Release Gate 已改为同时检查全部阈值。
+
+下一项：执行全量 Ruff、MyPy、Pytest、PostgreSQL Integration、Web Build、Golden Eval 与 Secret Scan。
+
+### 2026-09-01 10:22:42（Asia/Shanghai）
+
+【六项强化后的严格 V1 Release Gate —— 已完成】
+
+- Release Gate 总结果 passed=true，报告写入 artifacts/release_gate_post_hardening.json。
+- Ruff 通过；MyPy 检查 99 个源文件、0 错误；全量 Pytest 通过。
+- PostgreSQL Integration 3/3 通过，覆盖持久化/Memory、Checkpoint 与 Celery 重投。
+- Web TypeScript 与 Vite 生产构建、Compose、迁移头 20260831_0016、Secret Scan 均通过。
+- Golden：Stop Accuracy=1.0、Gap Recall=1.0、Gap Precision=1.0、Evidence Support Precision/Recall=1.0、Early-stop Error Rate=0.0。
+
+本轮 6 项后续强化已全部完成并通过本地严格 Release Gate；下一步是提交当前变更并由 GitHub Actions 远端复验。

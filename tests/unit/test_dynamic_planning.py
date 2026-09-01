@@ -1,5 +1,10 @@
 import pytest
-from app.domain.planning import ResearchPlan, ResearchQuestion, append_dynamic_questions
+from app.domain.planning import (
+    ResearchPlan,
+    ResearchQuestion,
+    append_dynamic_questions,
+    build_gap_driven_questions,
+)
 
 
 def _plan() -> ResearchPlan:
@@ -48,6 +53,24 @@ def test_dynamic_questions_are_bounded_and_deduplicated() -> None:
 def test_dynamic_question_append_limit_is_enforced() -> None:
     with pytest.raises(ValueError, match="at most three"):
         append_dynamic_questions(_plan(), [_question(f"q{index}") for index in range(6, 10)])
+
+
+def test_evaluator_gap_builds_a_bounded_replan_question() -> None:
+    additions = build_gap_driven_questions(
+        _plan(),
+        [
+            (
+                "q1",
+                "研究国内工业视觉厂商",
+                ("缺少第二个独立来源",),
+                1,
+            )
+        ],
+    )
+
+    assert [item.id for item in additions] == ["q6"]
+    assert "独立公开证据" in additions[0].question
+    assert additions[0].priority == 1
 
 
 def _question(identifier: str) -> ResearchQuestion:

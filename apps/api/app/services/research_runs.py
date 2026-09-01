@@ -17,7 +17,7 @@ from app.domain.evaluation import EvaluationSnapshot
 from app.domain.evidence_graph import EvidenceGraphView
 from app.domain.memory import MemoryAccessView, MemoryItemView
 from app.domain.planning import ResearchPlan
-from app.domain.reports import ReportCitationView, ReportView
+from app.domain.reports import ReportCitationView, ReportView, VerificationView
 from app.domain.research_runs import AgentEventView, ResearchRunView
 from app.domain.research_tools import EvidenceView
 from app.domain.state import ResearchState
@@ -103,6 +103,8 @@ class ResearchRunServiceProtocol(Protocol):
     ) -> list[EvaluationSnapshot]: ...
 
     async def get_report(self, owner_hash: str, run_id: UUID) -> ReportView: ...
+
+    async def get_verification(self, owner_hash: str, run_id: UUID) -> VerificationView: ...
 
     async def get_report_citation(
         self, owner_hash: str, report_id: UUID, citation_number: int
@@ -226,6 +228,26 @@ class ResearchRunService:
     async def get_report(self, owner_hash: str, run_id: UUID) -> ReportView:
         await self._repository.get(owner_hash, run_id)
         return await self._report_repository.get_for_run(owner_hash, run_id)
+
+    async def get_verification(self, owner_hash: str, run_id: UUID) -> VerificationView:
+        """Return the persisted report gate and its latest report-scoped evaluation."""
+
+        report = await self.get_report(owner_hash, run_id)
+        evaluations = await self._research_repository.list_evaluations(owner_hash, run_id)
+        report_evaluations = [item for item in evaluations if item.scope.value == "report"]
+        latest = report_evaluations[-1] if report_evaluations else None
+        return VerificationView(
+            run_id=run_id,
+            report_id=report.report_id,
+            report_status=report.status,
+            verified=bool(report.verification_result.get("verified", False)),
+            citation_count=len(report.citations),
+            analysis_artifact_citation_count=sum(
+                citation.analysis_artifact_id is not None for citation in report.citations
+            ),
+            verification_result=report.verification_result,
+            latest_report_evaluation=latest,
+        )
 
     async def get_report_citation(
         self, owner_hash: str, report_id: UUID, citation_number: int

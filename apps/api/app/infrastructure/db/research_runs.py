@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.identifiers import uuid7
-from app.domain.planning import ResearchPlan, ResearchQuestion
+from app.domain.planning import ResearchPlan, ResearchQuestion, append_dynamic_questions
 from app.domain.providers import TokenUsage
 from app.domain.research_runs import (
     TERMINAL_RUN_STATUSES,
@@ -376,13 +376,24 @@ class ResearchRunRepository:
             run = await session.scalar(
                 select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
             )
-            if run is None or RunStatus(run.status) != RunStatus.QUEUED:
+            if run is None:
                 return False
             now = datetime.now(UTC)
-            run.status = RunStatus.RUNNING.value
-            run.phase = (
-                RunPhase.RESEARCHING.value if run.plan_version > 0 else RunPhase.PLANNING.value
+            current_status = RunStatus(run.status)
+            expired_takeover = (
+                current_status == RunStatus.RUNNING
+                and run.lease_until is not None
+                and run.lease_until <= now
             )
+            if current_status != RunStatus.QUEUED and not expired_takeover:
+                return False
+            run.status = RunStatus.RUNNING.value
+            if not expired_takeover:
+                run.phase = (
+                    RunPhase.RESEARCHING.value
+                    if run.plan_version > 0
+                    else RunPhase.PLANNING.value
+                )
             run.started_at = run.started_at or now
             run.updated_at = now
             run.lease_owner = "celery-worker"
@@ -392,9 +403,17 @@ class ResearchRunRepository:
             await self._append_event(
                 session,
                 run,
-                event_type="run.started",
-                public_summary="后台 Worker 已领取任务并获得执行租约。",
-                refs={"run_id": str(run.id), "phase": run.phase},
+                event_type="run.recovered" if expired_takeover else "run.started",
+                public_summary=(
+                    "检测到过期 Worker 租约; Celery 重投任务已接管并从 Checkpoint 恢复。"
+                    if expired_takeover
+                    else "后台 Worker 已领取任务并获得执行租约。"
+                ),
+                refs={
+                    "run_id": str(run.id),
+                    "phase": run.phase,
+                    "recovered_from_expired_lease": expired_takeover,
+                },
                 metrics=None,
             )
             return True
@@ -465,6 +484,115 @@ class ResearchRunRepository:
                 },
             )
 
+            return True
+
+    async def save_replanned_questions(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        additions: list[ResearchQuestion],
+    ) -> bool:
+        """Create a new immutable plan version while preserving completed question states."""
+
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
+            )
+            if (
+                run is None
+                or RunStatus(run.status) != RunStatus.RUNNING
+                or run.worker_task_id != worker_task_id
+                or run.plan_version < 1
+            ):
+                return False
+            old_rows = (
+                await session.scalars(
+                    select(ResearchPlanItemRow)
+                    .where(
+                        ResearchPlanItemRow.run_id == run_id,
+                        ResearchPlanItemRow.plan_version == run.plan_version,
+                    )
+                    .order_by(ResearchPlanItemRow.priority, ResearchPlanItemRow.question_id)
+                )
+            ).all()
+            constraints = run.constraints
+            raw_completion = constraints.get("plan_completion_criteria", [])
+            current = ResearchPlan(
+                goal=str(constraints.get("plan_goal", run.normalized_goal)),
+                scope_summary=str(constraints.get("plan_scope_summary", run.normalized_goal)),
+                questions=[
+                    ResearchQuestion(
+                        id=row.question_id,
+                        question=row.question,
+                        priority=row.priority,
+                        rationale=row.rationale,
+                        evidence_requirements=row.evidence_requirements,
+                        search_hints=row.search_hints,
+                    )
+                    for row in old_rows
+                ],
+                completion_criteria=(
+                    [str(item) for item in raw_completion]
+                    if isinstance(raw_completion, list)
+                    else []
+                ),
+            )
+            revised = append_dynamic_questions(current, additions)
+            old_ids = {row.question_id for row in old_rows}
+            added = [item for item in revised.questions if item.id not in old_ids]
+            if not added:
+                return False
+            old_status = {row.question_id: row.status for row in old_rows}
+            plan_version = run.plan_version + 1
+            for question in revised.questions:
+                session.add(
+                    ResearchPlanItemRow(
+                        id=uuid7(),
+                        run_id=run.id,
+                        plan_version=plan_version,
+                        question_id=question.id,
+                        question=question.question,
+                        priority=question.priority,
+                        rationale=question.rationale,
+                        evidence_requirements=question.evidence_requirements,
+                        search_hints=question.search_hints,
+                        status=old_status.get(question.id, "pending"),
+                    )
+                )
+            run.plan_version = plan_version
+            run.phase = RunPhase.RESEARCHING.value
+            run.termination_reason = None
+            run.updated_at = datetime.now(UTC)
+            run.state_version += 1
+            for question in added:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="plan.question_added",
+                    public_summary=f"Evaluator 缺口触发动态问题 {question.id}.",
+                    refs={
+                        "plan_version": plan_version,
+                        "question_id": question.id,
+                        "question": question.question,
+                        "created_reason": "evaluation_gap",
+                    },
+                    metrics=None,
+                )
+            await self._append_event(
+                session,
+                run,
+                event_type="plan.revised",
+                public_summary=(
+                    f"REPLAN 已创建计划版本 {plan_version}, 新增 {len(added)} 个问题."
+                ),
+                refs={
+                    "plan_version": plan_version,
+                    "added_question_ids": [item.id for item in added],
+                    "question_count": len(revised.questions),
+                },
+                metrics=None,
+            )
             return True
 
     async def interrupt_for_pending_planner(

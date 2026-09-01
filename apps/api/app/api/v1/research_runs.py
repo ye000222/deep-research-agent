@@ -27,7 +27,7 @@ from app.domain.evaluation import EvaluationSnapshot
 from app.domain.evidence_graph import EvidenceGraphView
 from app.domain.memory import MemoryAccessView, MemoryItemView
 from app.domain.planning import ResearchPlan
-from app.domain.reports import ReportView
+from app.domain.reports import ReportView, VerificationView
 from app.domain.research_runs import TERMINAL_RUN_STATUSES, ResearchRunView
 from app.domain.research_tools import EvidenceView
 from app.domain.state import (
@@ -532,6 +532,23 @@ async def _get_state(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error_code": "RESEARCH_STATE_NOT_READY"},
+        ) from exc
+
+
+@router.get("/{run_id}/verification", response_model=VerificationView)
+async def get_verification(
+    run_id: UUID,
+    client: Annotated[ClientSession, Depends(get_client_session)],
+    service: Annotated[ResearchRunServiceProtocol, Depends(get_research_run_service)],
+) -> VerificationView:
+    try:
+        return await service.get_verification(client.owner_hash, run_id)
+    except ResearchRunNotFoundError as exc:
+        raise _not_found() from exc
+    except ReportNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error_code": "REPORT_NOT_READY"},
         ) from exc
 
 

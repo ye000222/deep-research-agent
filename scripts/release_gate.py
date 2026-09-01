@@ -118,7 +118,7 @@ def check_golden_eval() -> dict[str, object]:
             "from evals.graders.evaluation_grader import grade_dataset; "
             "cases=json.loads(Path('evals/datasets/v1_golden.json').read_text(encoding='utf-8')); "
             "r=grade_dataset(cases); print(json.dumps(r, ensure_ascii=False)); "
-            "raise SystemExit(0 if r['accuracy'] >= 0.90 else 1)"
+            "raise SystemExit(0 if r['release_gate_passed'] else 1)"
         )],
         cwd=ROOT,
         capture_output=True,
