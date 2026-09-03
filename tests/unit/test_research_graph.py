@@ -41,6 +41,7 @@ class FakeRuns:
         self.plan: ResearchPlan | None = None
         self.saved = 0
         self.replanned = 0
+        self.gap_tasks: list[tuple[str, tuple[str, ...]]] = []
 
     async def get_plan_for_execution(self, run_id: UUID) -> ResearchPlan | None:
         return self.plan
@@ -59,6 +60,11 @@ class FakeRuns:
         self.plan = self.plan.model_copy(
             update={"questions": [*self.plan.questions, *additions]}  # type: ignore[misc]
         )
+        self.replanned += 1
+        return True
+
+    async def save_gap_resolution_plan(self, run_id: UUID, **kwargs: object) -> bool:
+        self.gap_tasks = kwargs["gaps"]  # type: ignore[assignment]
         self.replanned += 1
         return True
 
@@ -233,7 +239,10 @@ async def test_graph_routes_evaluator_replan_through_persisted_plan_revision() -
     assert outcome == "report_completed:completed:citations=5"
     assert runs.replanned == 1
     assert runs.plan is not None
-    assert len(runs.plan.questions) == 6
+    assert len(runs.plan.questions) == 5
+    assert runs.gap_tasks == [
+        ("q1", ("A second independent source is required.",)),
+    ]
     assert states.nodes == [
         "planner",
         "research_iteration",

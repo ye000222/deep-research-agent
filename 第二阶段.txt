@@ -826,3 +826,96 @@ M5：系统加固与发布（S2-7、S2-8、S2-9）
 - SearXNG、API、Worker、Dispatcher 已重启。
 - /readyz 状态为 ready，PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部健康。
 - 旧失败任务保持终态用于审计；下一步必须从网页发起全新研究任务完成最终人工验收。
+
+### 2026-09-01 17:21:08（Asia/Shanghai）
+
+【V1.0.0 Release 已发布】
+
+- 修复分支已合并至 main。
+- 合并后的 GitHub Actions 五项检查全部通过。
+- GitHub Release v1.0.0 已正式发布。
+- 第二阶段开发、严格 Release Gate 与版本发布全部完成。
+
+### 2026-09-02 12:09:04（Asia/Shanghai）
+
+【研究进度可视化已完成】
+
+- 在研究工作台新增总体执行进度条，按目标分析、研究计划、搜索与阅读、证据评估、缺口补充、报告生成、最终核验七个阶段展示。
+- 进度由真实服务端 `phase`、Plan 完成数、Coverage、报告章节事件和最终核验事件计算；失败、取消和技术降级不会伪装成 100% 完成。
+- Research Plan 每个问题新增覆盖率条、已接受证据数和独立来源数，继续保留完成、部分完成、技术降级、阻塞和待处理状态。
+- 新增 Quality Progress 面板，展示总体覆盖度、来源独立性、交叉验证率和引用支持度。
+- 新增 Resource Budget 面板，展示研究轮次、搜索次数、读取页面和模型 Token 的实际消耗与上限，并在资源使用达到 85% 时发出视觉警示。
+- 新增 Information Gain 趋势条和低增益连续轮次提示，继续/重规划/停止原因沿用服务端公开决策摘要。
+- 前端 TypeScript 类型检查和 Vite 生产构建通过；后续应使用新任务进行真实联网运行，校准阶段权重和剩余时间估算。
+
+### 2026-09-02 12:10:59（Asia/Shanghai）
+
+【进度条显示细节补充】
+
+- REPLAN 事件现在会在阶段时间线上显示为“缺口补充”，直到新的研究动作发生；避免重新规划被隐藏在普通 Research 阶段中。
+- 增加 REPLAN 活动标签和最终前端构建复验，Vite 生产构建通过。
+
+### 2026-09-02 12:12:15（Asia/Shanghai）
+
+【进度可视化已部署】
+
+- Web 镜像已重建并由 Docker Compose 重启，API、Worker、Dispatcher、PostgreSQL、Redis、SearXNG 和 Web 均在运行。
+- `http://localhost:5174/` 已重新加载并确认首页可访问；创建研究任务后将显示实时进度面板。
+
+### 2026-09-02 12:32:14（Asia/Shanghai）
+
+【WORKER_EXECUTION_FAILED 长 URL 崩溃修复已完成】
+
+- 根因已确认：`context_items.source_ref_id` 原为 `VARCHAR(200)`，百分号编码后的中文网页 URL 可达到 219 字符，导致 PostgreSQL `StringDataRightTruncation`，Worker 随后被统一记录为 `WORKER_EXECUTION_FAILED`。
+- 生产 Evidence Extractor 现在将上下文来源引用写为已持久化来源的 UUID（`source_ref_type=source`）；无来源 UUID 的独立调用仍保留 URL 兼容回退。
+- 新增 Alembic 迁移 `20260902_0017`，将 `context_items.source_ref_id` 扩展为 PostgreSQL `TEXT`，兼容历史 URL 引用并避免长度上限再次成为运行时故障点。
+- Context Budget Manager 对 DataError/IntegrityError 增加持久化边界，Worker 返回稳定错误码 `CONTEXT_MANIFEST_PERSISTENCE_FAILED`；前端同步显示可恢复提示，不再只显示笼统执行失败。
+- 新增长 URL Context Manifest PostgreSQL 集成回归测试，并验证来源引用完整保留；研究循环单元测试验证每个网页读取均传递 UUID 来源引用。
+- 验证结果：Ruff 通过，MyPy（99 个源文件）通过，相关单元测试 15/15 通过，PostgreSQL 集成测试通过；Docker 迁移已执行，当前 schema 版本为 `20260902_0017`，`source_ref_id` 类型为 `text`，API/Worker/Dispatcher 已重启运行。
+
+下一步：从网页创建一条全新研究任务，确认真实联网路径能够持续产生 Evidence；若仍失败，按新的稳定错误码和 Worker 日志继续定位，而不是依据旧的 `WORKER_EXECUTION_FAILED` 泛化判断。
+
+### 2026-09-02 12:33:04（Asia/Shanghai）
+
+【修复后运行态复验已完成】
+
+- Docker Compose 已重建并重启 API、Worker、Dispatcher；PostgreSQL、Redis、SearXNG 和 Web 保持运行。
+- 业务迁移版本已核对为 `20260902_0017`，`context_items.source_ref_id` 实际类型为 PostgreSQL `text`。
+- 全量 Ruff 与 MyPy 复验通过；相关单元测试及 PostgreSQL 集成测试通过。
+
+### 2026-09-02 12:44:03（Asia/Shanghai）
+
+【兼容模型 JSON 计划输出修复已完成】
+
+- 现象：网页任务因 `MODEL_OUTPUT_INVALID` 停止，前端提示兼容模型两次未返回可解析 JSON，导致计划未完成、进度条无法达到 100%。
+- 根因：OpenAI-compatible Adapter 在 JSON Mode 返回 200 但内容非法时，第二次重试仍携带 `response_format=json_object`，没有真正切换到降级路径；当前失败任务使用 `deepseek-v4-flash` 已复现该行为。
+- 修复：JSON Mode 解析失败后，第二次调用强制移除 `response_format`，改用显式 Prompt JSON；增加 `<think>...</think>` 清理、消息分段内容和 Tool Arguments 解析兼容；Planner 默认输出预算由 3,000 提高至 6,000（仍受用户配置上限约束）。
+- 测试：LLM Adapter 8/8、Planner 4/4 通过；新增断言确认重试请求不再携带 `response_format`；MyPy 99 个源文件通过。
+- 前端错误提示已改为明确说明已尝试 JSON Mode 与 Prompt JSON，并指导检查模型结构化输出能力。
+
+下一步：重建并重启 API/Worker 后，用当前 DeepSeek 配置创建新任务；若仍出现 `MODEL_OUTPUT_INVALID`，应优先在模型设置中改用支持 JSON/结构化输出的 Chat 模型，或填写更高的 `max_output_tokens`，不要恢复旧失败任务反复重放。
+
+### 2026-09-02 12:47:07（Asia/Shanghai）
+
+【兼容模型修复已部署】
+
+- API、Worker、Dispatcher 镜像已重建并由 Docker Compose 强制重启。
+- Web TypeScript 检查和 Vite 生产构建通过。
+- 旧失败任务不会自动改变；请用同一连接配置创建新研究任务验证新的 Prompt JSON 降级路径。
+
+### 2026-09-02 12:48:28（Asia/Shanghai）
+
+【JSON 输出修复运行态复验已完成】
+
+- LLM Adapter、Planner 回归测试通过；Ruff 和 MyPy 全量通过。
+- API、Worker、Dispatcher、PostgreSQL、Redis、SearXNG、Web 均处于运行状态。
+- Web 生产构建通过；请刷新网页后用新任务验证，旧任务不会自动重放新逻辑。
+
+### 2026-09-03 11:07:25（Asia/Shanghai）
+
+【历史任务恢复后的真实 PostgreSQL 核验】
+
+- 已使用当前仓库和 Docker PostgreSQL 环境运行 `RUN_POSTGRES_INTEGRATION=1`。
+- `test_checkpoint_and_redelivery.py`、`test_postgres_recovery.py`、`test_provider_profile_persistence.py` 共 3 项集成测试全部通过。
+- 本次核验确认 Checkpoint/Celery 重投、恢复 smoke、Provider 配置持久化路径可运行。
+- 仍需在 GitHub Actions 上重新触发 CI，确认远端 PostgreSQL 与 Strict V1 release gate 使用同一结果；当前工作区尚有未提交修改。

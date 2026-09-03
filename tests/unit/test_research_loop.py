@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from app.domain.providers import TokenUsage, UsageAccuracy
@@ -7,6 +7,7 @@ from app.domain.research_tools import ReadPage, SearchResult
 from app.infrastructure.db.research_tools import IterationEvaluation, ResearchTarget
 from app.llm.adapters import ModelGatewayError
 from app.services.research_loop import ResearchLoopService, _prioritize_search_results
+from app.tools.errors import ToolExecutionError
 
 
 class FakeRepository:
@@ -24,6 +25,8 @@ class FakeRepository:
         self.finished = False
         self.finish_calls = 0
         self.stop_after = 1
+        self.last_attempt_outcome: str | None = None
+        self.allow_search_failure = False
 
     async def prepare_target(self, *args: object, **kwargs: object) -> ResearchTarget:
         return self.target
@@ -32,7 +35,8 @@ class FakeRepository:
         return None
 
     async def record_tool_failure(self, *args: object, **kwargs: object) -> None:
-        raise AssertionError("search must not fail")
+        if not self.allow_search_failure:
+            raise AssertionError("search must not fail")
 
     async def record_extraction_started(self, *args: object, **kwargs: object) -> None:
         return None
@@ -49,6 +53,7 @@ class FakeRepository:
     async def finish_iteration(
         self, *args: object, **kwargs: object
     ) -> IterationEvaluation:
+        self.last_attempt_outcome = str(kwargs.get("attempt_outcome"))
         self.finished = True
         self.finish_calls += 1
         should_continue = self.finish_calls < self.stop_after
@@ -64,8 +69,13 @@ class FakeSearch:
     async def search(self, query: str, *, limit: int) -> list[SearchResult]:
         return [
             SearchResult(title=f"Source {rank}", url=f"https://example.com/{rank}", rank=rank)
-            for rank in (1, 2)
+            for rank in (1, 2, 3)
         ]
+
+
+class FailingSearch:
+    async def search(self, query: str, *, limit: int) -> list[SearchResult]:
+        raise ToolExecutionError("SEARCH_PROVIDER_DEGRADED", retryable=True)
 
 
 class FakeReader:
@@ -83,9 +93,11 @@ class FakeExtractor:
     def __init__(self) -> None:
         self.calls = 0
         self.error_code = "EVIDENCE_OUTPUT_SCHEMA_INVALID"
+        self.source_ids: list[object] = []
 
     async def extract(self, *args: object, **kwargs: object) -> tuple[object, ...]:
         self.calls += 1
+        self.source_ids.append(kwargs["source_id"])
         if self.calls == 2:
             raise ModelGatewayError(
                 self.error_code,
@@ -103,6 +115,15 @@ class FakeExtractor:
         )
 
 
+class AlwaysInvalidExtractor:
+    async def extract(self, *args: object, **kwargs: object) -> tuple[object, ...]:
+        raise ModelGatewayError(
+            "MODEL_OUTPUT_INVALID",
+            retryable=False,
+            detail_code="OUTPUT_INVALID_PROMPT_JSON_FINISH_LENGTH_CHARS_6000",
+        )
+
+
 class FakeArtifacts:
     async def save_page(self, run_id: object, source_id: object, text: str) -> str:
         return "runs/test/source.txt"
@@ -111,18 +132,21 @@ class FakeArtifacts:
 @pytest.mark.asyncio
 async def test_schema_failure_is_isolated_to_page_and_iteration_finishes() -> None:
     repository = FakeRepository()
+    extractor = FakeExtractor()
     service = ResearchLoopService(  # type: ignore[arg-type]
         repository,
         FakeSearch(),
         FakeReader(),
-        FakeExtractor(),
+        extractor,
         FakeArtifacts(),
     )
 
     outcome = await service.run_iteration(uuid4(), worker_task_id="worker-1")
 
-    assert outcome == "research_stopped:ready_to_write:iterations=1:pages=2:accepted=1"
+    assert outcome == "research_stopped:ready_to_write:iterations=1:pages=3:accepted=2"
     assert repository.extraction_failures == ["EVIDENCE_OUTPUT_SCHEMA_INVALID"]
+    assert len(extractor.source_ids) == 3
+    assert all(isinstance(source_id, UUID) for source_id in extractor.source_ids)
     assert repository.finished is True
 
 @pytest.mark.asyncio
@@ -139,7 +163,7 @@ async def test_evaluator_continues_without_manual_resume() -> None:
 
     outcome = await service.run_iteration(uuid4(), worker_task_id="worker-1")
 
-    assert outcome == "research_stopped:ready_to_write:iterations=2:pages=4:accepted=3"
+    assert outcome == "research_stopped:ready_to_write:iterations=2:pages=6:accepted=5"
     assert repository.finish_calls == 2
 
 @pytest.mark.asyncio
@@ -157,8 +181,31 @@ async def test_retryable_model_failure_is_isolated_to_page() -> None:
 
     outcome = await service.run_iteration(uuid4(), worker_task_id="worker-1")
 
-    assert outcome == "research_stopped:ready_to_write:iterations=1:pages=2:accepted=1"
+    assert outcome == "research_stopped:ready_to_write:iterations=1:pages=3:accepted=2"
     assert repository.extraction_failures == ["MODEL_TIMEOUT"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_structured_extraction_failure_opens_capability_circuit() -> None:
+    repository = FakeRepository()
+    service = ResearchLoopService(  # type: ignore[arg-type]
+        repository,
+        FakeSearch(),
+        FakeReader(),
+        AlwaysInvalidExtractor(),
+        FakeArtifacts(),
+    )
+
+    with pytest.raises(ModelGatewayError) as raised:
+        await service.run_one_iteration(uuid4(), worker_task_id="worker-1")
+
+    assert raised.value.code == "MODEL_CAPABILITY_INSUFFICIENT"
+    assert raised.value.detail_code == "EVIDENCE_EXTRACTOR_CIRCUIT_OPEN_AFTER_2_SOURCES"
+    assert repository.extraction_failures == [
+        "MODEL_OUTPUT_INVALID",
+        "MODEL_OUTPUT_INVALID",
+    ]
+    assert repository.finished is False
 
 
 def test_public_html_sources_are_read_before_paywalls_and_pdfs() -> None:
@@ -177,3 +224,36 @@ def test_public_html_sources_are_read_before_paywalls_and_pdfs() -> None:
         "Publisher",
         "PDF",
     ]
+
+
+def test_source_owner_diversity_beats_a_repeated_domain() -> None:
+    results = [
+        SearchResult(title="Repeated", url="https://www.example.org/second", rank=1),
+        SearchResult(title="Independent", url="https://public.example.net/report", rank=2),
+    ]
+
+    ordered = _prioritize_search_results(
+        results,
+        query="industrial inspection report",
+        used_owner_keys={"example.org"},
+    )
+
+    assert ordered[0].title == "Independent"
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_does_not_count_as_research_iteration() -> None:
+    repository = FakeRepository()
+    repository.allow_search_failure = True
+    service = ResearchLoopService(  # type: ignore[arg-type]
+        repository,
+        FailingSearch(),
+        FakeReader(),
+        FakeExtractor(),
+        FakeArtifacts(),
+    )
+
+    outcome = await service.run_one_iteration(uuid4(), worker_task_id="worker-1")
+
+    assert outcome.outcome == "research_stopped:ready_to_write:iterations=0:pages=0:accepted=0"
+    assert repository.last_attempt_outcome == "provider_error"

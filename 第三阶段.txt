@@ -1,0 +1,463 @@
+Deep Research Agent V1 第三阶段规划
+===================================
+
+文档名称：第三阶段.txt
+阶段名称：V1.1 稳定性、可观测性与质量工程
+生成时间：2026-09-02 13:02:45
+规划依据：当前项目代码、测试、Docker 运行状态、GitHub CI 状态及 V1 功能审查结果
+
+一、阶段目标
+------------
+
+V1 主功能已经形成完整闭环：研究计划、搜索、网页读取、证据提取、Evidence Graph、Coverage Map、Context Budget、Memory、动态 REPLAN、Evaluation、Verification、报告引用和进度可视化均已具备。
+
+第三阶段不优先扩展 PDF、多模态、Embedding 或 Multi-Agent，而是把当前实现固化为可重复、可诊断、可度量的 V1.1 稳定版本。
+
+本阶段最终目标：
+
+- 代码、数据库 Migration、Docker 和 GitHub CI 可重复构建
+- 测试数据库与开发数据库完全隔离
+- Worker 崩溃、Lease 过期和 Celery 重投不会制造僵尸任务或重复副作用
+- 每次 LLM 调用均可审计，但不泄露 Prompt、API Key 或原始敏感响应
+- 研究启动前即可知道 Provider、Model 和 JSON/Tool 能力是否可用
+- 通过真实端到端 Golden Benchmark 验证 Coverage、Citation 和 Stop Decision
+- 失败任务能够解释失败阶段、失败原因和是否可以恢复
+- 完成 V1.1 Release Gate 并发布 v1.1.0
+
+二、当前审查结论
+----------------
+
+1. 代码与发布状态
+
+- 当前工作区仍有一批未提交修改，包括进度可视化、长 URL 修复、兼容模型 JSON 修复和新的数据库 Migration。
+- 已发布的 v1.0.0 不等于当前工作区的最新实现，必须先完成一次发布基线固化。
+- [scripts/release_gate.py] 当前仍固定检查旧 Migration 版本，实际数据库已进入 20260902_0017，Release Gate 应改为动态读取并校验最新 head。
+
+2. 任务生命周期
+
+- 开发数据库中存在大量历史 running、interrupted 和 failed 任务。
+- 部分 running 任务来自集成测试，Worker Lease 已过期但没有被统一回收。
+- 测试数据污染开发数据库会导致前端任务统计、运行状态和故障判断失真。
+
+3. 模型诊断能力
+
+- Provider Adapter 已有基础降级逻辑，但运行时缺少完整的 LLM Call 审计链。
+- finish_reason、尝试次数、降级策略、Provider Request ID、延迟和输出 Hash 尚未形成稳定的持久化记录。
+- 兼容模型的 JSON 输出问题往往只能在研究运行后暴露，缺少启动前 Capability Test。
+
+4. 质量验证
+
+- 当前单元测试、API 测试和集成测试覆盖了主要结构，但真实 Provider 和真实端到端研究样本仍需扩大。
+- 需要建立至少 30 个固定 Golden Case，分别评估中文、英文、来源稀缺、冲突来源、Prompt Injection 和模型降级场景。
+
+三、任务分解与推荐顺序
+----------------------
+
+### S3-0：固化最新发布基线
+
+工作内容：
+
+- 建立 `codex/v1.1-stability` 分支。
+- 盘点当前所有未提交修改，确认每项修改属于 V1.1 范围后统一提交。
+- 更新 Release Gate，动态读取 Alembic 当前 head，不再硬编码 0016。
+- 校验代码 Migration head、运行数据库 head 和 CI 使用的 head 一致。
+- 确认 `启动操作.txt` 是否纳入仓库。
+- 运行完整本地检查、Strict V1 Release Gate 和 GitHub CI。
+
+验收标准：
+
+- 工作区干净，变更均有明确 Commit。
+- 最新 Migration 为 20260902_0017，且 Release Gate 能自动识别未来新增 head。
+- 五项 GitHub CI 检查全部通过。
+- V1.0.0 数据库能够升级到当前版本。
+
+### S3-1：测试数据库隔离与任务生命周期修复
+
+工作内容：
+
+- 为集成测试使用独立 PostgreSQL Database 或独立 Schema。
+- 测试结束后清理 Run、Event、Evidence、Checkpoint 和 Outbox 数据。
+- 增加 stale-run reconciler，扫描过期 Worker Lease。
+- 将过期 running 任务转为 interrupted/recoverable，避免永久停留。
+- API/Worker 启动时执行轻量恢复扫描。
+- 增加 Worker 被终止、Redis 重投、Lease 过期和恢复失败测试。
+
+验收标准：
+
+- 集成测试不污染开发数据库。
+- 测试完成后残留业务任务为 0。
+- 超过 Lease 时间的 running 任务为 0。
+- Worker 崩溃恢复后不重复保存 Evidence、扣减预算或写入重复事件。
+
+### S3-2：LLM 调用可观测性
+
+工作内容：
+
+- 增加 `llm_calls` 持久化记录。
+- 记录 Run、Action、Node、Role、Adapter、Endpoint Host 和 Model。
+- 记录 Structured Output 策略、Tool Calling 策略、尝试次数和降级路径。
+- 记录 Provider Request ID、finish_reason、延迟、Token 用量和 estimated 标记。
+- 记录返回字符数、脱敏内容 Hash、稳定错误码和脱敏错误摘要。
+- 在研究工作台增加模型调用诊断面板。
+
+禁止保存：
+
+- API Key、Authorization Header。
+- 完整 Prompt、隐藏推理和未脱敏 Provider 原始响应。
+
+验收标准：
+
+- 每一次模型调用都有审计记录。
+- `MODEL_OUTPUT_INVALID` 能定位到具体尝试、策略和终止原因。
+- Secret 泄漏扫描结果为 0。
+- 不因增加审计而把敏感内容写入日志、SSE、Celery 或浏览器存储。
+
+### S3-3：真实 Provider 能力测试
+
+工作内容：
+
+- 实现 `POST /api/v1/llm/connections/test`。
+- 实现 `POST /api/v1/llm/profiles/{id}/test`。
+- Quick Test 检查 URL、TLS、鉴权、Model、最小生成、延迟和 Request ID。
+- Full Test 检查 Native JSON Schema、JSON Mode、Prompt JSON 降级、Tool Calling、Streaming、Usage、Context Window 和最大输出。
+- 将能力测试结果写入 Capability Snapshot，并在创建 Run 时固化。
+- 为 OpenAI Responses、Anthropic Messages、Google Gemini 和 OpenAI-compatible Chat 建立独立契约测试。
+
+验收标准：
+
+- 错误 Key、错误 Model、错误协议、网络错误和能力不足可以准确区分。
+- 兼容模型在研究启动前即可确定 JSON 和 Tool Calling 策略。
+- 能力不足时任务被明确拒绝，不运行到 Planner 才失败。
+- Live Smoke Test 与 CI Mock Test 分离，避免外部费用和网络波动影响确定性测试。
+
+### S3-4：真实端到端质量基准
+
+建立至少 30 个固定 Golden Case，覆盖：
+
+- 中文和英文研究问题。
+- 技术路线、厂商产品、市场规模、趋势预测和数据集。
+- 来源稀缺、网页不可访问和来源相互冲突。
+- Prompt Injection 页面。
+- JSON 输出异常、Provider 超时和有限重试。
+- 动态追加问题和 Analysis Artifact 引用。
+
+每个案例记录：
+
+- 任务完成状态和 Stop Reason。
+- accepted Evidence 数量。
+- Global Coverage 和 Priority 1 Coverage。
+- 来源质量、独立性、多样性和新鲜度。
+- Citation Completeness、Citation Support 和关键事实可追溯率。
+- 墙钟时间、Token、LLM 调用次数和 Provider 错误率。
+- 无证据报告数量、僵尸任务数量和重复副作用数量。
+
+建议目标：
+
+- 可访问来源案例完成率不低于 90%。
+- Priority 1 问题覆盖率不低于 80%。
+- 关键事实 Citation Support 达到 100%。
+- 数字和日期引用率达到 100%。
+- Golden Set 的 Stop Decision 一致率不低于 90%。
+- Secret、SSRF、Prompt Injection 逃逸数量为 0。
+
+### S3-5：基于基准的研究质量调优
+
+只根据 S3-4 的失败数据调整：
+
+- Query 改写、同义词扩展和重复 Query 识别。
+- 来源类型、Owner 独立性和转载去重。
+- 高价值候选网页优先级。
+- 每个问题的自适应预算与信息增益阈值。
+- 连续低收益轮次和停止条件。
+- Planner、Extractor、Evaluator 的重试、降级和错误边界。
+- 冲突、新鲜度和来源不足的专项搜索。
+- 报告写作前的 Evidence 缺口修复。
+
+验收标准：
+
+- 调优前后使用同一 Golden Set 对比。
+- Coverage 提升不能以 Citation Support 或来源独立性下降为代价。
+- 不允许通过放宽 Evidence 校验来人为提高覆盖率。
+
+### S3-6：前端诊断与进度语义完善
+
+工作内容：
+
+- 展示当前阶段、当前问题、已用预算和预计剩余阶段。
+- 展示最近一次成功动作、当前失败动作和重试倒计时。
+- 展示 Provider/Model 当前状态及 Capability Snapshot。
+- 对可恢复失败提供“恢复研究”按钮。
+- 失败任务显示实际停止阶段和百分比，不伪装成 100%。
+
+进度规则：
+
+- `completed`、`completed_with_limitations`：100%。
+- `failed`：保持失败时的实际百分比并标红。
+- `interrupted`：保持当前百分比并标记可恢复。
+- `cancelled`：显示取消时的实际百分比。
+
+### S3-7：发布 V1.1.0
+
+发布前必须同时满足：
+
+- 连续三次 GitHub CI 全绿。
+- V1.0.0 数据库升级测试通过。
+- 真实 Provider Smoke Test 通过。
+- 30 个端到端案例达到质量门槛。
+- 过期 running 任务数量为 0。
+- Release Gate 能动态验证最新 Migration。
+- Secret、SSRF、Prompt Injection 测试全部通过。
+- 进度文档记录最终 Release Gate 结果和完成时间。
+- 发布 Git Tag `v1.1.0` 和 GitHub Release。
+
+四、推荐时间安排
+----------------
+
+第一周：S3-0、S3-1
+
+- 先解决未提交变更、Migration 校验、测试隔离和僵尸任务。
+
+第二周：S3-2、S3-3
+
+- 建立 LLM 调用审计和启动前 Provider 能力验证。
+
+第三周：S3-4、S3-5
+
+- 建立端到端基准，并根据真实失败样本调优研究策略。
+
+第四周：S3-6、S3-7
+
+- 完善前端诊断、运行恢复和最终发布流程。
+
+单人全栈开发预计 12～18 个工作日，实际时间取决于真实 Provider 测试和 Golden Case 的失败数量。
+
+五、本阶段暂缓内容
+------------------
+
+在 V1.1 稳定版本完成前暂缓：
+
+- PDF、图片、音频和视频输入。
+- Embedding API、pgvector 和独立向量数据库。
+- Multi-Agent、Agent Handoff 和并行 Researcher。
+- 多用户、权限、计费和订阅。
+- 大规模异步并行搜索。
+
+原因：这些功能会扩大状态、成本和故障面，当前应先确保已有 Evidence、Context、Memory、Evaluation 和报告链路稳定可验证。
+
+六、V1.1 完成定义
+-----------------
+
+只有同时满足以下条件，才可宣称第三阶段完成：
+
+- 工作区和发布分支状态清晰，所有最新修复已提交。
+- GitHub CI 连续三次通过。
+- 数据库 Migration 可从 v1.0.0 升级到最新版本。
+- 测试数据库与开发数据库隔离。
+- 僵尸 running 任务自动回收，数量为 0。
+- 所有 LLM 调用可审计且无 Secret 泄漏。
+- Provider 能力在研究开始前完成验证。
+- Checkpoint 恢复和 Celery 重投不产生重复副作用。
+- Golden Benchmark 达到 Coverage、Citation、Stop Decision 和安全门槛。
+- 关键事实 100% 可追溯到 Claim、Evidence、Chunk、Snapshot 和 URL。
+- 失败任务能够显示真实阶段、错误码和恢复建议。
+- `第二阶段.txt` 和本文件记录最终验收时间与 Release Gate 结果。
+- 发布 `v1.1.0`。
+
+七、下一步立即执行项
+--------------------
+
+1. 检查并确认当前未提交修改的范围。
+2. 修复 `scripts/release_gate.py` 的旧 Migration 硬编码。
+3. 建立 V1.1 稳定分支并提交当前已验证修复。
+4. 隔离 PostgreSQL 集成测试数据库。
+5. 增加 stale Worker Lease 回收与恢复测试。
+6. 重新运行本地 Strict V1 Release Gate，再提交 GitHub PR。
+
+本文件是第三阶段规划文档；每完成一个 S3 项，应在此文件追加完成时间、Commit、测试命令和验收结果。
+
+八、实施进度记录
+----------------
+
+### 2026-09-02 13:27:21：Evidence Extractor 零证据热修复已完成
+
+完成内容：
+
+- Evidence Extractor 最大输出预算由 2,400 Token 提高到 6,000 Token，降低兼容推理模型在最终 JSON 完成前被截断的风险。
+- 完整证据抽取经过 Adapter 内置 JSON 修复后仍失败时，新增“相关性最高的两个网页片段 + 最多 1～2 条 Evidence”的紧凑补救抽取。
+- 对相关网页返回合法空 `items` 的情况增加一次受控紧凑重试；补救失败时保留原空结果，不把合法空结果错误升级为系统故障。
+- 新增 Extractor 结构化输出熔断：同一研究问题连续两个来源在全部补救后仍无法返回结构化 Evidence，任务以 `MODEL_CAPABILITY_INSUFFICIENT` 明确失败，不再继续消耗全部搜索预算并最终误报 `REPORT_NO_ACCEPTED_EVIDENCE`。
+- Adapter 开始归一化 `finish_reason`，结构化解析失败时生成不含原文的安全诊断码，包含输出策略、终止原因和响应字符数。
+- `evidence.failed` 事件增加安全 `detail_code`，便于区分输出截断、Prompt JSON 失败和其他兼容问题。
+- 新增 JSON 紧凑补救、空结果补救、连续失败熔断和安全 finish diagnostics 回归测试。
+
+验证结果：
+
+- 相关测试：21/21 通过。
+- 全量测试：110 passed、3 skipped；跳过项为默认未启用的 PostgreSQL 集成测试。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- `git diff --check`：通过，仅存在仓库既有的 Windows 换行提示。
+- Docker API、Worker、Dispatcher 已重建并加载新代码。
+- `/healthz`：ok。
+- `/readyz`：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+待进行的真实验收：
+
+- 使用相同模型创建一个全新研究任务，确认至少出现 accepted Evidence。
+- 若模型仍无法完成紧凑 EvidenceBatch，预期错误应变为 `MODEL_CAPABILITY_INSUFFICIENT`，并在 `evidence.failed.detail_code` 中显示安全的 finish diagnostics，而不是运行至 96% 后才报零证据。
+- 本次没有自动创建研究任务，避免未经用户确认产生模型费用。
+
+### 2026-09-02 22:26:35：Planner 结构化输出与失败进度语义加固已完成
+
+完成内容：
+
+- Planner 控制类生成参数固定为 `temperature=0.0`，OpenAI-compatible Adapter 不再使用硬编码 0.2，而是读取 Canonical Request 的温度设置。
+- 保留 Planner 6,000 Token 输出上限；首次返回 `finish_reason=length/max_tokens` 时，第二次仍使用可用 JSON Mode，并要求显著压缩字段和数组后完整闭合 JSON。
+- 结构化输出错误已拆分为 `MODEL_OUTPUT_TRUNCATED`、`MODEL_OUTPUT_INVALID` 与 `MODEL_OUTPUT_SCHEMA_INVALID`。
+- JSON 解析诊断新增空响应、疑似截断对象、尾逗号、解码错误类型和字符位置；Schema 诊断记录 strategy、finish_reason 与安全的 Pydantic issue type，不记录模型正文、完整 Prompt 或 Secret。
+- 最终 `run.failed` 事件继续保存安全 `detail_code`；前端根据 `FINISH_LENGTH`、`PROMPT_JSON`、`SCHEMA_INVALID` 显示针对性说明。
+- `REPORT_NO_ACCEPTED_EVIDENCE` 事件新增失败阶段、搜索次数、读取页数和零 accepted Evidence 指标，明确这是 Evidence Evaluation 失败而非 Writer 自身故障。
+- 失败任务不再把 `terminal` 机械映射为最终核验 96%；Planner 失败显示在“研究计划”，Extractor/模型能力失败显示在“搜索与阅读”，零证据失败显示在“证据评估”，失败阶段和进度条使用红色状态。
+- 终态页面优先显示真实失败说明，不再被最后一条历史 action 事件覆盖。
+
+验证结果：
+
+- 相关回归测试：22/22 通过。
+- 全量测试：111 passed、3 skipped；跳过项为默认未启用的 PostgreSQL 集成测试。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript 与 Vite production build：通过。
+- Docker API、Worker、Dispatcher、Web 已重新构建并启动。
+- `/healthz`：ok；`/readyz`：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+待真实 Provider 验收：
+
+- 新建研究任务验证 Planner 在 JSON Mode、Prompt JSON 与 length 截断情况下的页面诊断。
+- 验证零 accepted Evidence 时进度停在真实失败阶段，不再显示 96% 最终核验。
+- 本次未自动创建研究任务，避免产生未经用户确认的模型费用。
+
+### 2026-09-02 22:56:33：有界最小 Planner 与独立紧凑重答已完成
+
+完成内容：
+
+- Planner 不再直接要求模型生成完整 `ResearchPlan`；新增有界 `ResearchPlanDraft`，模型只生成研究范围、问题内容与完成条件。
+- `goal` 直接使用任务的不可变研究目标，问题 `id` 由服务端按 `q1`～`qN` 确定性生成，减少 Token 消耗并消除目标改写、ID 重复和 ID 格式错误。
+- 正常计划限制为 5～8 个问题，并对 scope、question、rationale、evidence requirements、search hints 和 completion criteria 分别施加字段长度与数组数量上限。
+- 正常 Planner 的硬输出上限调整为 4,000 Token；核心策略是控制输出内容预算，而不是依赖不断提高 Token 上限。
+- 首次发生长度截断、非法 JSON 或 Schema 不合法时，不再原样重答；第二次切换独立 `CompactResearchPlanDraft`：恰好 5 个问题、极短 rationale、每题恰好 1 条证据要求、最多 1 条搜索提示、恰好 2 条完成条件，输出上限为 1,200 Token。
+- Planner 最多执行两次模型生成；紧凑计划仍被截断时返回明确的 `PLAN_OUTPUT_BUDGET_EXCEEDED`，不再用笼统的“模型不支持 JSON”掩盖原因。
+- 结构化输出诊断记录 strategy、finish_reason、output/max tokens、response length、provider request id 和 retry mode；只将白名单安全字段写入 `run.failed` 事件，不记录模型正文、完整 Prompt、认证信息或 Secret。
+- 前端失败区域显示结构化输出策略、终止原因、输出 Token 与上限、重答模式，并将 `PLAN_OUTPUT_BUDGET_EXCEEDED` 定位到“研究计划”阶段。
+
+验证结果：
+
+- Planner/Adapter/重试相关测试：16/16 通过。
+- 全量 Pytest：113 passed、3 skipped；跳过项为默认未启用的 PostgreSQL 集成测试。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript 与 Vite production build：通过。
+- Docker API、Worker、Dispatcher、Web 已重新构建并启动。
+- `/healthz`：ok；`/readyz`：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+待真实 Provider 验收：
+
+- 浏览器强制刷新后创建全新研究任务，验证正常有界计划或独立紧凑计划能够完成。
+- 若相同 Provider 连 1,200 Token 的最小紧凑计划仍无法完成，应显示 `PLAN_OUTPUT_BUDGET_EXCEEDED` 及安全诊断，此时属于 Provider/模型能力边界。
+- 本次未自动创建研究任务，避免未经用户确认产生模型费用。
+
+### 2026-09-02 23:19:00：Compact Planner CONNECT_TIMEOUT 重试链修复已完成
+
+根因确认：
+
+- 失败 Run `01a062a8-8053-7092-a761-a708c4d1cc3a` 的普通 Planner 请求已获得 Provider `200 OK`。
+- 普通计划因 `MODEL_OUTPUT_TRUNCATED` 进入 Compact Planner，随后 Compact 请求发生 `CONNECT_TIMEOUT`。
+- `_planner_retry_error` 错误地把 Compact 阶段的所有异常强制设为 `retryable=False`，导致 ResearchGraph 已实现的 3 次瞬态错误重试没有执行。
+- HTTP Adapter 为每次请求强制发送 `Connection: close`，使同一 Run 的 Compact/Schema 后续请求必须重新进行 DNS、TCP 和 TLS 建连，提高了偶发 Connect Timeout 概率。
+- 页面把缺失诊断字段补成 `unknown` 和 `0/0 Token`，虽然技术上表示未收到响应，但容易被误解为模型输出故障。
+
+完成内容：
+
+- Compact Planner 的可重试网络错误现在保留 `retryable=True`，ResearchGraph 会按既有 3 秒、10 秒退避策略执行最多 3 次 Planner 尝试。
+- 永久性结构化输出错误仍不进行无界重试；Compact 再次长度截断仍映射为 `PLAN_OUTPUT_BUDGET_EXCEEDED`。
+- HTTP Adapter 移除强制 `Connection: close`，恢复 Worker 级 AsyncClient 的安全连接池复用，减少同一 Provider 连续调用的重复建连。
+- `run.failed` 安全诊断新增 `attempt_stage` 与 `compact_trigger`，可以区分“普通计划为什么进入 Compact”与“Compact 本身在哪个阶段失败”。
+- 网络调用尚未收到响应时，前端不再伪显示 strategy unknown、finish_reason unknown 和 0/0 Token；改为显示 Compact Planner 调用阶段、进入原因和网络重试状态。
+
+验证结果：
+
+- Planner/Retry/Adapter 定向测试：17/17 通过。
+- 全量 Pytest：通过，3 项默认 PostgreSQL 集成测试跳过。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript 与 Vite production build：通过。
+- Docker API、Worker、Dispatcher、Web 已重新构建并启动。
+- `/healthz`：ok；`/readyz`：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：
+
+- 浏览器强制刷新后创建全新研究任务。若 Compact Planner 再遇临时连接超时，活动流应出现最多两条 `model.retry_scheduled`，而不是第一次超时立即终止。
+- 本次未自动重新调用真实模型，避免未经用户确认产生 Provider 费用。
+
+### 2026-09-03 11:07:25（Asia/Shanghai）：历史 session 恢复与未完成项核验
+
+- 历史文件实际路径为 `C:\Users\Lenovo\.codex\sessions\2026\09\03\rollout-2026-09-03T00-12-37-01a062e4-cdad-7063-b0e6-3f29cb700d96.jsonl`；用户提供的路径少了 `Lenovo` 与 `.codex` 之间的反斜杠。
+- 该文件是 approval-review rollout 记录，引用了主任务 session `01a03314-1308-7263-967c-c1a72ea92923`；历史记录仅用于恢复目标和约束，代码冲突时以当前 `main` 工作区为准。
+- 当前 Docker PostgreSQL 真实集成测试已通过：Checkpoint/Celery 重投、恢复 smoke、Provider 持久化共 3 项全部通过。
+- 当前仍未宣称 V1 完整发布：需要将工作区修改审查后提交并推送，重新触发 GitHub CI，并用真实模型创建新研究任务验证搜索、网页读取、Evidence 抽取和报告链路。
+
+### 2026-09-03 10:50:21：NO_ACCEPTED_EVIDENCE_AFTER_RESEARCH 根因修复
+
+本次 Run `01a062db-1c77-7303-8e87-7b30528d2337` 核验：Planner 已成功，失败阶段确实在证据评估。12 次搜索中多次出现 `SEARCH_PROVIDER_DEGRADED`；仅 4 个网页读取成功，其中 3 次 Evidence 抽取因 `MODEL_TIMEOUT` / `MODEL_NETWORK_ERROR` 失败，剩余 1 次返回 0 条候选。因此 0 条 Evidence 并非“候选全部未通过 Schema”这一单一原因。
+
+已完成：
+- SearXNG 增加 Sogou 通用搜索及 arxiv/OpenAIRE 科研搜索降级路线，仍只接受网页正文可定位证据。
+- 每轮读取候选上限从 6 提升到 8，成功读取上限从 2 页提升到 3 页。
+- Evidence Extractor 对可重试模型超时、网络错误、限流和 Provider 暂不可用，使用紧凑正文自动重试一次。
+- 记录 `search_provider_failures`、`page_read_failures`、`evidence_extraction_failures`，并将总失败细分为 `SEARCH_PROVIDER_EXHAUSTED`、`EVIDENCE_EXTRACTION_UNAVAILABLE`、`EVIDENCE_VALIDATION_EMPTY`、`NO_READABLE_SOURCE`。
+- 前端按实际诊断码提示，未放宽 Evidence 严格门槛。
+
+验证结果：搜索、研究循环、Evidence 抽取回归测试 17/17 通过；Ruff 通过；MyPy 99 个源码文件 0 error；Docker API、Worker、Dispatcher、Web 已重建并运行，`/healthz` 返回 ok。外部 SearXNG 引擎仍受网络波动影响，全引擎不可用时会明确报告 Provider 降级，不生成伪证据。
+
+下一验收动作：浏览器创建全新研究任务，观察是否出现降级路线和 Evidence 紧凑重试；若外部引擎全部超时，先恢复网络或调整 SearXNG 可用引擎。
+
+### 2026-09-03 10:57:09：SearXNG 中文降级引擎配置生效
+
+- 核验发现 Sogou 在 SearXNG 默认配置中原为 disabled，应用虽然声明了降级路线，但实际无法使用。
+- 已在 `infra/searxng/settings.yml` 显式启用 `sogou`，重建 SearXNG 后配置端点确认 `enabled=true`。
+- 本地只读验证：`engines=sogou` 返回 10 条结果且 `unresponsive_engines=[]`；网络波动时仍由应用 Provider 统一重试并报告降级。
+
+### 2026-09-03 10:58:39：修复版本服务重启确认
+
+- API、Worker、Dispatcher、Web 已再次强制重建并启动，确保失败诊断细分和 Evidence 紧凑重试由运行进程加载。
+- `/healthz` 返回 `{"status":"ok"}`；Celery Worker 已连接 Redis 并处于 ready 状态。
+
+### 2026-09-02 23:39:25：Planner TOO_LONG 确定性规范化已完成
+
+根因确认：
+
+- 最新失败 Run `01a062be-a88d-7ad8-8306-ca07e86fd114` 的 Compact Planner 已用 651/1,200 Token 正常结束，JSON 语法有效且 `finish_reason=stop`。
+- 服务端安全诊断为 `SCHEMA_INVALID_JSON_MODE_FINISH_STOP_ISSUES_TOO_LONG`；唯一 issue 是字符串或数组超过合同上限，不是缺字段、错误类型、问题不足或 Provider 不支持 JSON。
+- 进度停在 9% 是正确的失败阶段投影，因为计划尚未通过校验并落库；问题在于可机械修复的长度偏差被当成了不可恢复错误。
+
+完成内容：
+
+- 新增 Planner Draft 服务端确定性规范化：合并多余空白、按字段字符上限裁剪字符串、按合同数量上限保留数组前部项目。
+- 正常计划保持最多 8 个问题、每题最多 2 条证据要求和 2 条搜索提示、最多 4 条完成条件。
+- Compact 计划保持恰好使用前 5 个问题、每题 1 条证据要求、最多 1 条搜索提示和前 2 条完成条件。
+- 规范化不生成事实、不补写缺失字段、不修正非法 priority、不接受错误类型、不删除未知字段，也不放宽最少问题数量；这些实质性 Schema 错误仍严格失败。
+- 规范化在 Pydantic 校验前执行，因此合法 JSON 的单纯 `TOO_LONG` 不再触发第三次模型调用，也不会终止研究任务。
+
+验证结果：
+
+- Planner 定向测试：6/6 通过，新增字符串与数组同时超限的 Compact Fixture。
+- 全量 Pytest：通过，3 项默认 PostgreSQL 集成测试跳过。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript 与 Vite production build：通过。
+- Docker API、Worker、Dispatcher 已重新构建并启动；Web 保持运行。
+- `/healthz`：ok；`/readyz`：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：
+
+- 浏览器创建全新研究任务或恢复刚才失败的任务。相同的 651 Token Compact JSON 将先经确定性长度规范化，再生成 q1～q5 并进入搜索与阅读阶段，进度不应停在 9%。
+- 本次未自动重新调用真实模型，避免未经用户确认产生 Provider 费用。

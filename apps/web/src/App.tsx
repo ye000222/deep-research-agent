@@ -3,8 +3,43 @@ import {FormEvent, useEffect, useMemo, useRef, useState} from "react";
 import {ProviderProfileForm} from "./ProviderProfileForm";
 
 type ApiHealth = "checking" | "ready" | "unavailable";
-type PlanStatus = "done" | "active" | "pending" | "blocked";
+type PlanStatus = "done" | "active" | "partial" | "degraded" | "pending" | "blocked";
 type BudgetTier = "quick" | "standard" | "deep";
+type ProgressStageState = "done" | "active" | "pending" | "failed";
+
+type ProgressStage = {
+  key: string;
+  label: string;
+  weight: number;
+};
+
+const PROGRESS_STAGES: ProgressStage[] = [
+  {key: "init", label: "目标分析", weight: 0.05},
+  {key: "plan", label: "研究计划", weight: 0.10},
+  {key: "research", label: "搜索与阅读", weight: 0.25},
+  {key: "evaluate", label: "证据评估", weight: 0.25},
+  {key: "replan", label: "缺口补充", weight: 0.15},
+  {key: "write", label: "报告生成", weight: 0.15},
+  {key: "verify", label: "最终核验", weight: 0.05},
+];
+
+const PHASE_TO_STAGE: Record<string, string> = {
+  initializing: "init",
+  init: "init",
+  analyze_query: "init",
+  planning: "plan",
+  plan: "plan",
+  researching: "research",
+  research: "research",
+  evaluating: "evaluate",
+  evaluate: "evaluate",
+  writing: "write",
+  write: "write",
+  verifying: "verify",
+  verify: "verify",
+  terminal: "verify",
+  finalize: "verify",
+};
 
 type ResearchRun = {
   run_id: string;
@@ -12,6 +47,8 @@ type ResearchRun = {
   phase: string;
   state_version: number;
   termination_reason: string | null;
+  budget_snapshot: Record<string, unknown>;
+  usage_snapshot: Record<string, unknown>;
   quality_snapshot: Record<string, unknown>;
   event_url: string;
 };
@@ -108,6 +145,10 @@ type PlanItem = {
   questionId?: string;
   title: string;
   status: PlanStatus;
+  reason?: string;
+  coverage?: number;
+  acceptedEvidence?: number;
+  independentSources?: number;
 };
 
 type CoverageDimension = {
@@ -118,6 +159,14 @@ type CoverageDimension = {
   accepted_evidence: number;
   independent_sources: number;
   missing_reasons: string[];
+  requirement_statuses: Array<{
+    dimension_key: string;
+    criterion: string;
+    coverage: number;
+    accepted_evidence: number;
+    independent_sources: number;
+    required_sources: number;
+  }>;
 };
 
 type KnowledgeLedger = {
@@ -158,7 +207,38 @@ function parseEventStream(raw: string): AgentEvent[] {
     .map((data) => JSON.parse(data) as AgentEvent);
 }
 
-function runMessage(run: ResearchRun): string {
+function latestFailureDetail(events: AgentEvent[]): string | null {
+  const failure = [...events].reverse().find((event) => event.event_type === "run.failed");
+  return typeof failure?.refs.detail_code === "string" ? failure.refs.detail_code : null;
+}
+
+function latestModelDiagnostics(events: AgentEvent[]): string | null {
+  const failure = [...events].reverse().find((event) => event.event_type === "run.failed");
+  const value = failure?.refs.model_diagnostics;
+  if (typeof value !== "object" || value === null) return null;
+  const diagnostics = value as Record<string, unknown>;
+  const parts: string[] = [];
+  const attemptStage = typeof diagnostics.attempt_stage === "string" ? diagnostics.attempt_stage : null;
+  const compactTrigger = typeof diagnostics.compact_trigger === "string" ? diagnostics.compact_trigger : null;
+  const strategy = typeof diagnostics.structured_output_strategy === "string" ? diagnostics.structured_output_strategy : null;
+  const finishReason = typeof diagnostics.finish_reason === "string" ? diagnostics.finish_reason : null;
+  const retryMode = typeof diagnostics.retry_mode === "string" ? diagnostics.retry_mode : null;
+  const outputTokens = typeof diagnostics.output_tokens === "number" ? diagnostics.output_tokens : null;
+  const maxOutputTokens = typeof diagnostics.max_output_tokens === "number" ? diagnostics.max_output_tokens : null;
+  if (attemptStage === "planner_compact") parts.push("调用阶段 Compact Planner");
+  if (compactTrigger === "compact_length") parts.push("进入原因：普通计划长度截断");
+  if (compactTrigger === "compact_invalid_or_schema") parts.push("进入原因：普通计划格式校验失败");
+  if (strategy) parts.push(`策略 ${strategy}`);
+  if (finishReason) parts.push(`finish_reason=${finishReason}`);
+  if (outputTokens !== null && maxOutputTokens !== null && maxOutputTokens > 0) {
+    parts.push(`输出 ${outputTokens}/${maxOutputTokens} Token`);
+  }
+  if (retryMode === "compact_transport_retry") parts.push("重试：Compact 网络重试");
+  else if (retryMode) parts.push(`重试 ${retryMode}`);
+  return parts.length > 0 ? parts.join("；") : null;
+}
+
+function runMessage(run: ResearchRun, events: AgentEvent[] = []): string {
   if (run.status === "queued") return `任务 ${run.run_id.slice(0, 8)}… 已入队，等待 Dispatcher 发布。`;
   if (run.status === "running") return `任务正在执行 ${run.phase} 阶段，状态版本 ${run.state_version}。`;
   if (run.status === "interrupted" && run.termination_reason === "planner_not_implemented") {
@@ -188,11 +268,39 @@ function runMessage(run: ResearchRun): string {
       MODEL_PROVIDER_UNAVAILABLE: "模型服务暂时不可用；Planner 会自动重试三次。",
       MODEL_RATE_LIMITED: "模型 API 已限流，请稍后重试。",
       MODEL_TIMEOUT: "模型调用超时，请稍后重试。",
-      MODEL_OUTPUT_INVALID: "兼容模型两次均未返回可解析的 JSON 研究计划，请检查模型是否支持 JSON 输出。",
+      MODEL_OUTPUT_INVALID: "模型未返回可解析的 JSON 研究计划；系统已尝试 JSON Mode 和 Prompt JSON，请确认该模型支持结构化输出。",
+      MODEL_OUTPUT_TRUNCATED: "模型输出因达到 Token 上限而截断，JSON 尚未闭合；系统已执行紧凑重答但仍未完成。",
+      PLAN_OUTPUT_BUDGET_EXCEEDED: "普通计划与独立 Compact Planner 均达到输出预算上限；系统已停止，避免继续用更大 Token 掩盖计划失控。",
       MODEL_OUTPUT_SCHEMA_INVALID: "模型经过一次结构纠正后，研究计划仍未通过 Schema 校验。",
+      MODEL_CAPABILITY_INSUFFICIENT: "兼容模型连续无法生成可校验的结构化证据；系统已提前熔断，避免耗尽全部研究预算。",
       EVIDENCE_OUTPUT_SCHEMA_INVALID: "单页证据抽取未通过 Schema 校验；新版会隔离该来源并保留其他有效证据。",
+      REPORT_NO_ACCEPTED_EVIDENCE: "研究期间未获得可验证证据，系统拒绝生成无证据报告；请查看搜索、网页读取和证据抽取的具体失败码。",
+      CONTEXT_MANIFEST_PERSISTENCE_FAILED: "研究上下文保存失败；系统已保留任务状态，请稍后恢复任务重试。",
     };
-    return failures[run.termination_reason ?? ""] ?? `研究任务失败：${run.termination_reason ?? "未知原因"}`;
+    const summary = failures[run.termination_reason ?? ""] ?? `研究任务失败：${run.termination_reason ?? "未知原因"}`;
+    const detail = latestFailureDetail(events);
+    const diagnostics = latestModelDiagnostics(events);
+    const suffix = diagnostics ? ` ${diagnostics}。` : "";
+    if (!detail) return `${summary}${suffix}`;
+    if (detail.includes("FINISH_LENGTH") || detail.includes("FINISH_MAX_TOKENS")) {
+      return `${summary} 诊断：Provider 返回长度截断。${suffix}`;
+    }
+    if (detail.includes("PROMPT_JSON")) {
+      return `${summary} 诊断：Provider 已降级到 Prompt JSON，未使用可靠的原生 JSON Mode。${suffix}`;
+    }
+    if (detail.includes("SEARCH_PROVIDER_EXHAUSTED")) {
+      return `${summary} 诊断：搜索 Provider 在本轮均不可用，未获得可读取候选。${suffix}`;
+    }
+    if (detail.includes("EVIDENCE_EXTRACTION_UNAVAILABLE")) {
+      return `${summary} 诊断：网页已读取，但证据抽取模型全部超时或网络失败。${suffix}`;
+    }
+    if (detail.includes("EVIDENCE_VALIDATION_EMPTY")) {
+      return `${summary} 诊断：网页已读取，但候选证据没有通过原文定位、来源范围或安全校验。${suffix}`;
+    }
+    if (detail.includes("SCHEMA_INVALID")) {
+      return `${summary} 诊断：JSON 语法有效，但字段结构不满足 ResearchPlan Schema。${suffix}`;
+    }
+    return `${summary} 诊断码：${detail}。${suffix}`;
   }
   if (run.status === "cancelled") return "研究任务已取消。";
   return `任务状态 ${run.status}，阶段 ${run.phase}。`;
@@ -209,6 +317,7 @@ function eventLabel(eventType: string): string {
     "run.cancelled": "Research API",
     "run.status_changed": "Run Lifecycle",
     "plan.generated": "Research Planner",
+    "plan.revised": "Research Replanner",
     "model.retry_scheduled": "Retry Policy",
     "gap.opened": "Gap Detector",
     "action.selected": "Tool Policy",
@@ -223,6 +332,8 @@ function eventLabel(eventType: string): string {
     "evidence.failed": "Evidence Boundary",
     "question.researched": "Research State",
     "question.retry_scheduled": "Evaluator",
+    "question.technical_retry_scheduled": "Technical Retry",
+    "question.technical_degraded": "Provider Boundary",
     "evaluation.completed": "Evaluator",
     "research.information_gain_calculated": "Information Gain",
     "research.continued": "Research Loop",
@@ -238,6 +349,117 @@ function eventLabel(eventType: string): string {
 function metric(snapshot: Record<string, unknown> | undefined, key: string): number {
   const value = snapshot?.[key];
   return typeof value === "number" ? value : 0;
+}
+
+function progressStageIndex(stageKey: string): number {
+  return Math.max(0, PROGRESS_STAGES.findIndex((stage) => stage.key === stageKey));
+}
+
+function progressStageState(
+  stage: ProgressStage,
+  currentIndex: number,
+  completedPlanItems: number,
+  planCount: number,
+  coverage: number,
+  events: AgentEvent[],
+  failedStageKey: string | null,
+): ProgressStageState {
+  const index = progressStageIndex(stage.key);
+  if (failedStageKey) {
+    const failedIndex = progressStageIndex(failedStageKey);
+    if (index < failedIndex) return "done";
+    if (index === failedIndex) return "failed";
+    return "pending";
+  }
+  if (index < currentIndex) return "done";
+  if (index > currentIndex) return "pending";
+  if (stage.key === "init") return events.some((item) => item.event_type === "run.started") ? "done" : "active";
+  if (stage.key === "plan") return planCount > 0 && completedPlanItems >= planCount ? "done" : "active";
+  if (stage.key === "research") return coverage > 0 ? "active" : "active";
+  if (stage.key === "evaluate") return events.some((item) => item.event_type === "evaluation.completed") ? "active" : "active";
+  if (stage.key === "replan") return events.some((item) => item.event_type === "plan.revised") ? "active" : "pending";
+  if (stage.key === "write") return events.some((item) => item.event_type === "report.section_completed") ? "active" : "pending";
+  if (stage.key === "verify") return events.some((item) => item.event_type === "report.verified") ? "done" : "pending";
+  return "pending";
+}
+
+function failureStageKey(run: ResearchRun, events: AgentEvent[]): string | null {
+  if (run.status !== "failed") return null;
+  const reason = run.termination_reason ?? "";
+  if (["MODEL_OUTPUT_INVALID", "MODEL_OUTPUT_TRUNCATED", "MODEL_OUTPUT_SCHEMA_INVALID", "PLAN_OUTPUT_BUDGET_EXCEEDED"].includes(reason)) return "plan";
+  if (reason === "REPORT_NO_ACCEPTED_EVIDENCE") return "evaluate";
+  if (["MODEL_CAPABILITY_INSUFFICIENT", "EVIDENCE_OUTPUT_SCHEMA_INVALID"].includes(reason)) return "research";
+  if (reason.startsWith("REPORT_") || reason.startsWith("WRITER_")) return "write";
+  if (events.some((event) => event.event_type === "report.writing_started")) return "write";
+  if (events.some((event) => event.event_type === "evaluation.completed")) return "evaluate";
+  if (events.some((event) => event.event_type === "search.completed")) return "research";
+  if (events.some((event) => event.event_type === "plan.generated")) return "research";
+  return "plan";
+}
+
+function phaseProgress(
+  run: ResearchRun | null,
+  completedPlanItems: number,
+  planCount: number,
+  coverage: number,
+  events: AgentEvent[],
+): {overall: number; stageKey: string; stageProgress: number; stageStates: Record<string, ProgressStageState>} {
+  if (!run) {
+    return {
+      overall: 0,
+      stageKey: "init",
+      stageProgress: 0,
+      stageStates: Object.fromEntries(PROGRESS_STAGES.map((stage) => [stage.key, "pending"])),
+    };
+  }
+  const terminalComplete = ["completed", "completed_with_limitations"].includes(run.status);
+  const failedStageKey = failureStageKey(run, events);
+  const latestReplan = [...events].reverse().find((item) => item.event_type === "plan.revised");
+  const latestResearchProgress = [...events].reverse().find((item) =>
+    ["question.researched", "action.selected", "tool.called", "search.completed", "source.read", "evaluation.completed"].includes(item.event_type),
+  );
+  const activeStageKey = latestReplan && (!latestResearchProgress || latestReplan.seq > latestResearchProgress.seq)
+    ? "replan"
+    : PHASE_TO_STAGE[run.phase] ?? "init";
+  const stageKey = failedStageKey ?? activeStageKey;
+  const currentIndex = progressStageIndex(stageKey);
+  const searchBudget = metric(run.budget_snapshot, "max_searches");
+  const pageBudget = metric(run.budget_snapshot, "max_pages");
+  const researchActivity = Math.max(
+    coverage,
+    searchBudget > 0 ? metric(run.usage_snapshot, "searches") / searchBudget : 0,
+    pageBudget > 0 ? metric(run.usage_snapshot, "pages") / pageBudget : 0,
+  );
+  const normalStageProgress = stageKey === "plan"
+    ? planCount > 0 ? completedPlanItems / planCount : 0.35
+    : stageKey === "research" || stageKey === "evaluate" || stageKey === "replan"
+      ? coverage
+      : stageKey === "write"
+        ? (events.filter((item) => item.event_type === "report.section_completed").length > 0 ? 0.65 : 0.15)
+        : stageKey === "verify"
+          ? events.some((item) => item.event_type === "report.verified") ? 1 : 0.2
+          : 0.5;
+  const stageProgress = failedStageKey
+    ? stageKey === "plan"
+      ? planCount > 0 ? completedPlanItems / planCount : 0.25
+      : stageKey === "research"
+        ? Math.min(0.95, researchActivity)
+        : stageKey === "evaluate"
+          ? coverage
+          : stageKey === "write"
+            ? events.filter((item) => item.event_type === "report.section_completed").length > 0 ? 0.65 : 0.1
+            : 0
+    : normalStageProgress;
+  const completedWeight = PROGRESS_STAGES
+    .slice(0, currentIndex)
+    .reduce((sum, stage) => sum + stage.weight, 0);
+  const overall = terminalComplete
+    ? 1
+    : Math.min(0.99, Math.max(0, completedWeight + PROGRESS_STAGES[currentIndex].weight * Math.min(1, stageProgress)));
+  const stageStates = Object.fromEntries(
+    PROGRESS_STAGES.map((stage) => [stage.key, progressStageState(stage, currentIndex, completedPlanItems, planCount, coverage, events, failedStageKey)]),
+  ) as Record<string, ProgressStageState>;
+  return {overall, stageKey, stageProgress: Math.min(1, Math.max(0, stageProgress)), stageStates};
 }
 
 function coverageDimensions(
@@ -269,6 +491,25 @@ function coverageDimensions(
       independent_sources: item.independent_sources,
       missing_reasons: Array.isArray(item.missing_reasons)
         ? item.missing_reasons.filter((reason: unknown): reason is string => typeof reason === "string")
+        : [],
+      requirement_statuses: Array.isArray(item.requirement_statuses)
+        ? item.requirement_statuses.filter(
+            (status: unknown): status is CoverageDimension["requirement_statuses"][number] =>
+              typeof status === "object" &&
+              status !== null &&
+              "dimension_key" in status &&
+              "criterion" in status &&
+              "coverage" in status &&
+              "accepted_evidence" in status &&
+              "independent_sources" in status &&
+              "required_sources" in status &&
+              typeof status.dimension_key === "string" &&
+              typeof status.criterion === "string" &&
+              typeof status.coverage === "number" &&
+              typeof status.accepted_evidence === "number" &&
+              typeof status.independent_sources === "number" &&
+              typeof status.required_sources === "number",
+          )
         : [],
     }];
   });
@@ -497,6 +738,7 @@ function App() {
   }, [activeRun, activeRunId]);
 
   const planItems = useMemo<PlanItem[]>(() => {
+    const currentCoverage = coverageDimensions(activeRun?.quality_snapshot);
     const generated = events.find((item) => item.event_type === "plan.generated");
     const questions = generated?.refs.questions;
     const questionIds = generated?.refs.question_ids;
@@ -526,11 +768,26 @@ function App() {
             ].includes(item.event_type),
         );
         const finalStatus = finished?.refs.status;
+        const technicalStatus = [...events]
+          .reverse()
+          .find(
+            (item) =>
+              ["question.technical_retry_scheduled", "question.technical_degraded"].includes(
+                item.event_type,
+              ) && item.refs.question_id === questionId,
+          );
+        const dimension = currentCoverage.find(
+          (item) => item.dimension_key === questionId,
+        );
         const failedActive = activeRun?.status === "failed" && active;
         const status: PlanStatus =
-          finalStatus === "researched"
+          dimension && dimension.coverage >= 1
             ? "done"
-            : finalStatus === "blocked" || failedActive
+            : dimension && dimension.coverage > 0
+              ? "partial"
+              : technicalStatus?.event_type === "question.technical_degraded"
+                ? "degraded"
+                : finalStatus === "blocked" || failedActive
               ? "blocked"
               : active
                 ? "active"
@@ -540,6 +797,17 @@ function App() {
           questionId,
           title: String(question),
           status,
+          coverage: dimension?.coverage ?? 0,
+          acceptedEvidence: dimension?.accepted_evidence ?? 0,
+          independentSources: dimension?.independent_sources ?? 0,
+          reason:
+            status === "partial"
+              ? dimension?.missing_reasons.join("；")
+              : status === "degraded"
+                ? "搜索服务连续故障，未计入研究失败"
+                : status === "blocked"
+                  ? dimension?.missing_reasons.join("；") || "有效检索后仍缺少证据"
+                  : undefined,
         };
       });
     }
@@ -549,19 +817,21 @@ function App() {
     const interrupted = events.some((item) => item.event_type === "run.interrupted");
     const failed = events.some((item) => item.event_type === "run.failed");
     return [
-      {number: "01", title: "任务与不可变配置落库", status: created ? "done" : "active"},
+      {number: "01", title: "任务与不可变配置落库", status: created ? "done" : "active", coverage: created ? 1 : 0},
       {
         number: "02",
         title: "Outbox 发布与 Worker Lease",
         status: started ? "done" : created ? "active" : "pending",
+        coverage: started ? 1 : 0,
       },
       {
         number: "03",
         title: "Planner 生成研究计划",
         status: interrupted || failed ? "blocked" : started ? "active" : "pending",
+        coverage: interrupted || failed ? 0 : started ? 0.5 : 0,
       },
-      {number: "04", title: "Research Loop 与证据评估", status: "pending"},
-      {number: "05", title: "报告、引用与事实核验", status: "pending"},
+      {number: "04", title: "Research Loop 与证据评估", status: "pending", coverage: 0},
+      {number: "05", title: "报告、引用与事实核验", status: "pending", coverage: 0},
     ];
   }, [activeRun, events]);
 
@@ -720,6 +990,27 @@ function App() {
     : nextAction
       ? eventLabel(nextAction.event_type)
       : "等待评估";
+  const progress = phaseProgress(
+    activeRun,
+    completedPlanItems,
+    planItems.length,
+    coverage,
+    events,
+  );
+  const usage = activeRun?.usage_snapshot;
+  const budget = activeRun?.budget_snapshot;
+  const budgetItems = [
+    {key: "iterations", label: "研究轮次", used: metric(usage, "iterations"), max: metric(budget, "max_iterations")},
+    {key: "searches", label: "搜索次数", used: metric(usage, "searches"), max: metric(budget, "max_searches")},
+    {key: "pages", label: "读取页面", used: metric(usage, "pages"), max: metric(budget, "max_pages")},
+    {key: "model_tokens", label: "模型 Token", used: metric(usage, "model_tokens"), max: metric(budget, "max_tokens")},
+  ];
+  const recentGainEvents = events
+    .filter((event) => event.event_type === "research.information_gain_calculated")
+    .slice(-7);
+  const currentActionEvent = [...events].reverse().find((event) =>
+    ["action.selected", "tool.called", "source.read", "evidence.extraction_started", "evaluation.completed", "research.continued"].includes(event.event_type),
+  );
   return (
     <main className="shell">
       <header className="topbar">
@@ -809,6 +1100,67 @@ function App() {
         <p className="form-message">{message}</p>
       </form>
 
+      {activeRun && (
+        <section className="research-progress" aria-label="Research progress">
+          <div className="research-progress__header">
+            <div>
+              <span className="eyebrow">RESEARCH PROGRESS</span>
+              <h2>{Math.round(progress.overall * 100)}% <small>{activeRun.status === "running" ? "执行中" : activeRun.status === "failed" ? "失败" : activeRun.status}</small></h2>
+              <p>{STOPPED_STATUSES.has(activeRun.status) ? runMessage(activeRun, events) : currentActionEvent?.public_summary ?? runMessage(activeRun, events)}</p>
+            </div>
+            <div className="progress-current-action">
+              <span>{activeRun.status === "failed" ? "失败阶段" : "当前阶段"}</span>
+              <strong>{PROGRESS_STAGES.find((stage) => stage.key === progress.stageKey)?.label ?? "初始化"}</strong>
+              <small>{activeRun.status === "failed" ? "该阶段未完成" : `${Math.round(progress.stageProgress * 100)}% 阶段进度`}</small>
+            </div>
+          </div>
+          <div className={`overall-progress-bar${activeRun.status === "failed" ? " overall-progress-bar--failed" : ""}`} role="progressbar" aria-valuenow={Math.round(progress.overall * 100)} aria-valuemin={0} aria-valuemax={100}>
+            <i style={{width: `${Math.round(progress.overall * 100)}%`}} />
+          </div>
+          <div className="progress-stage-list">
+            {PROGRESS_STAGES.map((stage) => (
+              <div className={`progress-stage progress-stage--${progress.stageStates[stage.key]}`} key={stage.key}>
+                <i>{progress.stageStates[stage.key] === "done" ? "✓" : progress.stageStates[stage.key] === "active" ? "●" : progress.stageStates[stage.key] === "failed" ? "×" : "○"}</i>
+                <span>{stage.label}</span>
+              </div>
+            ))}
+          </div>
+          <div className="progress-details">
+            <div className="progress-quality">
+              <div className="progress-section-heading"><span>QUALITY PROGRESS</span><b>{Math.round(coverage * 100)}% / 85% target</b></div>
+              <div className="progress-quality-grid">
+                <div><strong>{Math.round(coverage * 100)}%</strong><span>总体覆盖度</span></div>
+                <div><strong>{Math.round(metric(quality, "source_independence") * 100)}%</strong><span>来源独立性</span></div>
+                <div><strong>{Math.round(metric(quality, "cross_validation") * 100)}%</strong><span>交叉验证</span></div>
+                <div><strong>{Math.round(metric(quality, "citation_support") * 100)}%</strong><span>引用支持度</span></div>
+              </div>
+            </div>
+            <div className="progress-budget">
+              <div className="progress-section-heading"><span>RESOURCE BUDGET</span><b>实际消耗 / 上限</b></div>
+              {budgetItems.map((item) => {
+                const ratio = item.max > 0 ? Math.min(1, item.used / item.max) : 0;
+                return (
+                  <div className="budget-meter" key={item.key}>
+                    <div><span>{item.label}</span><b>{item.used.toLocaleString()} / {item.max.toLocaleString()}</b></div>
+                    <div className="budget-meter__bar"><i className={ratio >= .85 ? "budget-meter--warning" : ""} style={{width: `${Math.round(ratio * 100)}%`}} /></div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="progress-gain">
+              <div className="progress-section-heading"><span>INFORMATION GAIN</span><b>{Math.round(informationGain * 100)}% latest</b></div>
+              <div className="gain-bars" aria-label="Information gain trend">
+                {recentGainEvents.length === 0 ? <small>等待第一轮 Evaluation</small> : recentGainEvents.map((event, index) => {
+                  const gain = typeof event.metrics?.information_gain === "number" ? event.metrics.information_gain : informationGain;
+                  return <i key={event.seq} title={`第 ${index + 1} 轮 ${Math.round(gain * 100)}%`} style={{height: `${Math.max(8, Math.round(gain * 100))}%`}} />;
+                })}
+              </div>
+              <small>低增益连续轮次：{lowGainStreak} / 2；Evaluator 将据此判断继续、重规划或停止。</small>
+            </div>
+          </div>
+        </section>
+      )}
+
       <section className="workspace-grid">
         <article className="panel plan-panel">
           <div className="panel-heading">
@@ -819,8 +1171,29 @@ function App() {
             {planItems.map((item) => (
               <div className={`plan-item plan-item--${item.status}`} key={item.number}>
                 <span>{item.number}</span>
-                <p>{item.title}</p>
-                <i>{item.status === "done" ? "✓" : item.status === "active" ? "●" : item.status === "blocked" ? "!" : "○"}</i>
+                <div>
+                  <p>{item.title}</p>
+                  {item.coverage !== undefined && planItems.length > 0 && (
+                    <div className="plan-progress" title={`覆盖率 ${Math.round(item.coverage * 100)}%`}>
+                      <i style={{width: `${Math.round(item.coverage * 100)}%`}} />
+                    </div>
+                  )}
+                  {item.reason && <small>{item.reason}</small>}
+                  {item.questionId && <small className="plan-evidence-count">{item.acceptedEvidence ?? 0} 条证据 · {item.independentSources ?? 0} 个独立来源</small>}
+                </div>
+                <i>
+                  {item.status === "done"
+                    ? "✓"
+                    : item.status === "active"
+                      ? "●"
+                      : item.status === "partial"
+                        ? "≈"
+                        : item.status === "degraded"
+                          ? "⚠"
+                          : item.status === "blocked"
+                            ? "!"
+                            : "○"}
+                </i>
               </div>
             ))}
           </div>

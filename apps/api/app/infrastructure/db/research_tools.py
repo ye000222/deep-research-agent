@@ -24,7 +24,6 @@ from app.domain.evidence_graph import (
     derive_claim_status,
 )
 from app.domain.identifiers import uuid7
-from app.domain.planning import MAX_DYNAMIC_QUESTIONS
 from app.domain.providers import TokenUsage
 from app.domain.research_management import ResearchFactCounts, calculate_information_gain
 from app.domain.research_runs import RunPhase, RunStatus
@@ -71,6 +70,8 @@ class ResearchTarget:
     gap_id: UUID
     tool_call_id: UUID
     source_id_seed: UUID
+    acceptance_dimensions: tuple[tuple[str, str], ...] = ()
+    used_source_owner_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,7 @@ class _CoverageMapEntry(TypedDict):
     accepted_evidence: int
     independent_sources: int
     acceptance_criteria: list[str]
+    requirement_statuses: list[dict[str, object]]
     missing_reasons: list[str]
 
 
@@ -116,17 +118,15 @@ class ResearchToolRepository:
                     .where(
                         ResearchPlanItemRow.run_id == run_id,
                         ResearchPlanItemRow.plan_version == run.plan_version,
-                        ResearchPlanItemRow.status.in_(("pending", "active", "blocked")),
+                        ResearchPlanItemRow.status.in_(
+                            ("pending", "active", "blocked", "partial", "technical_retry")
+                        ),
                     )
-                    .order_by(ResearchPlanItemRow.priority, ResearchPlanItemRow.question_id)
                     .with_for_update()
                 )
             ).all()
-            question: ResearchPlanItemRow | None = None
+            eligible: list[tuple[int, int, int, str, ResearchPlanItemRow]] = []
             for candidate in candidates:
-                if candidate.status != "blocked":
-                    question = candidate
-                    break
                 candidate_gap = await session.scalar(
                     select(ResearchGapRow).where(
                         ResearchGapRow.run_id == run_id,
@@ -134,13 +134,19 @@ class ResearchToolRepository:
                         ResearchGapRow.question_id == candidate.question_id,
                     )
                 )
-                if (
-                    candidate_gap is not None
-                    and candidate_gap.resolution_attempts < _MAX_GAP_ATTEMPTS
-                ):
-                    question = candidate
-                    break
-            if question is None:
+                attempts = candidate_gap.resolution_attempts if candidate_gap is not None else 0
+                if attempts < _MAX_GAP_ATTEMPTS:
+                    eligible.append(
+                        (
+                            attempts,
+                            1 if candidate.status == "technical_retry" else 0,
+                            candidate.priority,
+                            candidate.question_id,
+                            candidate,
+                        )
+                    )
+            selected_entry = min(eligible, default=None, key=lambda item: item[:4])
+            if selected_entry is None:
                 await self._enter_writing(
                     session,
                     run,
@@ -148,6 +154,7 @@ class ResearchToolRepository:
                     summary="研究问题已处理完毕; 自动进入证据驱动报告写作。",
                 )
                 return None
+            question: ResearchPlanItemRow = selected_entry[4]
             now = datetime.now(UTC)
             gap = await session.scalar(
                 select(ResearchGapRow).where(
@@ -174,10 +181,9 @@ class ResearchToolRepository:
                 )
                 session.add(gap)
                 await session.flush()
-            gap.resolution_attempts += 1
             gap.updated_at = now
             question.status = "active"
-            attempt_index = max(gap.resolution_attempts - 1, 0)
+            attempt_index = gap.resolution_attempts
             query_candidates = [*question.search_hints, question.question]
             query = (
                 query_candidates[attempt_index]
@@ -211,6 +217,12 @@ class ResearchToolRepository:
                 )
                 session.add(tool_call)
                 await session.flush()
+            else:
+                tool_call.status = "running"
+                tool_call.error_code = None
+                tool_call.retryable = False
+                tool_call.started_at = now
+                tool_call.finished_at = None
             if created_gap:
                 await self._append_event(
                     session,
@@ -241,6 +253,28 @@ class ResearchToolRepository:
                     "question_id": question.question_id,
                 },
             )
+            used_owner_keys = tuple(
+                str(owner)
+                for owner in (
+                    await session.scalars(
+                        select(distinct(ResearchSourceRow.source_owner_key))
+                        .join(
+                            ResearchEvidenceRow,
+                            ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                        )
+                        .where(
+                            ResearchEvidenceRow.run_id == run_id,
+                            ResearchEvidenceRow.question_id == question.question_id,
+                            ResearchEvidenceRow.accepted.is_(True),
+                        )
+                    )
+                ).all()
+                if owner
+            )
+            dimensions = tuple(
+                (f"{question.question_id}:d{index}", str(criterion))
+                for index, criterion in enumerate(question.evidence_requirements, start=1)
+            )
             return ResearchTarget(
                 plan_version=run.plan_version,
                 question_id=question.question_id,
@@ -249,6 +283,8 @@ class ResearchToolRepository:
                 gap_id=gap.id,
                 tool_call_id=tool_call.id,
                 source_id_seed=uuid7(),
+                acceptance_dimensions=dimensions,
+                used_source_owner_keys=used_owner_keys,
             )
 
     async def record_search_results(
@@ -334,6 +370,11 @@ class ResearchToolRepository:
                 tool_call.error_code = error_code[:100]
                 tool_call.retryable = retryable
                 tool_call.finished_at = datetime.now(UTC)
+            usage_snapshot = dict(run.usage_snapshot)
+            usage_snapshot["search_provider_failures"] = (
+                int(usage_snapshot.get("search_provider_failures", 0)) + 1
+            )
+            run.usage_snapshot = usage_snapshot
             await self._append_event(
                 session,
                 run,
@@ -393,7 +434,7 @@ class ResearchToolRepository:
                     canonical_url=page.final_url,
                     url_hash=url_hash,
                     domain=(urlsplit(page.final_url).hostname or "unknown")[:255],
-                    source_owner_key=(urlsplit(page.final_url).hostname or "unknown")[:255],
+                    source_owner_key=_source_owner_key(page.final_url),
                     title=page.title,
                     source_type="webpage",
                     reliability=reliability,
@@ -461,12 +502,17 @@ class ResearchToolRepository:
                 if item.accepted and chunk_window is None:
                     rejection_reason = "quote_not_located_for_graph"
                 if claim is None:
+                    dimension_key = _evidence_dimension_key(
+                        target,
+                        candidate.dimension_key,
+                        f"{candidate.claim} {candidate.exact_quote}",
+                    )
                     claim = ResearchClaimRow(
                         id=uuid7(),
                         run_id=run_id,
                         plan_version=target.plan_version,
                         question_id=target.question_id,
-                        dimension_key=target.question_id,
+                        dimension_key=dimension_key,
                         atomic_claim=candidate.claim,
                         claim_hash=claim_hash,
                         claim_type="factual",
@@ -665,6 +711,7 @@ class ResearchToolRepository:
         page: ReadPage,
         artifact_uri: str,
         error_code: str,
+        detail_code: str | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -682,7 +729,7 @@ class ResearchToolRepository:
                     canonical_url=page.final_url,
                     url_hash=url_hash,
                     domain=(urlsplit(page.final_url).hostname or "unknown")[:255],
-                    source_owner_key=(urlsplit(page.final_url).hostname or "unknown")[:255],
+                    source_owner_key=_source_owner_key(page.final_url),
                     title=page.title,
                     source_type="webpage",
                     reliability=0.72,
@@ -749,6 +796,11 @@ class ResearchToolRepository:
                     "source_id": str(source.id),
                     "question_id": target.question_id,
                     "error_code": error_code[:100],
+                    **(
+                        {"detail_code": detail_code[:100]}
+                        if detail_code is not None
+                        else {}
+                    ),
                 },
             )
 
@@ -763,6 +815,11 @@ class ResearchToolRepository:
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            usage_snapshot = dict(run.usage_snapshot)
+            usage_snapshot["page_read_failures"] = (
+                int(usage_snapshot.get("page_read_failures", 0)) + 1
+            )
+            run.usage_snapshot = usage_snapshot
             await self._append_event(
                 session,
                 run,
@@ -781,6 +838,7 @@ class ResearchToolRepository:
         *,
         worker_task_id: str,
         target: ResearchTarget,
+        attempt_outcome: str = "evidence_gained",
     ) -> IterationEvaluation:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -797,7 +855,12 @@ class ResearchToolRepository:
             )
             sources_for_question = int(
                 await session.scalar(
-                    select(func.count(distinct(ResearchEvidenceRow.source_id))).where(
+                    select(func.count(distinct(ResearchSourceRow.source_owner_key)))
+                    .join(
+                        ResearchEvidenceRow,
+                        ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                    )
+                    .where(
                         ResearchEvidenceRow.run_id == run_id,
                         ResearchEvidenceRow.question_id == target.question_id,
                         ResearchEvidenceRow.accepted.is_(True),
@@ -813,24 +876,51 @@ class ResearchToolRepository:
                 )
             )
             gap = await session.get(ResearchGapRow, target.gap_id)
+            usage = dict(run.usage_snapshot)
+            technical_failures = dict(usage.get("technical_failures_by_question", {}))
+            technical_failure_count = _as_int(technical_failures.get(target.question_id, 0))
+            technical_outcome = attempt_outcome == "provider_error"
+            if technical_outcome:
+                technical_failure_count += 1
+                technical_failures[target.question_id] = technical_failure_count
+                usage["technical_failures_by_question"] = technical_failures
+                usage["technical_retries"] = _as_int(usage.get("technical_retries", 0)) + 1
+            elif gap is not None:
+                gap.resolution_attempts += 1
             attempts = gap.resolution_attempts if gap is not None else _MAX_GAP_ATTEMPTS
             retry_current = (
-                accepted_for_question == 0 or sources_for_question < 2
-            ) and attempts < _MAX_GAP_ATTEMPTS
-            if retry_current:
+                technical_failure_count < 3
+                if technical_outcome
+                else (
+                    accepted_for_question == 0 or sources_for_question < 2
+                ) and attempts < _MAX_GAP_ATTEMPTS
+            )
+            if technical_outcome:
+                question_status = (
+                    "technical_retry" if retry_current else "technical_degraded"
+                )
+            elif retry_current:
                 question_status = "retrying"
-            elif accepted_for_question > 0:
+            elif accepted_for_question > 0 and sources_for_question >= 2:
                 question_status = "researched"
+            elif accepted_for_question > 0:
+                question_status = "partial"
             else:
                 question_status = "blocked"
             if plan_item is not None:
-                plan_item.status = "active" if retry_current else question_status
+                plan_item.status = (
+                    question_status
+                    if technical_outcome
+                    else "active"
+                    if retry_current
+                    else question_status
+                )
             if gap is not None:
                 gap.status = (
                     "open"
                     if retry_current
                     else "resolved"
-                    if accepted_for_question > 0
+                    if accepted_for_question > 0 and sources_for_question >= 2
                     else "abandoned"
                 )
                 gap.updated_at = datetime.now(UTC)
@@ -851,7 +941,7 @@ class ResearchToolRepository:
                     select(
                         ResearchEvidenceRow.question_id,
                         func.count(ResearchEvidenceRow.id),
-                        func.count(distinct(ResearchSourceRow.domain)),
+                        func.count(distinct(ResearchSourceRow.source_owner_key)),
                     )
                     .join(
                         ResearchSourceRow,
@@ -868,6 +958,33 @@ class ResearchToolRepository:
                 question_id: (int(evidence_count), int(question_sources))
                 for question_id, evidence_count, question_sources in question_counts
             }
+            dimension_counts = (
+                await session.execute(
+                    select(
+                        ResearchClaimRow.question_id,
+                        ResearchClaimRow.dimension_key,
+                        func.count(ResearchEvidenceRow.id),
+                        func.count(distinct(ResearchSourceRow.source_owner_key)),
+                    )
+                    .join(
+                        ResearchEvidenceRow,
+                        ResearchEvidenceRow.claim_id == ResearchClaimRow.id,
+                    )
+                    .join(
+                        ResearchSourceRow,
+                        ResearchSourceRow.id == ResearchEvidenceRow.source_id,
+                    )
+                    .where(
+                        ResearchEvidenceRow.run_id == run_id,
+                        ResearchEvidenceRow.accepted.is_(True),
+                    )
+                    .group_by(ResearchClaimRow.question_id, ResearchClaimRow.dimension_key)
+                )
+            ).all()
+            counts_by_dimension = {
+                (question_id, dimension_key): (int(evidence_count), int(owner_count))
+                for question_id, dimension_key, evidence_count, owner_count in dimension_counts
+            }
             coverage_map: list[_CoverageMapEntry] = []
             weighted_coverage = 0.0
             total_weight = 0.0
@@ -875,18 +992,48 @@ class ResearchToolRepository:
                 evidence_count, independent_sources = counts_by_question.get(
                     item.question_id, (0, 0)
                 )
+                requirements = [str(value) for value in item.evidence_requirements]
+                requirement_statuses: list[dict[str, object]] = []
+                missing_reasons: list[str] = []
+                requirement_scores: list[float] = []
+                has_bound_dimensions = any(
+                    key[0] == item.question_id and key[1].startswith(f"{item.question_id}:d")
+                    for key in counts_by_dimension
+                )
+                for index, criterion in enumerate(requirements, start=1):
+                    dimension_key = f"{item.question_id}:d{index}"
+                    dimension_evidence, dimension_sources = counts_by_dimension.get(
+                        (item.question_id, dimension_key),
+                        (0, 0) if has_bound_dimensions else (evidence_count, independent_sources),
+                    )
+                    required_sources = 2 if _requires_independent_sources(criterion) else 1
+                    score = (
+                        1.0
+                        if dimension_evidence > 0 and dimension_sources >= required_sources
+                        else 0.5
+                        if dimension_evidence > 0
+                        else 0.0
+                    )
+                    requirement_scores.append(score)
+                    requirement_statuses.append(
+                        {
+                            "dimension_key": dimension_key,
+                            "criterion": criterion,
+                            "coverage": score,
+                            "accepted_evidence": dimension_evidence,
+                            "independent_sources": dimension_sources,
+                            "required_sources": required_sources,
+                        }
+                    )
+                    if score == 0.0:
+                        missing_reasons.append(f"{criterion}: 缺少可验证网页原文证据")
+                    elif score < 1.0:
+                        missing_reasons.append(f"{criterion}: 缺少第二个独立来源")
                 dimension_coverage = (
-                    1.0
-                    if evidence_count > 0 and independent_sources >= 2
-                    else 0.5
-                    if evidence_count > 0
+                    sum(requirement_scores) / len(requirement_scores)
+                    if requirement_scores
                     else 0.0
                 )
-                missing_reasons: list[str] = []
-                if evidence_count == 0:
-                    missing_reasons.append("缺少可验证网页原文证据")
-                if independent_sources < 2:
-                    missing_reasons.append("缺少第二个独立来源")
                 weight = float(4 - item.priority)
                 total_weight += weight
                 weighted_coverage += dimension_coverage * weight
@@ -898,18 +1045,14 @@ class ResearchToolRepository:
                         "coverage": dimension_coverage,
                         "accepted_evidence": evidence_count,
                         "independent_sources": independent_sources,
-                        "acceptance_criteria": list(item.evidence_requirements),
+                        "acceptance_criteria": requirements,
+                        "requirement_statuses": requirement_statuses,
                         "missing_reasons": missing_reasons,
                     }
                 )
             coverage = round(weighted_coverage / total_weight, 4) if total_weight else 0.0
             covered_questions = sum(
                 1 for evidence_count, _ in counts_by_question.values() if evidence_count > 0
-            )
-            cross_validated_questions = sum(
-                1
-                for evidence_count, independent_sources in counts_by_question.values()
-                if evidence_count > 0 and independent_sources >= 2
             )
             accepted_total = int(
                 await session.scalar(
@@ -946,9 +1089,9 @@ class ResearchToolRepository:
                 )
                 or 0
             )
-            domain_count = int(
+            owner_count = int(
                 await session.scalar(
-                    select(func.count(distinct(ResearchSourceRow.domain)))
+                    select(func.count(distinct(ResearchSourceRow.source_owner_key)))
                     .join(
                         ResearchEvidenceRow,
                         ResearchEvidenceRow.source_id == ResearchSourceRow.id,
@@ -969,9 +1112,28 @@ class ResearchToolRepository:
                 )
                 or 0.0
             )
+            claim_owner_counts = (
+                await session.scalars(
+                    select(func.count(distinct(ResearchSourceRow.source_owner_key)))
+                    .join(
+                        ResearchEvidenceRow,
+                        ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                    )
+                    .where(
+                        ResearchEvidenceRow.run_id == run_id,
+                        ResearchEvidenceRow.accepted.is_(True),
+                        ResearchEvidenceRow.claim_id.is_not(None),
+                    )
+                    .group_by(ResearchEvidenceRow.claim_id)
+                )
+            ).all()
             cross_validation = (
-                round(cross_validated_questions / covered_questions, 4)
-                if covered_questions
+                round(
+                    sum(1 for count in claim_owner_counts if int(count) >= 2)
+                    / len(claim_owner_counts),
+                    4,
+                )
+                if claim_owner_counts
                 else 0.0
             )
             previous_facts = ResearchFactCounts(
@@ -990,7 +1152,7 @@ class ResearchToolRepository:
             current_facts = ResearchFactCounts(
                 accepted_evidence=accepted_total,
                 unique_claims=unique_claims,
-                independent_sources=domain_count,
+                independent_sources=owner_count,
                 evidence_candidates=candidate_total,
                 coverage=coverage,
             )
@@ -999,7 +1161,9 @@ class ResearchToolRepository:
                 previous_quality.get("low_information_gain_streak", 0)
             )
             low_information_gain_streak = (
-                previous_low_gain_streak + 1
+                previous_low_gain_streak
+                if technical_outcome
+                else previous_low_gain_streak + 1
                 if information_gain.score < _LOW_INFORMATION_GAIN_THRESHOLD
                 else 0
             )
@@ -1014,15 +1178,37 @@ class ResearchToolRepository:
                 if int(dimension["priority"]) == 1
             ]
             priority_one_coverage = min(priority_one_coverages) if priority_one_coverages else 0.0
+            unresolved_conflict_ids = [
+                str(conflict_id)
+                for conflict_id in (
+                    await session.scalars(
+                        select(ResearchConflictRow.id).where(
+                            ResearchConflictRow.run_id == run_id,
+                            ResearchConflictRow.status == "open",
+                        )
+                    )
+                ).all()
+            ]
+            weak_claim_ids = [
+                str(claim_id)
+                for claim_id in (
+                    await session.scalars(
+                        select(ResearchClaimRow.id).where(
+                            ResearchClaimRow.run_id == run_id,
+                            ResearchClaimRow.status.in_(("candidate", "partial", "disputed")),
+                        )
+                    )
+                ).all()
+            ]
             run.quality_snapshot = {
                 "coverage": coverage,
                 "information_gain": information_gain.score,
                 "low_information_gain_streak": low_information_gain_streak,
                 "coverage_map": coverage_map,
                 "source_quality": round(source_quality, 4),
-                "independent_source_count": domain_count,
+                "independent_source_count": owner_count,
                 "priority_one_coverage": round(priority_one_coverage, 4),
-                "source_independence": round(domain_count / source_count, 4)
+                "source_independence": round(owner_count / source_count, 4)
                 if source_count
                 else 0.0,
                 "cross_validation": cross_validation,
@@ -1030,23 +1216,43 @@ class ResearchToolRepository:
                 "candidate_evidence": candidate_total,
                 "claim_count": unique_claims,
                 "source_count": source_count,
-                "conflict_count": 0,
+                "conflict_count": len(unresolved_conflict_ids),
                 "citation_count": accepted_total,
                 "unanswered_questions": max(total_questions - covered_questions, 0),
                 "critical_gaps": critical_gaps,
             }
-            usage = dict(run.usage_snapshot)
-            usage["iterations"] = int(usage.get("iterations", 0)) + 1
+            if not technical_outcome:
+                usage["iterations"] = int(usage.get("iterations", 0)) + 1
             run.usage_snapshot = usage
 
-            if retry_current:
+            if technical_outcome:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type=(
+                        "question.technical_retry_scheduled"
+                        if retry_current
+                        else "question.technical_degraded"
+                    ),
+                    public_summary=(
+                        f"问题 {target.question_id} 遇到搜索服务故障; "
+                        "该故障不消耗研究尝试或信息增益轮次。"
+                    ),
+                    refs={
+                        "question_id": target.question_id,
+                        "status": question_status,
+                        "technical_retry": technical_failure_count,
+                    },
+                    metrics={"research_attempt_consumed": False},
+                )
+            elif retry_current:
                 await self._append_event(
                     session,
                     run,
                     event_type="question.retry_scheduled",
                     public_summary=(
                         f"问题 {target.question_id} 当前有 {accepted_for_question} 条证据、"
-                        f"{sources_for_question} 个来源; Evaluator 安排替代检索。"
+                        f"{sources_for_question} 个独立来源; Evaluator 安排替代检索。"
                     ),
                     refs={
                         "question_id": target.question_id,
@@ -1081,7 +1287,7 @@ class ResearchToolRepository:
                     select(func.count(ResearchPlanItemRow.id)).where(
                         ResearchPlanItemRow.run_id == run_id,
                         ResearchPlanItemRow.plan_version == run.plan_version,
-                        ResearchPlanItemRow.status.in_(("pending", "active")),
+                        ResearchPlanItemRow.status.in_(("pending", "active", "technical_retry")),
                     )
                 )
                 or 0
@@ -1098,6 +1304,18 @@ class ResearchToolRepository:
                 and critical_gaps == 0
                 and low_information_gain_streak >= _LOW_INFORMATION_GAIN_STREAK_TO_STOP
             )
+            all_first_attempted = all(item.status != "pending" for item in plan_items)
+            replan_allowed = run.plan_version < 3
+            replan_needed = (
+                replan_allowed
+                and all_first_attempted
+                and critical_gaps > 0
+                and (
+                    remaining == 0
+                    or low_information_gain_streak >= _LOW_INFORMATION_GAIN_STREAK_TO_STOP
+                    or _replan_reserve_reached(run)
+                )
+            )
             budget_hit = _budget_exhausted(run)
             if budget_hit:
                 decision = "stop_budget"
@@ -1108,18 +1326,14 @@ class ResearchToolRepository:
             elif information_stagnated:
                 decision = "stop_information_gain"
                 stop_reason = "stagnation"
-            elif (
-                remaining == 0
-                and total_questions < MAX_DYNAMIC_QUESTIONS
-                and critical_gaps > 0
-            ):
+            elif replan_needed:
                 decision = "replan"
                 stop_reason = None
             elif remaining == 0:
                 decision = "write_with_limitations"
                 stop_reason = "sources_exhausted"
             elif retry_current:
-                decision = "retry_current"
+                decision = "retry_technical" if technical_outcome else "retry_current"
                 stop_reason = None
             else:
                 decision = "continue_plan"
@@ -1148,18 +1362,18 @@ class ResearchToolRepository:
                     coverage=coverage,
                     evidence_sufficiency=min(1.0, accepted_for_question / 2.0),
                     source_quality=source_quality,
-                    source_diversity=min(1.0, domain_count / 3.0),
+                    source_diversity=min(1.0, owner_count / 3.0),
                     source_independence=run.quality_snapshot["source_independence"],
                     cross_validation=cross_validation,
                     freshness=1.0,
-                    conflict_resolution=1.0,
+                    conflict_resolution=1.0 if not unresolved_conflict_ids else 0.0,
                     citation_completeness=1.0 if accepted_total else 0.0,
                     citation_support=cross_validation,
-                    weak_claim_ids=[],
+                    weak_claim_ids=weak_claim_ids,
                     missing_dimension_keys=[
                         d["dimension_key"] for d in coverage_map if d["coverage"] < 1.0
                     ],
-                    unresolved_conflict_ids=[],
+                    unresolved_conflict_ids=unresolved_conflict_ids,
                     verdict=verdict,
                     created_at=datetime.now(UTC),
                 )
@@ -1572,10 +1786,66 @@ def _budget_exhausted(run: ResearchRunRow) -> bool:
     )
 
 
+def _replan_reserve_reached(run: ResearchRunRow) -> bool:
+    maximum = int(run.budget_snapshot.get("max_iterations", 0) or 0)
+    used = int(run.usage_snapshot.get("iterations", 0) or 0)
+    reserve = max(2, int(maximum * 0.20))
+    return maximum > 0 and maximum - used <= reserve
+
+
+def _source_owner_key(url: str) -> str:
+    hostname = (urlsplit(url).hostname or "unknown").lower().rstrip(".")
+    for prefix in ("www.", "m.", "en.", "zh.", "docs."):
+        if hostname.startswith(prefix):
+            hostname = hostname[len(prefix) :]
+    return hostname[:255]
+
+
+def _evidence_dimension_key(
+    target: ResearchTarget,
+    proposed_key: str | None,
+    evidence_text: str,
+) -> str:
+    allowed = {key: criterion for key, criterion in target.acceptance_dimensions}
+    if proposed_key in allowed:
+        return str(proposed_key)
+    if not allowed:
+        return target.question_id
+    evidence_tokens = _lexical_tokens(evidence_text)
+    return max(
+        allowed,
+        key=lambda key: (
+            len(evidence_tokens & _lexical_tokens(allowed[key])),
+            key,
+        ),
+    )
+
+
+def _lexical_tokens(value: str) -> set[str]:
+    normalized = "".join(char.casefold() if char.isalnum() else " " for char in value)
+    words = {word for word in normalized.split() if len(word) > 1}
+    cjk = {
+        normalized[index : index + 2]
+        for index in range(max(0, len(normalized) - 1))
+        if all("\u4e00" <= char <= "\u9fff" for char in normalized[index : index + 2])
+    }
+    return words | cjk
+
+
+def _requires_independent_sources(criterion: str) -> bool:
+    normalized = criterion.casefold()
+    markers = ("两个", "两条", "第二", "独立来源", "two ", "2 ", "independent")
+    return any(marker in normalized for marker in markers)
+
+
 def _evaluation_summary(decision: str, question_id: str) -> str:
     summaries = {
         "retry_current": f"问题 {question_id} 的证据质量不足; 自动使用替代检索词重试。",
+        "retry_technical": (
+            f"问题 {question_id} 遇到临时搜索服务故障; 不消耗研究尝试并调度技术重试。"
+        ),
         "continue_plan": f"问题 {question_id} 已完成评估; 自动推进下一个研究问题。",
+        "replan": "连续低信息增益或预算进入预留区; 对原问题执行定向补证。",
         "ready_to_write": "全部研究质量门已满足; 进入报告写作。",
         "write_with_limitations": (
             "计划已遍历但部分验收条件仍未满足; 使用现有证据进入限制性写作。"

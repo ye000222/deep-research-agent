@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -86,7 +87,9 @@ class ContextItemRow(Base):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     item_type: Mapped[str] = mapped_column(String(40), nullable=False)
     source_ref_type: Mapped[str | None] = mapped_column(String(50))
-    source_ref_id: Mapped[str | None] = mapped_column(String(200))
+    # References are normally stable UUIDs, but Text keeps legacy URL references
+    # and provider-specific identifiers from crashing manifest persistence.
+    source_ref_id: Mapped[str | None] = mapped_column(Text)
     rank_score: Mapped[float] = mapped_column(Float, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     compression_level: Mapped[str] = mapped_column(String(20), nullable=False)

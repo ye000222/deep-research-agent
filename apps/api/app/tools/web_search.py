@@ -12,7 +12,14 @@ from app.tools.errors import ToolExecutionError
 
 _SEARCH_STRATEGIES: tuple[tuple[dict[str, str], int], ...] = (
     ({}, 1),
-    ({"engines": "openairepublications"}, 2),
+    # The default general engines are frequently rate-limited or blocked on
+    # Chinese networks. Sogou provides a genuinely independent general-web
+    # fallback instead of repeatedly asking the same degraded engine group.
+    ({"engines": "sogou"}, 2),
+    # Public research indexes are especially useful for technical questions
+    # and usually expose readable abstract pages that the evidence reader can
+    # verify without a paywall.
+    ({"engines": "arxiv,openairepublications"}, 2),
 )
 
 

@@ -379,13 +379,44 @@ class ReportRepository:
             run.finished_at = now
             run.updated_at = now
             run.state_version += 1
+            usage = dict(run.usage_snapshot)
+            searches = int(usage.get("searches", 0) or 0)
+            pages = int(usage.get("pages", 0) or 0)
+            search_failures = int(usage.get("search_provider_failures", 0) or 0)
+            extraction_failures = int(usage.get("evidence_extraction_failures", 0) or 0)
+            if search_failures and pages == 0 and (
+                searches == 0 or search_failures >= searches
+            ):
+                detail_code = "SEARCH_PROVIDER_EXHAUSTED"
+                cause = "search_provider_unavailable"
+            elif pages and extraction_failures >= pages:
+                detail_code = "EVIDENCE_EXTRACTION_UNAVAILABLE"
+                cause = "model_extraction_unavailable"
+            elif pages:
+                detail_code = "EVIDENCE_VALIDATION_EMPTY"
+                cause = "no_candidate_passed_provenance_validation"
+            else:
+                detail_code = "NO_READABLE_SOURCE"
+                cause = "no_readable_source"
             await self._append_event(
                 session,
                 run,
                 event_type="run.failed",
                 public_summary="没有可验证证据, 系统拒绝生成看似完整的报告。",
-                refs={"reason": "REPORT_NO_ACCEPTED_EVIDENCE"},
-                metrics=None,
+                refs={
+                    "reason": "REPORT_NO_ACCEPTED_EVIDENCE",
+                    "detail_code": detail_code,
+                    "failure_stage": "evidence_evaluation",
+                    "failure_cause": cause,
+                },
+                metrics={
+                    "searches": searches,
+                    "pages": pages,
+                    "search_provider_failures": search_failures,
+                    "page_read_failures": int(usage.get("page_read_failures", 0) or 0),
+                    "evidence_extraction_failures": extraction_failures,
+                    "accepted_evidence": 0,
+                },
             )
 
     async def get_for_run(self, owner_hash: str, run_id: UUID) -> ReportView:

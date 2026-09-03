@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -36,6 +37,12 @@ MAX_INPUT_FRACTION = 0.70
 
 class ContextBudgetInsufficientError(ValueError):
     """Raised when protected context cannot fit without unsafe truncation."""
+
+
+class ContextManifestPersistenceError(RuntimeError):
+    """Raised when a context manifest cannot be persisted safely."""
+
+    code = "CONTEXT_MANIFEST_PERSISTENCE_FAILED"
 
 
 def estimate_tokens(content: str) -> int:
@@ -141,73 +148,76 @@ class ContextBudgetManager:
         manifest_id = uuid7()
         token_before = sum(tokens for _, tokens in measured)
 
-        async with self._sessions() as session, session.begin():
-            session.add(
-                ContextManifestRow(
-                    id=manifest_id,
-                    run_id=run_id,
-                    node_name=node_name,
-                    provider_adapter=provider_adapter,
-                    model=model,
-                    context_window=allocation.context_window,
-                    input_budget=allocation.input_budget,
-                    output_reserve=allocation.output_reserve,
-                    safety_margin=allocation.safety_margin,
-                    selected_count=len(selected),
-                    rejected_count=len(rejected),
-                    protected_count=sum(1 for candidate in selected if candidate.protected),
-                    compressed_count=len(compression_by_index),
-                    token_before=token_before,
-                    token_after=used,
-                    truncated=bool(rejected) or bool(compression_by_index),
-                    rendered_prompt_hash=rendered_hash,
-                    prompt_template_version=prompt_template_version,
-                )
-            )
-            compression_ids: dict[int, UUID] = {}
-            for index, result in compression_by_index.items():
-                artifact_id = uuid7()
-                compression_ids[index] = artifact_id
+        try:
+            async with self._sessions() as session, session.begin():
                 session.add(
-                    CompressionArtifactRow(
-                        id=artifact_id,
-                        context_manifest_id=manifest_id,
-                        input_hash=result.input_hash,
-                        output_hash=result.output_hash,
-                        compression_level=result.candidate.compression_level.value,
-                        token_before=result.token_before,
-                        token_after=result.token_after,
-                        validation_status=result.validation_status,
-                        provenance_refs=list(result.candidate.provenance_refs),
+                    ContextManifestRow(
+                        id=manifest_id,
+                        run_id=run_id,
+                        node_name=node_name,
+                        provider_adapter=provider_adapter,
+                        model=model,
+                        context_window=allocation.context_window,
+                        input_budget=allocation.input_budget,
+                        output_reserve=allocation.output_reserve,
+                        safety_margin=allocation.safety_margin,
+                        selected_count=len(selected),
+                        rejected_count=len(rejected),
+                        protected_count=sum(1 for candidate in selected if candidate.protected),
+                        compressed_count=len(compression_by_index),
+                        token_before=token_before,
+                        token_after=used,
+                        truncated=bool(rejected) or bool(compression_by_index),
+                        rendered_prompt_hash=rendered_hash,
+                        prompt_template_version=prompt_template_version,
                     )
                 )
-            for ordinal, (candidate, original_tokens) in enumerate(measured):
-                effective = selected_by_index.get(ordinal, candidate)
-                is_selected = ordinal in selected_by_index
-                if is_selected:
-                    reason = effective.selected_reason_code
-                elif ordinal in policy_pruned:
-                    reason = "context_policy_pruned"
-                else:
-                    reason = "context_budget_pruned"
-                session.add(
-                    ContextItemRow(
-                        id=uuid7(),
-                        context_manifest_id=manifest_id,
-                        ordinal=ordinal,
-                        item_type=candidate.item_type.value,
-                        source_ref_type=candidate.source_ref_type,
-                        source_ref_id=candidate.source_ref_id,
-                        rank_score=candidate.rank_score,
-                        token_count=token_by_index.get(ordinal, original_tokens),
-                        compression_level=effective.compression_level.value,
-                        content_hash=hashlib.sha256(effective.content.encode("utf-8")).hexdigest(),
-                        selected=is_selected,
-                        protected=candidate.protected,
-                        selected_reason_code=reason,
-                        compression_artifact_id=compression_ids.get(ordinal),
+                compression_ids: dict[int, UUID] = {}
+                for index, result in compression_by_index.items():
+                    artifact_id = uuid7()
+                    compression_ids[index] = artifact_id
+                    session.add(
+                        CompressionArtifactRow(
+                            id=artifact_id,
+                            context_manifest_id=manifest_id,
+                            input_hash=result.input_hash,
+                            output_hash=result.output_hash,
+                            compression_level=result.candidate.compression_level.value,
+                            token_before=result.token_before,
+                            token_after=result.token_after,
+                            validation_status=result.validation_status,
+                            provenance_refs=list(result.candidate.provenance_refs),
+                        )
                     )
-                )
+                for ordinal, (candidate, original_tokens) in enumerate(measured):
+                    effective = selected_by_index.get(ordinal, candidate)
+                    is_selected = ordinal in selected_by_index
+                    if is_selected:
+                        reason = effective.selected_reason_code
+                    elif ordinal in policy_pruned:
+                        reason = "context_policy_pruned"
+                    else:
+                        reason = "context_budget_pruned"
+                    session.add(
+                        ContextItemRow(
+                            id=uuid7(),
+                            context_manifest_id=manifest_id,
+                            ordinal=ordinal,
+                            item_type=candidate.item_type.value,
+                            source_ref_type=candidate.source_ref_type,
+                            source_ref_id=candidate.source_ref_id,
+                            rank_score=candidate.rank_score,
+                            token_count=token_by_index.get(ordinal, original_tokens),
+                            compression_level=effective.compression_level.value,
+                            content_hash=hashlib.sha256(effective.content.encode("utf-8")).hexdigest(),
+                            selected=is_selected,
+                            protected=candidate.protected,
+                            selected_reason_code=reason,
+                            compression_artifact_id=compression_ids.get(ordinal),
+                        )
+                    )
+        except (DataError, IntegrityError) as exc:
+            raise ContextManifestPersistenceError from exc
 
         return ContextEnvelope(
             manifest_id=manifest_id,

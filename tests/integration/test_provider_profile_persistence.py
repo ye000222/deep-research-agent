@@ -5,7 +5,9 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from app.context.manager import ContextBudgetManager
 from app.core.config import Settings
+from app.domain.context import ContextCandidate, ContextItemType
 from app.domain.identifiers import uuid7
 from app.domain.planning import ResearchPlan
 from app.domain.providers import TokenUsage, UsageAccuracy
@@ -162,6 +164,44 @@ async def _exercise_memory_hybrid_retrieval(settings: Settings, run_id: UUID) ->
         assert result.result == "hit"
         assert result.items
         assert "工业视觉缺陷检测" in result.items[0].content_summary
+    finally:
+        await database.close()
+
+
+async def _exercise_long_context_source_reference(settings: Settings, run_id: UUID) -> None:
+    """A percent-encoded URL must not crash Context Manifest persistence."""
+    database = PostgresRuntime(settings.database_url)
+    manager = ContextBudgetManager(database.session_factory)
+    long_url = "https://www.example.com/" + ("%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84/" * 12)
+    try:
+        envelope = await manager.build(
+            run_id=run_id,
+            node_name="evidence_extractor",
+            provider_adapter="openai_compatible_chat",
+            model="integration-model-v1",
+            candidates=(
+                ContextCandidate(
+                    item_type=ContextItemType.SOURCE_CHUNK,
+                    content="A long URL reference must remain auditable.",
+                    rank_score=1.0,
+                    source_ref_type="source_url",
+                    source_ref_id=long_url,
+                ),
+            ),
+            requested_output_tokens=1000,
+            context_window=16000,
+            provider_max_output_tokens=2000,
+            prompt_template_version="integration.long-source-ref.v1",
+        )
+        assert envelope.manifest_id
+        metrics = await manager.list_metrics(run_id)
+        item = next(
+            item
+            for manifest in metrics
+            if manifest.manifest_id == envelope.manifest_id
+            for item in manifest.items
+        )
+        assert item.source_ref_id == long_url
     finally:
         await database.close()
 
@@ -366,6 +406,7 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
         assert persisted_plan.json()["questions"][0]["id"] == "q1"
 
         asyncio.run(_exercise_memory_hybrid_retrieval(settings, UUID(planner_run_id)))
+        asyncio.run(_exercise_long_context_source_reference(settings, UUID(planner_run_id)))
 
         planner_events = restarted.get(
             f"/api/v1/research-runs/{planner_run_id}/events?follow=false"

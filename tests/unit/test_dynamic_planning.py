@@ -4,6 +4,8 @@ from app.domain.planning import (
     ResearchQuestion,
     append_dynamic_questions,
     build_gap_driven_questions,
+    build_gap_resolution_hints,
+    fit_plan_to_budget,
 )
 
 
@@ -71,6 +73,35 @@ def test_evaluator_gap_builds_a_bounded_replan_question() -> None:
     assert [item.id for item in additions] == ["q6"]
     assert "独立公开证据" in additions[0].question
     assert additions[0].priority == 1
+
+
+def test_standard_budget_keeps_only_executable_high_priority_questions() -> None:
+    plan = _plan().model_copy(
+        update={
+            "questions": [
+                *(_plan().questions),
+                _question("q6").model_copy(update={"priority": 3}),
+                _question("q7").model_copy(update={"priority": 1}),
+                _question("q8").model_copy(update={"priority": 2}),
+            ]
+        }
+    )
+
+    fitted = fit_plan_to_budget(plan, max_iterations=15)
+
+    assert len(fitted.questions) == 6
+    assert "q7" in {question.id for question in fitted.questions}
+    assert "q6" not in {question.id for question in fitted.questions}
+
+
+def test_gap_resolution_hints_target_independent_sources_without_new_question() -> None:
+    question = _question("q6")
+
+    hints = build_gap_resolution_hints(question, ("缺少第二个独立来源",))
+
+    assert len(hints) == 3
+    assert all(question.question in hint for hint in hints)
+    assert any("independent source" in hint for hint in hints)
 
 
 def _question(identifier: str) -> ResearchQuestion:

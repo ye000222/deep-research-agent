@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -9,7 +10,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.identifiers import uuid7
-from app.domain.planning import ResearchPlan, ResearchQuestion, append_dynamic_questions
+from app.domain.planning import (
+    ResearchPlan,
+    ResearchQuestion,
+    append_dynamic_questions,
+    build_gap_resolution_hints,
+    fit_plan_to_budget,
+)
 from app.domain.providers import TokenUsage
 from app.domain.research_runs import (
     TERMINAL_RUN_STATUSES,
@@ -436,6 +443,10 @@ class ResearchRunRepository:
                 or run.worker_task_id != worker_task_id
             ):
                 return False
+            plan = fit_plan_to_budget(
+                plan,
+                max_iterations=int(run.budget_snapshot.get("max_iterations", 0) or 0),
+            )
             plan_version = run.plan_version + 1
             for question in plan.questions:
                 session.add(
@@ -484,6 +495,103 @@ class ResearchRunRepository:
                 },
             )
 
+            return True
+
+    async def save_gap_resolution_plan(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        gaps: list[tuple[str, tuple[str, ...]]],
+    ) -> bool:
+        """Replan original questions in place so new evidence closes parent gaps."""
+
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
+            )
+            if (
+                run is None
+                or RunStatus(run.status) != RunStatus.RUNNING
+                or run.worker_task_id != worker_task_id
+                or run.plan_version < 1
+            ):
+                return False
+            rows = (
+                await session.scalars(
+                    select(ResearchPlanItemRow)
+                    .where(
+                        ResearchPlanItemRow.run_id == run_id,
+                        ResearchPlanItemRow.plan_version == run.plan_version,
+                    )
+                    .order_by(ResearchPlanItemRow.priority, ResearchPlanItemRow.question_id)
+                )
+            ).all()
+            targets = {question_id: reasons for question_id, reasons in gaps[:3]}
+            if not targets:
+                return False
+            plan_version = run.plan_version + 1
+            reset_ids: list[str] = []
+            for row in rows:
+                requirements = [str(item) for item in row.evidence_requirements]
+                hints = [str(item) for item in row.search_hints]
+                status = row.status
+                reasons = targets.get(row.question_id)
+                if reasons is not None:
+                    question = ResearchQuestion(
+                        id=row.question_id,
+                        question=row.question,
+                        priority=row.priority,
+                        rationale=row.rationale,
+                        evidence_requirements=requirements,
+                        search_hints=hints,
+                    )
+                    hints = build_gap_resolution_hints(question, reasons)
+                    status = "pending"
+                    reset_ids.append(row.question_id)
+                session.add(
+                    ResearchPlanItemRow(
+                        id=uuid7(),
+                        run_id=run.id,
+                        plan_version=plan_version,
+                        question_id=row.question_id,
+                        question=row.question,
+                        priority=row.priority,
+                        rationale=row.rationale,
+                        evidence_requirements=requirements,
+                        search_hints=hints,
+                        status=status,
+                    )
+                )
+            if not reset_ids:
+                return False
+            run.plan_version = plan_version
+            run.phase = RunPhase.RESEARCHING.value
+            run.termination_reason = None
+            quality = dict(run.quality_snapshot)
+            quality["low_information_gain_streak"] = 0
+            run.quality_snapshot = quality
+            usage = dict(run.usage_snapshot)
+            usage["replans"] = int(usage.get("replans", 0) or 0) + 1
+            run.usage_snapshot = usage
+            run.updated_at = datetime.now(UTC)
+            run.state_version += 1
+            await self._append_event(
+                session,
+                run,
+                event_type="plan.revised",
+                public_summary=(
+                    f"REPLAN 已创建计划版本 {plan_version}; "
+                    f"对 {len(reset_ids)} 个原问题执行定向补证。"
+                ),
+                refs={
+                    "plan_version": plan_version,
+                    "gap_resolution_question_ids": reset_ids,
+                    "question_count": len(rows),
+                    "coverage_denominator_changed": False,
+                },
+                metrics=None,
+            )
             return True
 
     async def save_replanned_questions(
@@ -682,6 +790,7 @@ class ResearchRunRepository:
         worker_task_id: str,
         error_code: str = "WORKER_EXECUTION_FAILED",
         detail_code: str | None = None,
+        diagnostics: Mapping[str, str | int] | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
@@ -704,6 +813,23 @@ class ResearchRunRepository:
             run.updated_at = now
             run.finished_at = now
             run.state_version += 1
+            allowed_diagnostics = {
+                "structured_output_strategy",
+                "finish_reason",
+                "output_tokens",
+                "max_output_tokens",
+                "response_length",
+                "provider_request_id",
+                "retry_mode",
+                "first_error_code",
+                "attempt_stage",
+                "compact_trigger",
+            }
+            safe_diagnostics = {
+                key: value[:200] if isinstance(value, str) else value
+                for key, value in (diagnostics or {}).items()
+                if key in allowed_diagnostics and isinstance(value, str | int)
+            }
             await self._append_event(
                 session,
                 run,
@@ -712,6 +838,7 @@ class ResearchRunRepository:
                 refs={
                     "reason": safe_code[:100],
                     "detail_code": (detail_code or "UNKNOWN")[:100],
+                    "model_diagnostics": safe_diagnostics,
                 },
                 metrics=None,
             )

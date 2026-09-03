@@ -1,0 +1,33 @@
+以后你可以这样启动：
+cd D:\agentProject
+docker compose up -d
+
+查看运行状态：
+docker compose ps
+
+打开网页：
+http://localhost:5174/
+
+停止项目：
+cd D:\agentProject
+docker compose down
+
+查看日志：
+docker compose logs -f api
+docker compose logs -f worker
+docker compose logs -f web
+
+代码修改后重新构建：
+docker compose up -d --build
+
+如果只修改前端：
+docker compose up -d --build web
+
+如果只修改后端：
+docker compose up -d --build api worker dispatcher
+
+如果出现数据库迁移问题，可执行：
+docker compose run --rm migrate
+docker compose up -d
+
+网页端口固定为 5174，后端 API 端口为 8000

@@ -159,7 +159,7 @@ async def test_compatible_adapter_falls_back_when_json_mode_is_rejected() -> Non
         )
 
     assert route.call_count == 2
-    assert route.calls[0].request.headers["connection"] == "close"
+    assert route.calls[0].request.headers.get("connection") != "close"
     second_body = json.loads(route.calls[1].request.content)
     assert "response_format" not in second_body
     assert "JSON Schema" in second_body["messages"][0]["content"]
@@ -235,10 +235,100 @@ async def test_compatible_adapter_regenerates_invalid_json_once_and_counts_usage
     assert route.call_count == 2
     retry_body = json.loads(route.calls[1].request.content)
     assert "前一次响应无法解析" in retry_body["messages"][1]["content"]
+    assert "response_format" not in retry_body
     assert result.usage.input_tokens == 22
     assert result.usage.output_tokens == 45
     assert result.usage.total_tokens == 67
-    assert result.capability_strategy["structured_output"] == "json_mode_regenerated_once"
+    assert result.capability_strategy["structured_output"] == "prompt_json_regenerated_once"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compatible_invalid_json_exposes_safe_finish_diagnostics() -> None:
+    route = respx.post("https://api.deepseek.com/chat/completions").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "id": "chat_invalid_1",
+                    "choices": [
+                        {"finish_reason": "length", "message": {"content": "not-json"}}
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "id": "chat_invalid_2",
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "still-not-json"},
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 20},
+                },
+            ),
+        ]
+    )
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(ModelGatewayError) as raised:
+            await LLMGateway(client).generate_structured(
+                adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT,
+                base_url="https://api.deepseek.com",
+                api_key=SecretStr("compatible-secret"),
+                request=request(),
+            )
+
+    assert route.call_count == 2
+    retry_body = json.loads(route.calls[1].request.content)
+    assert retry_body["response_format"] == {"type": "json_object"}
+    assert "达到长度上限" in retry_body["messages"][1]["content"]
+    assert raised.value.code == "MODEL_OUTPUT_TRUNCATED"
+    assert raised.value.detail_code == (
+        "OUTPUT_INVALID_JSON_MODE_REGENERATED_ONCE_FINISH_LENGTH_"
+        "PARSE_EXPECTING_VALUE_AT_0_CHARS_14"
+    )
+    assert raised.value.diagnostics == {
+        "structured_output_strategy": "json_mode_regenerated_once",
+        "finish_reason": "length",
+        "output_tokens": 40,
+        "max_output_tokens": 1800,
+        "response_length": 14,
+        "provider_request_id": "chat_invalid_2",
+        "retry_mode": "generic_regeneration",
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compatible_adapter_honors_control_plane_temperature() -> None:
+    route = respx.post("https://api.deepseek.com/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "chat_deterministic",
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": json.dumps(PLAN)}}
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+            },
+        )
+    )
+    deterministic_request = request().model_copy(
+        update={"generation_parameters": {"temperature": 0.0}}
+    )
+    async with httpx.AsyncClient() as client:
+        await LLMGateway(client).generate_structured(
+            adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT,
+            base_url="https://api.deepseek.com",
+            api_key=SecretStr("compatible-secret"),
+            request=deterministic_request,
+        )
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["temperature"] == 0.0
 
 
 @pytest.mark.asyncio
