@@ -6,6 +6,13 @@ search:
     - html
     - json
 
+# Keep a Chinese general-web fallback available for the application-level
+# search strategy. The provider can still report a transient timeout; it must
+# not be silently disabled by SearXNG when the default engines are degraded.
+engines:
+  - name: sogou
+    disabled: false
+
 server:
   secret_key: "ZjrPThLzCIMk3lz9mSYdeyo1K8X79CmSp9dz-v7axG8NSnTFTEG8z8syEaB1OHHf"
   limiter: false

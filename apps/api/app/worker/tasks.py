@@ -8,7 +8,7 @@ from uuid import UUID
 import httpx
 from celery import Task  # type: ignore[import-untyped]
 
-from app.context.manager import ContextBudgetManager
+from app.context.manager import ContextBudgetManager, ContextManifestPersistenceError
 from app.core.config import Settings
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.checkpoints.lifecycle import CheckpointRuntime
@@ -137,6 +137,7 @@ async def _execute(run_id: UUID, task_id: str) -> str:
             worker_task_id=task_id,
             error_code=exc.code,
             detail_code=exc.detail_code,
+            diagnostics=exc.diagnostics,
         )
         await _synchronize_failure_state(state_repository, run_id)
         return f"failed:{exc.code}"
@@ -148,6 +149,14 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         )
         await _synchronize_failure_state(state_repository, run_id)
         return "failed:CREDENTIAL_UNAVAILABLE"
+    except ContextManifestPersistenceError as exc:
+        await repository.fail_execution(
+            run_id,
+            worker_task_id=task_id,
+            error_code=exc.code,
+        )
+        await _synchronize_failure_state(state_repository, run_id)
+        return f"failed:{exc.code}"
     except Exception:
         await repository.fail_execution(run_id, worker_task_id=task_id)
         await _synchronize_failure_state(state_repository, run_id)

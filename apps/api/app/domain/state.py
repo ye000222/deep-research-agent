@@ -183,6 +183,15 @@ class QualitySnapshot(BaseModel):
     citation_support: Score = 0.0
 
 
+class RequirementCoverageSnapshot(BaseModel):
+    dimension_key: str = Field(min_length=1, max_length=100)
+    criterion: str = Field(min_length=1, max_length=1000)
+    coverage: Score
+    accepted_evidence: int = Field(ge=0)
+    independent_sources: int = Field(ge=0)
+    required_sources: int = Field(ge=1)
+
+
 class CoverageDimensionSnapshot(BaseModel):
     dimension_key: str = Field(min_length=1, max_length=100)
     question: str = Field(min_length=1, max_length=500)
@@ -191,6 +200,7 @@ class CoverageDimensionSnapshot(BaseModel):
     accepted_evidence: int = Field(ge=0)
     independent_sources: int = Field(ge=0)
     acceptance_criteria: tuple[str, ...] = ()
+    requirement_statuses: tuple[RequirementCoverageSnapshot, ...] = ()
     missing_reasons: tuple[str, ...] = ()
 
 

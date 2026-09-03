@@ -48,7 +48,7 @@ async def test_searxng_normalizes_invalid_payload_to_safe_error() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_searxng_falls_back_to_openaire_when_general_engines_are_degraded() -> None:
+async def test_searxng_falls_back_to_sogou_when_general_engines_are_degraded() -> None:
     route = respx.get("http://searxng.test/search").mock(
         side_effect=[
             httpx.Response(
@@ -63,9 +63,9 @@ async def test_searxng_falls_back_to_openaire_when_general_engines_are_degraded(
                 json={
                     "results": [
                         {
-                            "title": "Open research paper",
-                            "url": "https://arxiv.org/abs/2109.11304",
-                            "content": "Public abstract page.",
+                            "title": "Sogou result",
+                            "url": "https://example.cn/inspection",
+                            "content": "Public result page.",
                         }
                     ],
                     "unresponsive_engines": [],
@@ -74,11 +74,13 @@ async def test_searxng_falls_back_to_openaire_when_general_engines_are_degraded(
         ]
     )
     async with httpx.AsyncClient() as client:
-        results = await SearXNGSearchProvider(client, "http://searxng.test").search("topic")
+        results = await SearXNGSearchProvider(client, "http://searxng.test").search(
+            "topic", limit=1
+        )
 
     assert route.call_count == 2
-    assert results[0].url == "https://arxiv.org/abs/2109.11304"
-    assert route.calls[1].request.url.params["engines"] == "openairepublications"
+    assert results[0].url == "https://example.cn/inspection"
+    assert route.calls[1].request.url.params["engines"] == "sogou"
 
 
 @pytest.mark.asyncio
@@ -103,7 +105,7 @@ async def test_searxng_reports_provider_degradation_instead_of_false_empty_succe
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_searxng_retries_transient_openaire_degradation_once() -> None:
+async def test_searxng_retries_transient_fallback_degradation_once() -> None:
     route = respx.get("http://searxng.test/search").mock(
         side_effect=[
             httpx.Response(
@@ -112,7 +114,11 @@ async def test_searxng_retries_transient_openaire_degradation_once() -> None:
             ),
             httpx.Response(
                 200,
-                json={"results": [], "unresponsive_engines": [["openaire", "timeout"]]},
+                json={"results": [], "unresponsive_engines": [["sogou", "timeout"]]},
+            ),
+            httpx.Response(
+                200,
+                json={"results": [], "unresponsive_engines": [["sogou", "timeout"]]},
             ),
             httpx.Response(
                 200,
@@ -131,5 +137,5 @@ async def test_searxng_retries_transient_openaire_degradation_once() -> None:
     async with httpx.AsyncClient() as client:
         results = await SearXNGSearchProvider(client, "http://searxng.test").search("topic")
 
-    assert route.call_count == 3
+    assert route.call_count == 4
     assert results[0].title == "Recovered result"

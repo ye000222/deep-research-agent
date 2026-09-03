@@ -10,7 +10,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.domain.memory import MemoryItemView
-from app.domain.planning import ResearchPlan, build_gap_driven_questions
+from app.domain.planning import ResearchPlan
 from app.domain.providers import TokenUsage
 from app.infrastructure.db.research_runs import ResearchRunRepository
 from app.infrastructure.db.state_runtime import ResearchStateRuntimeRepository
@@ -135,9 +135,7 @@ class ResearchGraphService:
             gaps = [
                 (
                     dimension.dimension_key,
-                    dimension.question,
                     dimension.missing_reasons,
-                    dimension.priority,
                 )
                 for dimension in sorted(
                     state.coverage_map,
@@ -145,16 +143,15 @@ class ResearchGraphService:
                 )
                 if dimension.coverage < 1.0
             ]
-            additions = build_gap_driven_questions(plan, gaps)
-            if not additions:
+            if not gaps:
                 raise RuntimeError("REPLAN was selected without an actionable coverage gap")
-            saved = await self._runs.save_replanned_questions(
+            saved = await self._runs.save_gap_resolution_plan(
                 run_id,
                 worker_task_id=worker_task_id,
-                additions=additions,
+                gaps=gaps,
             )
             if not saved:
-                raise RuntimeError("REPLAN lost the worker lease or produced no new question")
+                raise RuntimeError("REPLAN lost the worker lease or produced no gap task")
             state = await self._states.synchronize(
                 run_id,
                 node_name="replan",
@@ -163,7 +160,7 @@ class ResearchGraphService:
             return {
                 "run_id": str(run_id),
                 "research_state": state.model_dump(mode="json"),
-                "outcome": f"replanned:added={len(additions)}",
+                "outcome": f"replanned:gaps={len(gaps[:3])}",
                 "continue_research": True,
                 "iteration": int(graph_state.get("iteration", 0)),
                 "replan_required": False,

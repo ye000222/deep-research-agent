@@ -41,6 +41,7 @@ class EvidenceCandidate(BaseModel):
 
     claim: str = Field(min_length=10, max_length=1200)
     exact_quote: str = Field(min_length=10, max_length=2000)
+    dimension_key: str | None = Field(default=None, min_length=1, max_length=100)
     relation: EvidenceRelation = EvidenceRelation.SUPPORTS
     relevance: float = Field(ge=0.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)

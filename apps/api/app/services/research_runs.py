@@ -39,8 +39,8 @@ _BUDGETS: dict[str, dict[str, object]] = {
         "max_tokens": 30_000,
     },
     "standard": {
-        "max_iterations": 15,
-        "max_searches": 15,
+        "max_iterations": 20,
+        "max_searches": 20,
         "max_pages": 30,
         "max_tokens": 100_000,
     },

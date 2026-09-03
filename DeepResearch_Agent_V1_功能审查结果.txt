@@ -1,0 +1,1344 @@
+DeepResearch Agent V1 功能审查结果
+====================================
+
+审查日期：2026-08-31
+审查记录版本：V1.7
+审查对象：DeepResearch_Agent_V1_开发计划.txt 与当前代码仓库
+审查原则：只把已经存在于代码、数据库 Migration 或可重复验证结果中的能力列为“已完成”；计划文档中的目标不等于实际完成。
+
+审查结论：当前项目已经打通“模型配置 → Planner → 多轮搜索 → 网页读取 → 证据抽取 → 基础 Evaluation → 报告生成 → 引用展示”的可运行纵向链路。StateGraph 已从单个粗粒度 Research Loop 节点升级为可在每轮研究后条件回环的 iteration-level Graph；每轮会生成可重放的 Coverage Map、Information Gain、关键缺口和继续/停止说明。Evidence Graph 基础闭环已完成：Claim / Evidence / Chunk / Snapshot 原子绑定、确定性 supports / contradicts / supplements 关系、独立来源 Conflict 门槛、Graph API 和 Citation Snapshot 外键链均已进入运行时；当前主要缺口转为 Context Budget Manager、研究经验 Memory、工具级细粒度节点、完整冲突消解和语义 Evaluation。
+V1.7 增量审查（2026-08-31）
+----------------------------
+
+本轮已完成并验证 Context Budget Manager 的第一阶段闭环：
+
+- 新增 `context_manifests`、`context_items` 业务表及 Alembic 迁移 `20260828_0010`。
+- Context Window、输出预留、输入预算上限和受保护上下文由确定性算法计算。
+- Planner、Evidence Extractor、Report Writer 已接入上下文候选选择和 Manifest 记录。
+- Manifest 保存选择/拒绝数量、Token 前后值、裁剪状态、Prompt Hash 和 Item Hash；不保存 API Key 或完整 Prompt。
+- 新增 `GET /api/v1/research-runs/{run_id}/context-metrics`，返回节点级预算与选择指标。
+- 已通过真实 PostgreSQL 18 迁移和数据库冒烟：版本为 `20260828_0010`，Manifest/Item 能成功写入并读取；临时冒烟数据已清理。
+- 已通过全量 pytest、Ruff、API 启动导入和 OpenAPI 路由检查。
+
+本轮仍未完成：`compression_artifacts`、Context Policy Registry、MMR/去重、层级压缩、Provenance Guard、Repair Call 独立 Manifest、Context Metrics 前端面板，以及输入 Token 减少 40% 的 Golden Eval。Docker Compose 当前可启动，API/Worker/Dispatcher/Redis/PostgreSQL/SearXNG 均已就绪。
+
+一、总体判断
+------------
+
+当前定位：可以端到端演示的 Evidence-driven Research Agent，已具备 iteration-level 状态图、持久化恢复基础、Coverage Map、确定性 Information Gain，以及 Claim → Evidence → Chunk → Snapshot → Citation 的运行时链路和基础 Claim Relation / Conflict 管理；还不是开发计划中完整的“Context Budget + Research Memory + Tool Policy + Semantic Evaluation”系统。
+
+粗略完成度：
+
+- 按可运行 Demo 计算：完成度较高，主链路可以演示
+- 按完整 V1 Release Gate 计算：约 62%
+- 已完成主链路：基础工程、PostgreSQL、BYOK、Planner、搜索、网页读取、证据校验、iteration-level StateGraph、Coverage/Information Gain、报告和引用
+- 最大缺口：Context Budget Manager、研究经验 Memory、工具级细粒度节点、统一 Tool Calling、完整冲突消解和语义 Evaluation
+
+本轮新增的实际进展：
+
+- StateGraph 已调整为 Planner → Research Iteration ↻ → Report Writer；每轮 Evaluation 后由条件边自动继续或进入写作
+- Worker 使用官方 AsyncPostgresSaver 编译和执行 Graph
+- Graph 使用 thread_id=run_id 和 durability=sync 保存 Planner、每轮 Research Iteration 与 Writer 边界 Checkpoint
+- 新增 research_state_snapshots 和 research_state_patches 两张业务表
+- 新增轻量 ResearchState 初始化、StatePatch 投影、版本校验、State Hash 和 Patch 审计
+- accepted Evidence 和 Research Gap 可投影到 State 的 Known / Gaps
+- 新增 GET /api/v1/research-runs/{run_id}/state
+- 失败、取消、恢复边界会同步公开 ResearchState；恢复时会清理旧 stop_reason
+- completed_with_limitations 使用独立机器可读 StopReason，不再误报为 budget_exhausted
+- Planner 重试逻辑迁移到 ResearchGraphService，避免 Worker 和 Graph 出现两套编排逻辑
+- 新增按 Question/Priority/独立来源计算的 Research Coverage Map
+- 新增确定性 Information Gain、低增益连续轮次和可解释继续/停止事件
+- quality_met、sources_exhausted、stagnation 使用不同终止原因和报告限制
+- Evidence Graph 新数据在 Evidence 保存事务内创建/复用 Claim、Source Snapshot 与 Source Chunk，并绑定可追溯外键
+- accepted Evidence 若无法在网页正文定位 Exact Quote，会由服务端降级拒绝
+- 新增 GET /api/v1/research-runs/{run_id}/evidence-graph，并在现有 Evidence API 返回 claim_id / snapshot_id / chunk_id
+- 新增历史 Evidence Graph 回填 CLI，默认 dry-run；已在真实 PostgreSQL 完成 144 条历史 Evidence 回填与幂等复查
+- 新增确定性 Claim Relation v2：同实体/指标范围门槛、独立 source_owner_key Conflict 门槛、假冲突回归测试和 stale edge 协调删除
+- Graph API 已返回 Claim Edge 与 Conflict；历史关系重建为 7 条 supplements、0 条伪 conflicts，二次 apply 零变更
+- Report Citation 新增 claim_id / snapshot_id / chunk_id；Citation API 返回 Snapshot Hash 与 Chunk 字符定位
+
+二、按开发阶段核对
+------------------
+
+P0 设计冻结：部分完成
+
+已完成：
+
+- 已有完整 V1 开发计划
+- 已有 PostgreSQL 边界 ADR 和 BYOK/凭据 ADR
+- 已有 ResearchState、StatePatch、KnownClaimRef、ResearchGap、NextAction、ToolDecision、EvaluationSnapshot 等类型契约
+- 已定义预算、证据、引用和停止条件
+
+未完成：
+
+- 正式字段级 ERD
+- 完整状态转换表
+- Tool Decision/Policy/Idempotency 矩阵
+- Provider 错误与重试矩阵
+- 完整 Secret Threat Model
+- LangGraph Checkpoint 版本矩阵、Graph Schema 升级和恢复 ADR
+
+P1 工程骨架：基本完成
+
+已完成：
+
+- FastAPI、React、TypeScript、Vite
+- PostgreSQL 18、Redis、Celery、SearXNG
+- Docker Compose
+- Alembic
+- GitHub Actions CI
+- Health API 和基础 Readiness API
+
+部分完成：
+
+- Readiness 主要检查依赖连通性，未完整验证 PostgreSQL 版本、UTC、扩展、索引、Worker、Checkpoint Migration 和 Secret Cipher
+- 未接入 OpenTelemetry
+- 前端未使用计划中的 React Router、TanStack Query、Tailwind、shadcn/ui、react-markdown
+
+P2 数据、事件与 Checkpoint：部分完成，阶段级主链路已接入
+
+已完成：
+
+- Research Run 持久化
+- Agent Event 事实源和 Run Seq
+- Dispatch Outbox
+- Celery Worker、Dispatcher 和 Worker Lease
+- 取消、恢复和重复投递跳过
+- SSE Last-Event-ID 增量读取
+- 官方 Checkpoint 数据库和四张官方 Checkpoint 表
+- 实际 Worker 已打开官方 AsyncPostgresSaver
+- 实际研究流程已编译为 LangGraph StateGraph
+- Planner、Research Loop、Report Writer 三个阶段边界会保存同步 Checkpoint
+- 使用 run_id 作为 thread_id
+- 新增 ResearchState Snapshot/Patch 持久化和 state.initialized/state.patch_applied 公开事件
+- 失败、取消和恢复时同步已有 State Snapshot
+
+未完成：
+
+- 当前 StateGraph 已在每个 Research Iteration 后 Checkpoint 并通过条件边回环；Search / Read / Extract / Save / Evaluate 尚未继续拆成独立节点
+- Search、Read、Extract、Evaluate 尚未成为可独立恢复的 Graph Node
+- 没有正式 Pending Writes、Time Travel、Conformance、并发和崩溃恢复测试
+- 还没有验证“业务事务成功但 Checkpoint 失败”和相反方向的 Failure Injection
+- Redis 目前不是 SSE 唤醒层，前端主要通过 follow=false 轮询
+- 没有 EVENTS_EXPIRED 410 事件保留窗口处理
+- 取消不会主动取消正在进行的 Provider HTTP 请求
+
+P3 多模型 API 与 BYOK：部分完成
+
+已完成：
+
+- OpenAI Responses Adapter
+- Anthropic Messages Adapter
+- Google Gemini Adapter
+- OpenAI-compatible Chat Adapter
+- 自定义 Base URL、Model ID、API Key
+- AES-256-GCM 加密、AAD、Key 轮换、删除和末四位展示
+- HttpOnly 会话 Cookie
+- Run 创建时固化模型配置快照
+- 私网 IP、Metadata IP、URL 凭据、Query、Fragment 校验
+
+未完成：
+
+- GET /api/v1/llm/providers
+- Quick Connection Test 和 Full Capability Test
+- Capability Cache
+- Tool Calling、Streaming、Usage、Context Window 探测
+- generate_text、stream_text、normalize_tool_calls、cancel 等完整统一 Adapter 接口
+- Planner、Extractor、Evaluator、Writer、Verifier 独立 Role Binding
+- run-only Credential、24 小时宽限期和 Secret GC
+- llm_calls 模型调用审计表
+
+P4 Tool 层：部分完成
+
+已完成：
+
+- SearXNG Web Search
+- Public Web Reader
+- SSRF、重定向、MIME、大小和超时限制
+- Evidence Extractor
+- Exact Quote 校验
+- Evidence Score
+- Search Query、Source、Evidence 和 Tool Call 基础持久化
+- 重复搜索键和基础错误分类
+
+未完成：
+
+- Tool Registry、Tool Gateway 和 ToolPolicyGuard
+- Budget Reservation/Commit/Release
+- 正式 search_evidence Tool
+- analyze_data Tool
+- 统一 ToolResultEnvelope 的运行时执行链
+- LLM 提出 ToolDecision 后由确定性 Policy 决定执行
+- ActionUtility 排序
+
+当前实际执行路径仍由 ResearchLoopService 固定为：
+
+prepare_target → web_search → read_page → extract → save evidence → evaluate
+
+P5 State、Context 与 Memory：State 部分已进入运行时，Context/Memory 仍大部分未完成
+
+1. State
+
+已完成：
+
+- ResearchState、KnownClaimRef、ResearchGap、NextAction、BudgetLimits、StatePatch
+- State Invariants 和确定性 StateReducer
+- StatePatch 支持 base_version 校验并在每次应用后递增 state_version
+- research_state_snapshots 保存当前轻量状态和 SHA-256 State Hash
+- research_state_patches 保存每次 Patch、节点、base/result version 和结果 Hash
+- Planner、每轮 Research Iteration、Report Writer 结束后通过 StatePatch 投影数据库事实
+- accepted Evidence 投影到 Known，Research Gap 投影到 Gaps
+- Budget Usage、Quality、Phase、Status 和 StopReason 投影到 State
+- 失败、取消、恢复生命周期边界同步 State
+- State 查询 API
+- StateGraph 和官方 PostgreSQL Checkpoint 已接入实际 Worker
+
+部分完成或未完成：
+
+- research_claims 已进入运行时并绑定 Evidence；Known State 仍沿用轻量兼容投影，尚未直接引用 Knowledge Snapshot / Claim Ledger
+- 当前是行锁 + base_version 校验，不是计划中完整的 UPDATE ... WHERE state_version=N RETURNING CAS 协议
+- Research Loop 内部节点仍直接更新业务表，尚未做到“所有节点只返回 StatePatch”
+- 没有独立 Knowledge Snapshot、Knowledge Fingerprint 和恢复一致性检查
+- current_question_id、next_action、no_progress_iterations 尚未形成完整运行账本
+- 没有 Agent Action 表和完整 Known/Unknown/Next Action Runtime
+- 已有每轮 Research Iteration 级 Checkpoint；还没有 Search/Read/Extract/Save/Evaluate 分步 Checkpoint
+
+2. Context Engineering
+
+已完成：
+
+- Planner 使用目标级上下文
+- Extractor 只接收当前问题和当前网页内容
+- Writer 最多使用 20 张 Evidence Card
+- Writer 不接收全量网页正文
+
+未完成：
+
+- context_manifests、context_items、compression_artifacts
+- Context Policy Registry、ContextBuilder、Context Ranker
+- MMR 去重、Token Budget Allocator、Context Compressor、Provenance Guard
+- Context Metrics API
+
+当前多个节点仍只生成临时随机 context_manifest_id，没有真实 Manifest、选择记录、Token 记录或压缩产物持久化。
+
+3. Memory
+
+当前已有的是任务级业务事实和 Graph Checkpoint，不等同于完整 Memory 系统。
+
+未完成：
+
+- Working / Episodic / Semantic / Procedural Memory 分层
+- memory_items、memory_links、memory_access_logs、memory_search_documents
+- Question Summary、Research Ledger
+- 跨任务 Memory Leads、Memory Hit/Miss 和 Revalidation
+- 衰减、过期、覆盖和遗忘
+- tsvector + pg_trgm + RRF Hybrid Retrieval
+- 中文 Tokenizer 和 Retrieval Config 版本
+
+P6 Research Loop 与 Evaluation：部分完成
+
+已完成：
+
+- 自动多轮循环；每轮成为独立 StateGraph Super-step 并可 Checkpoint
+- 每个问题最多两次补充尝试
+- 自动读取网页和抽取证据
+- Coverage Map 按问题优先级、证据数和独立来源域名计算 0 / 0.5 / 1 维度状态
+- Information Gain 按新增 Evidence、Claim、独立来源、Coverage 提升和低价值候选惩罚确定性计算
+- 每轮记录 information_gain、low_information_gain_streak、critical_gaps 和公开决策说明
+- Source Quality 0.75、Cross Validation 0.70、Priority 1 Coverage 0.80 已进入质量停止硬门
+- quality_met、sources_exhausted、stagnation、research_budget_exhausted 分开路由
+- 每轮质量快照和 Coverage Map 投影进 ResearchState
+
+与计划仍不一致：
+
+- Claim Relation v2 已生成 supports / contradicts / supplements 候选边，Conflict 只在同范围矛盾且 accepted Evidence 来自独立 source_owner_key 时创建；高严重度 Conflict 尚未接入完整 TerminationJudge
+- 当前 Coverage Dimension 仍以 Planner Question 为粒度，Acceptance Criteria 尚未拆成独立子维度
+- 独立性当前按来源域名近似，尚未使用 source_owner_key / original_source_id
+- 没有 Claim 级语义支持度、新鲜度和 LLM Critic
+- 没有 Dynamic Planning 和 REPLAN
+- Evaluation 仍在 ResearchToolRepository 中计算，尚未成为独立 Graph Node
+
+P7 报告系统：部分完成
+
+已完成：
+
+- Evidence-only Report Writer
+- 最多 20 张 Evidence Card
+- 稳定 Citation Number 和 Evidence ID 映射
+- Report、Section、Citation PostgreSQL 持久化
+- 引用绑定 Claim、Evidence、Source Chunk、Source Snapshot、URL、Snapshot Content Hash 和访问时间
+- 模型失败或预算不足时确定性降级
+- 无有效证据时拒绝生成报告
+- Report API、Citation API 和前端报告阅读器
+
+未完成：
+
+- 独立 Outline Generator
+- 每章节独立生成和评估
+- Fact Checker 和 Verifier Model
+- LLM/语义级 Citation Support 检查；当前已完成结构化外键、Exact Quote 与 Snapshot/Chunk 定位校验
+- 数字、日期、单位、地区和定义一致性检查
+- Analysis Artifact 重算验证
+- 引用失败后的章节修复轮次
+
+P8 前端工作台：部分完成
+
+已完成：
+
+- 研究问题输入、模型配置、预算选择
+- 研究计划、Agent Activity、Evidence 面板和质量指标
+- Research Coverage Map：逐问题显示覆盖率、证据数、独立来源和缺口
+- Information Gain、低增益连续轮次和 WHY CONTINUE / STOP 公开说明
+- 取消研究、恢复任务和结束研究
+- 报告阅读器和引用来源链接
+- 刷新后恢复模型配置和最近任务
+- 可展示 state.initialized 和 state.patch_applied 活动事件
+
+未完成：
+
+- 独立首页、研究页、模型设置页和 React Router
+- TanStack Query 和真正的 EventSource 长连接
+- Known / Unknown / Next Action 面板
+- Context、Memory 和完整 Evaluation 详情面板
+- Provider Capability 页面
+- 时间、地区、语言和重点维度输入
+- 最近任务完整列表
+- Citation Evidence Drawer
+- 前端尚未消费完整 State API 形成 Known / Unknown / Next Action 详情面板
+
+P9 Eval、系统加固与 Demo：初始阶段
+
+已有：
+
+- Provider Adapter、Planner、Evidence Extractor、Web Reader、Web Search 单元测试
+- State Contract、StateReducer、State Lifecycle 和 ResearchGraph 单元测试
+- Report Writer、Research Loop 单元测试
+- 基础 PostgreSQL 集成测试
+- LangGraph InMemorySaver 阶段级 Checkpoint 冒烟测试
+- GitHub Actions CI
+
+未完成：
+
+- evals/ 数据集和 Golden Set
+- Gap Recall、Stop Decision、Evidence Support Precision
+- Memory Retrieval Eval 和 Context Selection Eval
+- Playwright、Vitest、Prompt Injection 和 Failure Injection
+- Checkpoint Conformance、Pending Writes、Time Travel 和旧 Checkpoint 恢复测试
+- Celery 重投集成测试和 100 并发 Event 测试
+- EXPLAIN ANALYZE 检索测试
+- Secret 全链路泄漏扫描
+- 工业视觉固定 Demo 脚本
+
+三、当前实际数据库范围
+------------------------
+
+当前业务数据库已有：
+
+- Provider Profile、Credential Version
+- Research Run、Research Plan Item、Research Gap
+- Research Tool Call、Search Query、Search Result
+- Research Source、Research Evidence
+- Agent Event、Dispatch Outbox
+- Report、Report Section、Report Citation
+- Research State Snapshot、Research State Patch
+- Research Claim、Claim Edge、Source Snapshot、Source Chunk、Conflict
+
+当前官方 Checkpoint 数据库已有：
+
+- checkpoint_migrations
+- checkpoints
+- checkpoint_blobs
+- checkpoint_writes
+
+尚未实现的核心计划实体：
+
+- knowledge_snapshots、agent_actions
+- analysis_artifacts；完整 Conflict Resolution / Scope Normalization 仍未实现
+- context_manifests、context_items、compression_artifacts
+- memory_items、memory_links、memory_access_logs、memory_search_documents
+- evidence_search_documents、retrieval_config_versions
+- llm_capability_tests、run_llm_bindings、llm_calls
+- evaluation_snapshots
+
+当前证据链：
+
+Report Citation → Claim → Research Evidence → Source Chunk → Source Snapshot → Research Source → 原始 URL
+
+计划目标证据链：
+
+Citation → Claim → Evidence → Source Chunk → Source Snapshot → 原始 URL（结构链已完成；语义支持验证仍待加强）
+
+四、当前已实现 API
+------------------
+
+已实现主要接口：
+
+- Provider Profile 列表、创建、更新、轮换、删除
+- Research Run 创建、列表、详情、计划、State、证据
+- Research Run 取消、恢复、SSE Events
+- Research Report 查询和 Report Citation 查询
+- healthz、readyz、meta
+
+尚缺主要接口：
+
+- Provider Registry、Connection Test、Capability Test
+- Search Provider 状态
+- Knowledge、Gaps、Actions
+- Context Metrics、Memory Accesses、Evaluations
+- Run LLM Config、Sources、单条 Evidence、Verification
+
+五、五条技术主线真实完成度
+--------------------------
+
+1. Agent 状态管理
+
+- 类型契约：已完成
+- Reducer 与状态不变量：已完成
+- Snapshot/Patch 持久化：已完成
+- iteration-level StateGraph 和官方 Checkpoint：已完成
+- 失败/取消/恢复终态同步：已完成
+- 工具级细粒度节点：未完成
+- 完整 CAS 协议：部分完成
+- Known/Unknown/Next Action 完整账本：部分完成
+
+2. Context Engineering
+
+- 基础最小上下文：部分完成
+- Context Manifest：未完成
+- 排序、压缩、裁剪和 Token Budget：未完成
+- Provenance：未完成
+
+3. Memory
+
+- 任务级 Evidence Store：已完成
+- Graph 短期执行 Checkpoint：已完成
+- Working Memory 业务语义：部分完成
+- 长期 Semantic Memory、检索、遗忘和过期：未完成
+
+4. Tool Calling
+
+- Web Search、Web Reader、Evidence Extract/Save：已完成
+- Evidence 检索 Tool：未完成
+- 声明式数据分析 Tool：未完成
+- LLM 动作提议和确定性 Policy 决策：未完成
+- 预算预留和统一 Tool Envelope：未完成
+
+5. Evaluation
+
+- 基础确定性指标和质量停止：部分完成
+- 确定性基础冲突检测：已完成；LLM Critic、完整冲突消解和引用语义验证：未完成
+- Golden Evaluation：未完成
+
+六、推荐推进顺序
+----------------
+
+第一优先级：iteration-level Research Management（本轮基础切片已完成）
+
+已完成：
+
+1. Planner → Research Iteration ↻ → Report Writer 条件回环。
+2. 每轮 StatePatch、Checkpoint、Coverage Map 和 Information Gain。
+3. Priority 1 Coverage、Source Quality、Cross Validation 与 Critical Gap 硬门。
+4. quality_met、sources_exhausted、stagnation 和 budget_exhausted 的可解释停止语义。
+5. 工作台 Coverage Map 与 WHY CONTINUE / STOP。
+
+尚未完成：
+
+1. Search / Read / Extract / Save / Evaluate 工具级节点与 Checkpoint。
+2. 独立 Evaluation Graph Node。
+3. 完整 current_question_id、next_action、no_progress_iterations 和 agent_actions 账本。
+4. Pending Writes、Time Travel 和故障注入验证。
+
+第二优先级：Evidence Graph（基础闭环已完成）
+
+1. 【已完成】创建 research_claims、research_claim_edges、research_source_snapshots、research_source_chunks 和 research_conflicts。
+2. 【已完成】Evidence 保存事务内原子创建/复用 Claim、Snapshot、Chunk，并绑定 Claim → Evidence → Chunk → Snapshot；真实 PostgreSQL 已完成 144 条历史 Evidence 回填，二次 dry-run 候选为 0。
+3. 【已完成】owner-scoped Evidence Graph API 已返回 Claim、Evidence、Snapshot、Chunk、Claim Edge 与 Conflict。
+4. 【部分完成】source_owner_key / original_source_id 已入库；Owner 解析、转载归并和独立性评分仍未完成。
+5. 【部分完成】确定性 supports / contradicts / supplements Claim Edge 已运行；derived_from 与 LLM 语义关系仍未实现。
+6. 【已完成结构闭环】Report Citation 已固化 claim_id / evidence_id / snapshot_id / chunk_id，API 返回 Snapshot Hash、Exact Quote 和 Chunk 字符定位；当前数据库无历史 Report Citation，可在下一次完成研究时做非空运行验证。
+7. 【部分完成】已实现保守数值/极性冲突检测、独立来源门槛、stale edge 协调和假冲突回归测试；时间/地区/单位/定义的完整归一化、专门搜索消解与报告披露仍未完成。
+
+第三优先级：Context Budget Manager
+
+1. 创建 context_manifests、context_items 和 compression_artifacts。
+2. 实现节点 Context Contract、Token Budget Allocator 和输出预留。
+3. 实现 Evidence/State/Gap/Memory 候选排序、去重、裁剪和压缩。
+4. 保证数字、日期、实体、Exact Quote、Citation ID 与高严重度冲突不被压缩丢失。
+5. 暴露 Context Metrics，并验证相同质量下输入 Token 至少下降 40%。
+
+第四优先级：Tool Policy 与 Evaluation
+
+1. 实现 Tool Registry、统一 Tool Envelope、幂等键和预算预留/提交/释放。
+2. 实现 search_evidence 与声明式 analyze_data。
+3. 让模型只提议 ToolDecision，由确定性 Policy 决定执行。
+4. 将 Evidence / Question / Global Evaluation 拆为独立节点。
+5. 加入 LLM Critic、Claim 语义支持、新鲜度、冲突与 Citation Support。
+
+第五优先级：Research Memory
+
+1. V1 先实现当前 Run 的 Working / Task Memory、Question Summary 和 Research Ledger。
+2. 跨任务历史事实只能作为待重新验证线索，不能直接成为 Citation。
+3. V1.1/V2 实现“研究经验记忆”：有效 Query 模板、可靠来源路径、失败路径、口径陷阱和研究策略。
+4. 增加检索、衰减、过期、覆盖、遗忘和 Revalidation。
+
+第六优先级：报告、Eval 与系统加固
+
+1. 独立 Outline、Section Writer、Verifier 和修复轮次。
+2. Golden Eval：Coverage、Information Gain、Gap Recall、Evidence Support 与 Stop Decision。
+3. Checkpoint Conformance、Celery 重投、并发事件和 Failure Injection。
+4. Playwright、SSRF、Prompt Injection、Secret 泄漏和完整 Release Gate。
+
+七、关键代码位置
+----------------
+
+- StateGraph：apps/api/app/services/research_graph.py
+- Research Loop：apps/api/app/services/research_loop.py
+- Worker：apps/api/app/worker/tasks.py
+- State 类型：apps/api/app/domain/state.py
+- State Reducer：apps/api/app/agent/reducers/state_reducer.py
+- State Runtime：apps/api/app/infrastructure/db/state_runtime.py
+- State 表：apps/api/app/infrastructure/db/state_models.py
+- State Migration：apps/api/alembic/versions/20260826_0006_state_runtime.py
+- Evidence Graph 领域/响应类型：apps/api/app/domain/evidence_graph.py
+- Evidence Graph ORM：apps/api/app/infrastructure/db/evidence_graph_models.py
+- Evidence Graph Migration：apps/api/alembic/versions/20260828_0007_evidence_graph.py、20260828_0008_evidence_relations_citations.py、20260828_0009_citation_provenance_not_null.py
+- Evidence Graph 运行时写入/查询：apps/api/app/infrastructure/db/research_tools.py
+- Claim Relation / Conflict 协调：apps/api/app/infrastructure/db/evidence_graph_relations.py
+- 关系历史重建：scripts/rebuild_evidence_graph_relations.py
+- Graph 真实数据库验证：scripts/verify_evidence_graph.py
+- Evidence Graph 历史回填：scripts/backfill_evidence_graph.py
+- Evaluation：apps/api/app/infrastructure/db/research_tools.py
+- Report Writer：apps/api/app/services/report_writer.py
+- Provider Adapter：apps/api/app/llm/adapters.py
+- Checkpoint 生命周期：apps/api/app/infrastructure/checkpoints/lifecycle.py
+- Research Run API：apps/api/app/api/v1/research_runs.py
+- 前端工作台：apps/web/src/App.tsx
+
+八、审查验证记录
+----------------
+
+- 真实 PostgreSQL 已升级到唯一 Head 20260828_0009；Evidence Graph、Citation Snapshot 非空外键和 Conflict 去重索引均已实际查询确认
+- research_state_snapshots、research_state_patches 已在 PostgreSQL 创建
+- 官方 Checkpoint 四张表已实际查询确认
+- LangGraph 无网络测试通过：Planner → Research Iteration → Research Iteration → Report Writer；条件边按迭代结果回环，每轮均同步 State
+- 生命周期冒烟测试通过：恢复清除旧 StopReason，受限完成原因映射正确，State API 进入 OpenAPI
+- 后端完整测试：69 passed，1 skipped
+- Ruff：All checks passed
+- Python compileall：通过
+- git diff --check：通过，仅有现存 CRLF 转换警告
+- 前端 TypeScript 检查和 Vite 生产构建：通过
+- 完整 Compose 栈已启动；API /healthz 与 /readyz 均返回 200，PostgreSQL、Checkpoint PostgreSQL、Redis 和 SearXNG Readiness 全部 ready
+- 当前仓库共收集 70 个测试
+- 本轮未执行 mypy、Checkpoint Conformance、Playwright、Failure Injection 和完整 Release Gate
+
+最终判断：第一优先级的 iteration-level StateGraph + Coverage/Information Gain 已完成基础切片；Evidence Graph 已完成 Schema、原子证据链、保守 Claim Relation / Conflict、Graph API、Citation Snapshot 结构闭环、真实 PostgreSQL Migration 和历史回填。下一开发主线正式进入 Context Budget Manager。当前仍不能把确定性基础冲突检测误认为完整语义冲突消解，也不能把迭代级 Checkpoint 误认为 Search/Read/Extract/Save 工具级恢复能力。
+
+九、根据《新内容.txt》重新确定的当前方向
+------------------------------------------
+
+新的产品定位：
+
+Evidence-Aware & Memory-Aware Deep Research Agent，即面向长周期研究的证据驱动、自适应上下文管理 Research Agent。
+
+V1 不再以“功能数量最多”作为推进目标，而只优先打磨三个能形成辨识度、能现场验证的核心亮点：
+
+1. Evidence Graph
+   - Claim、Evidence、Source Snapshot、Source Chunk、支持/反驳/补充/派生关系可追溯。
+   - 冲突不静默选择；按时间、地区、单位、定义和来源独立性生成 Conflict。
+   - 报告引用必须沿 Claim → Evidence → Chunk → Snapshot → URL 回溯。
+
+2. Coverage-driven / Information-Gain Research Loop
+   - Coverage 按研究维度和 Acceptance Criteria 计算，必须能解释每个维度的已知、未知和证据数量。
+   - 每轮记录新增 Evidence、Claim、独立 Source、Coverage 提升和重复信息，形成 Information Gain。
+   - 继续、补搜、重规划或停止由 Coverage、关键 Gap 和边际信息增益共同决定，而不是只按搜索次数停止。
+
+3. Context Budget Manager
+   - 按模型 Context Window 为 State、当前 Gap、Evidence、Working/Task Memory 和输出预留预算。
+   - 对候选内容排序、去重、压缩和重新检索；关键数字、实体、日期、Exact Quote、Citation ID 和高严重度冲突不得丢失。
+   - 每次调用要有可追溯的 Context Manifest、Token 使用和压缩记录。
+
+当前代码对新方向的映射：
+
+- iteration-level StateGraph、State Snapshot/Patch 和基础 Evidence/Gap Loop：已完成或部分完成。
+- Evidence Graph 的 Claim/Snapshot/Chunk/Claim Edge/Conflict ORM 与 Migration、新证据运行时原子绑定、自动关系协调、Graph API、历史回填和 Citation Snapshot 结构链均已在真实 PostgreSQL 验证；完整语义关系、Conflict Resolution 与非空历史 Citation 运行验证仍待完成。
+- 可解释 Coverage Map 和 Information Gain：已完成基础可运行版本；Acceptance Criteria 子维度、Owner 独立性和语义信息增益仍未完成。
+- Context Manifest、动态预算、压缩和 provenance：未完成。
+- 当前 Run 的 Working/Task Memory 检索和固化：未完成。
+
+新的推荐推进顺序：
+
+1. 【本轮已完成】将内部循环拆为 iteration-level StateGraph 条件回环，并在每轮输出 Coverage Map 和 Information Gain。
+2. 【本轮已完成基础闭环】Evidence Graph Schema、原子证据链、Claim Relation v2、独立来源 Conflict 门槛、Graph API、Citation Snapshot 外键、真实 PostgreSQL Migration 和历史重建均已验证。
+3. 实现 Context Budget Manager 和 Context Manifest，再将其接入 Planner、Extractor、Evaluator、Writer。
+4. 实现当前 Run 的 Working/Task Memory；跨任务长期 Memory、Embedding、Multi-Agent 延后到 V1.1/V2。
+5. 最后补齐语义 Evaluation、报告验证、Golden Eval、Failure Injection 和前端三栏可解释视图。
+
+因此，之前“先补齐所有 Provider/API/界面”的路线继续作为支撑工作；iteration-level StateGraph + Coverage/Information Gain 和 Evidence Graph 基础闭环均已完成。下一开发切片切换为 Context Budget Manager 与 Context Manifest。
+
+十、2026-08-28 实际开发记录
+----------------------------
+
+本轮目标：把“搜够数量”升级为可验证的研究管理闭环。
+
+已完成并可验证：
+
+1. ResearchState 新增 CoverageDimensionSnapshot、coverage_map、information_gain 和 low_information_gain_streak。
+2. ResearchGraph 从单个内部循环节点升级为每轮 Research Iteration 后通过条件边自动回环；每轮结束同步 State 并形成 Checkpoint 边界。
+3. Information Gain 使用版本化确定性输入：新增 accepted Evidence、唯一 Claim、独立来源域名、Coverage Delta 和低价值候选比例。
+4. Coverage Map 对每个 Planner Question 保存 Priority、Coverage、Evidence 数、独立来源数、Acceptance Criteria 与 Missing Reasons。
+5. Termination Judge 基础硬门已对齐：Global Coverage >= 0.85、Priority 1 Coverage >= 0.80、Source Quality >= 0.75、Cross Validation >= 0.70、Critical Gap = 0。
+6. 连续两轮 Information Gain < 0.10 且 Coverage >= 0.85、无关键缺口时，以 stagnation 停止低价值扩展。
+7. 计划遍历结束但未通过质量门时使用 sources_exhausted，并生成带限制报告；只有全部硬门通过才使用 quality_met。
+8. 工作台新增 Research Coverage Map、本轮信息增益、低增益连续轮次和 WHY CONTINUE / STOP。
+9. 新增 Information Gain 单元测试，并更新 ResearchGraph 条件回环测试。
+10. 新增 Evidence Graph 兼容 Schema：research_claims、research_source_snapshots、research_source_chunks、research_claim_edges、research_conflicts。
+11. 现有 research_sources 新增 source_owner_key / original_source_id；research_evidence 新增可空 claim_id / snapshot_id / chunk_id，保证旧数据兼容。
+12. 新增 20260828_0007、20260828_0008 与 20260828_0009 Migration、ORM Metadata 注册和图结构契约测试；Migration 链唯一 Head 为 20260828_0009。
+13. 新网页读取后，在现有 Evidence 保存事务中创建/复用 Source Snapshot、原子 Claim 和 Exact Quote 周边 Chunk；Evidence 同步绑定 claim_id、snapshot_id、chunk_id。
+14. accepted Evidence 若无法在原网页正文定位逐字引文，会降级为 rejected，错误码为 quote_not_located_for_graph。
+15. 新增 evidence.graph_updated 公开事件，记录 Snapshot、Claim、Chunk 与绑定 Evidence 数量，不暴露网页全文。
+16. 新增 GET /api/v1/research-runs/{run_id}/evidence-graph；现有 Evidence API 同步暴露三个图节点 ID。
+17. 新增 scripts/backfill_evidence_graph.py；默认 dry-run，--apply 才会写库，Artifact 缺失或 Quote 无法定位时报告缺口而不伪造 Chunk。
+18. 新增 Exact Quote 空白归一化定位、稳定 Claim 指纹和可复现 Chunk 单元测试。
+19. Evidence accepted 与 Claim supported 已解耦：单一独立来源为 partial，至少两个独立来源才为 supported，出现有效反驳证据为 disputed。
+20. Docker Desktop 恢复后，真实 PostgreSQL 已执行 20260826_0006 → 20260828_0007 → 20260828_0008 → 20260828_0009 Migration。
+21. 回填增强 dry-run 实际检查 Artifact 与 Exact Quote：144 candidates、0 missing artifacts、7 unlocated quotes、0 accepted unlocated quotes。
+22. 正式回填结果：144 Evidence bound、144 Claims、34 Source Snapshots、101 去重 Chunks；二次 dry-run candidates=0。
+23. 数据库不变量：144/144 Evidence 绑定 Claim 和 Snapshot，accepted_without_chunk=0，orphan_evidence=0。
+24. Claim 状态结果：122 partial、22 rejected；没有把单一来源错误提升为 supported。
+25. 真实 Repository 查询成功组装历史 Run：78 Claims、78 Evidence refs、18 Snapshots、51 Chunks。
+26. 新增 Claim Relation v2：数值关系必须通过同实体/指标范围门槛，显式极性规则不再把“未来”中的“未”误判为否定。
+27. 新增 research_claim_edges 自动协调：当前规则不再成立时删除 stale edge；Conflict 失效时标记 dismissed，Claim 状态按 accepted Evidence 与独立 Owner 重算。
+28. Conflict 只有在 contradicts Claim 均有 accepted Evidence 且 source_owner_key 独立时创建；同一 Owner 不计交叉验证。
+29. 新增 scripts/rebuild_evidence_graph_relations.py，历史库 v2 最终为 7 supplements、0 contradicts、0 conflicts；第二次 --apply 为 created/deleted/dismissed/reopened 全 0。
+30. Report Citation 新增强制非空的 claim_id、snapshot_id、chunk_id 外键，写入时固化 Snapshot Hash；Citation API 返回 Snapshot Hash 与 Chunk char_start/char_end。
+31. 新增 scripts/verify_evidence_graph.py；真实仓储成功组装最新历史 Run：78 Claims、78 Evidence、18 Snapshots、51 Chunks、7 Edges、0 Conflicts。
+32. 假冲突回归覆盖不同市场范围、不同指标、标准编号与“未来”极性边界；关系持久化测试覆盖独立 Owner / 同 Owner 两种情况。
+
+本轮验证：
+
+- 后端：69 passed，1 skipped；共收集 70 个测试。
+- Ruff：All checks passed。
+- Python compileall：通过。
+- 前端 TypeScript + Vite production build：通过。
+- git diff --check：通过，只有现存换行符提示。
+- 容器级联调：已通过；PostgreSQL 18.6、Redis、SearXNG、API、Worker、Dispatcher、Web 均已启动，Health/Readiness 通过。
+
+仍未完成：
+
+- Evidence Graph API 已返回 Claim、Edge 和 Conflict；完整时间/地区/单位/定义归一化、LLM 语义关系和冲突专门搜索消解仍未完成。
+- Coverage Map 尚未将一条 Question 的 Acceptance Criteria 拆成多条可独立判定的子维度。
+- Information Gain 尚未引入 Claim 语义新颖性、冲突减少量和来源 Owner 独立性。
+- Evaluation 尚未拆成独立 Graph Node。
+- Search / Read / Extract / Save 尚未拆成工具级 Checkpoint Node。
+- Evidence Graph 已完成运行时与数据库基础闭环；Citation Snapshot 已完成结构闭环但尚无非空历史引用可实测。后续主线为 Context Budget Manager、研究经验 Memory、完整冲突消解和语义 Evaluation。
+
+十一、2026-08-31 本轮实际开发记录（Context / Memory / Tool Policy）
+------------------------------------------------------------
+
+已完成：
+
+1. Context Budget Manager
+   - 新增 compression_artifacts ORM、Migration 20260831_0011 和 Manifest 关联。
+   - Context Policy Registry 已按 Planner、Evidence Extractor、Report Writer 定义可压缩类型、MMR 参数和类型上限。
+   - Context Ranker 实现 Latin/CJK 词法特征、Jaccard 相似度、MMR 排序、近重复裁剪和类型配额。
+   - Context Compressor 实现 extractive / summarized 两级压缩，优先保留数字、日期、百分比、实体 ID、引用和 Evidence 句，并记录 provenance。
+   - Context Manifest 持久化 token_before/token_after、压缩数量、裁剪原因、Compression Artifact ID、输入/输出 Hash 和校验状态。
+   - PostgreSQL 压缩烟测：token_before=2029、token_after=1084、compressed=1、artifacts=1、selected=2。
+   - 前端新增 CONTEXT BUDGET MANAGER 面板，展示 Token 节省率、压缩前后 Token、压缩数量、裁剪数量和节点预算条。
+
+2. Research Memory
+   - 新增 memory_items、memory_access_logs ORM 与 Migration 20260831_0012。
+   - Working Memory：每个 Planner/Research/Writer 状态边界固化 State 摘要，旧版本标记 superseded。
+   - Episodic Memory：记录节点、状态版本、覆盖度、信息增益和研究决策，形成研究过程经验。
+   - Semantic Memory：仅从当前 Run accepted Evidence 固化 Claim，并绑定 evidence/claim/snapshot 引用。
+   - Planner 执行前检索跨任务 Memory；历史命中只作为 candidate lead，并标记 revalidation_required，不能直接成为 Citation。
+   - Memory Retrieval 记录 candidate/selected IDs、命中/未命中、访问计数和跨任务重新验证数量。
+   - 新增 GET /api/v1/research-runs/{run_id}/memory 和 /memory-accesses。
+   - Research Memory Manager 已接入 LangGraph Planner、Research Iteration、Writer 节点。
+
+3. Tool Policy 与受控工具
+   - 新增严格 ToolDecisionRequest、ToolPolicyResult、EvidenceSearchInput、AnalyzeDataInput Schema。
+   - ToolPolicyGuard 强制 Gap 绑定、预算检查、幂等去重、Evidence Store 前置检索、未读来源优先和分析操作白名单。
+   - 新增 ControlledToolGateway，模型不能绕过 Policy 直接执行工具。
+   - search_evidence 查询当前 Run accepted Evidence，返回可引用 Evidence Card，并写入 Tool Call 审计。
+   - analyze_data 只接受 aggregate、growth_rate、cagr、ratio、rank、compare、descriptive_stats 声明式操作，不接受 Python/Shell/路径/网络地址。
+   - Analysis Artifact 与 analysis_inputs 模型已创建，公式、版本、输入 Evidence 和结果可重算。
+   - Research Loop 已加入 search_evidence 前置检索，再由 Policy 放行 Web Search。
+   - 新增 20260831_0013 Analysis Artifact Migration 文件，待 Docker PostgreSQL 恢复后执行。
+
+验证结果：
+
+- 新增 Tool/Memory 模块 Ruff：通过。
+- 新增 Tool/Memory 模块 mypy：通过。
+- 全部后端单元测试：通过（当前本地测试集 73 项）。
+- 前端 TypeScript 与 Vite production build：通过。
+- Docker Migration/端到端验证：本轮因 dockerDesktopLinuxEngine 当前不可连接，尚未执行。
+
+未完成与下一步：
+
+1. Docker 恢复后执行 Migration 0012、0013，并运行 Memory/Analysis PostgreSQL 集成烟测。
+2. 为 SearchEvidenceTool、AnalyzeDataTool 增加真实 PostgreSQL Fixture 测试和幂等恢复测试。
+3. 将 Memory Retrieval Projection 升级为 tsvector/pg_trgm/RRF 版本化检索；当前实现为受限确定性词法召回基础版。
+4. 增加 Memory 衰减、过期、superseded 链、forgetting/retention Job。
+5. 将 analyze_data 结果接入 Evidence Graph 的 derived_from 边和报告引用。
+6. 增加 Context Metrics 的前端详情抽屉，展示每个 Context Item 的 selected/rejected/compressed provenance。
+7. 完成独立 Evaluation Node、报告 Verifier、Golden Eval、Failure Injection 和 Release Gate。
+8. Docker 恢复后重启 API/Worker，验证 Research Loop 的 search_evidence 前置审计事件不会造成重复 Tool 副作用。
+
+当前判断：
+
+本轮已把“Context Budget Manager、三层 Research Memory、Tool Policy、search_evidence、声明式 analyze_data”从设计要求推进到可运行代码和单元测试。Context 的数据库审计与前端指标、Memory 的实际 Graph 生命周期、Tool 的确定性策略边界已经形成 V1 技术闭环；PostgreSQL 集成验证、检索投影优化、Memory 生命周期作业和 Evaluation/Verifier 仍是发布前工作。
+十二、2026-08-31 继续推进记录（Memory 生命周期与工具幂等）
+
+本轮新增并验证：
+
+1. Memory 生命周期
+   - MemoryItemView 新增 expires_at，Working/Episodic/Semantic 按 7/30/90 天默认窗口生成过期时间。
+   - ResearchMemoryManager.apply_lifecycle() 增加到期状态迁移：active → stale。
+   - 对长期未访问、低重要性且非 Working Memory 项执行 active → forgotten；仅退出主动检索，不物理删除审计数据。
+   - 新增 Celery 任务 deep_research.memory_lifecycle，后续可由 Celery Beat 或运维任务调度。
+
+2. Tool 幂等恢复
+   - search_evidence 重复请求现在根据原始 tool_calls.result_refs 重放 Evidence Card。
+   - 对仍处于 running 的相同调用返回可重试的 TOOL_IN_PROGRESS，不重新执行检索。
+   - 保持 run_id + duplicate_key 约束，避免恢复或重投造成重复工具副作用。
+
+验证结果：
+
+- Ruff：通过。
+- Python compileall：通过。
+- 后端测试：73 项通过，1 项跳过。
+- 前端 TypeScript/Vite production build：通过。
+- Docker PostgreSQL 集成迁移仍未执行：当前 dockerDesktopLinuxEngine 无法连接。
+
+下一步优先级：
+
+1. Docker 恢复后执行 0011/0012/0013 Migration，并运行真实 PostgreSQL Context、Memory、Analysis 集成烟测。
+2. 把 Memory 检索从应用侧受限词法升级为版本化 tsvector/pg_trgm/RRF 投影。
+3. 为生命周期状态迁移、Tool 幂等重放增加 PostgreSQL Fixture/故障恢复测试。
+4. 将 Analysis Artifact 接入 Evidence Graph derived_from 与报告引用。
+5. 完成 Context Metrics 详情抽屉、独立 Evaluation Node、Report Verifier 和 Golden Eval。
+
+当前判断：
+
+Context Budget Manager、Context Manifest、三层 Research Memory、Memory 生命周期入口、Tool Policy、search_evidence、声明式 analyze_data 已形成可运行的 V1 基础闭环。剩余发布阻塞点主要是 Docker/PostgreSQL 集成迁移验证、检索投影性能、完整 Evaluation/Verifier 和端到端故障注入。
+十三、2026-08-31 API 边界收尾
+
+- search_evidence / analyze_data 路由已补齐 ToolExecutionError 映射：可重试错误返回 409，策略/参数/预算错误返回 422，并携带稳定 error_code。
+- API 路由导入、返回类型和 OpenAPI 生成路径已修复。
+- 最终回归：Ruff、compileall、73 项 pytest、API import、前端 production build 均通过。
+十四、2026-08-31 Docker 恢复后的集成验证
+
+已完成：
+
+- Docker Desktop 引擎恢复，docker compose 全套服务启动成功：PostgreSQL、Redis、SearXNG、API、Worker、Dispatcher、Web。
+- PostgreSQL 业务 Alembic 已执行至唯一 Head：20260831_0013。
+- 已确认 compression_artifacts、memory_items、analysis_artifacts 三张新增表存在。
+- LangGraph 官方 Checkpoint 独立数据库已通过 setup，确认 checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations 表存在。
+- /healthz 返回 ok；/readyz 返回 ready，PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 检查全部通过。
+- 真实 PostgreSQL 烟测成功：基于已有 Run 的 accepted Evidence 执行 CAGR 分析，得到 0.10 结果；Memory 检索和生命周期任务成功返回；烟测 Artifact/Tool Call 已按精确 ID 清理。
+- Worker 日志确认已注册 deep_research.execute_run 与 deep_research.memory_lifecycle 两个任务。
+
+注意：
+
+- 已发现并验证 Tool 的真实前置条件：tool_calls.gap_id 必须关联当前 Run 的 research_gaps，随机 Gap 会被 PostgreSQL 外键正确拒绝；实际运行由 Agent Action/Gap 提供真实 ID。
+- Docker 集成迁移、Checkpoint 初始化和健康检查现已从“待执行”更新为“已完成”。
+十五、进度记录规范（2026-08-31 17:10:38）
+
+后续所有进度、功能完成情况、验证结果和未完成项同步到本文件时，记录标题必须包含当前日期及时分秒（格式：YYYY-MM-DD HH:mm:ss）。
+
+十六、当前项目进度总览（2026-08-31 17:14:22）
+
+说明：
+
+本节是当前状态的唯一对照基线。前面章节保留为历史设计/开发记录，其中出现的“待执行”描述以本节和后续带时间戳记录为准。
+
+一、已完成并通过验证
+
+A. 工程与运行基础
+
+- Monorepo、FastAPI、React/Vite、Celery、Redis、PostgreSQL、SearXNG、Docker Compose 已建立。
+- PostgreSQL 18 业务 Migration 已执行至唯一 Head：20260831_0013。
+- LangGraph 官方 PostgreSQL Checkpoint 已在独立数据库初始化。
+- API、Worker、Dispatcher、Web、PostgreSQL、Redis、SearXNG 容器均可启动。
+- /healthz 返回 ok，/readyz 返回 ready。
+- PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG Readiness 检查通过。
+
+B. BYOK 与模型连接
+
+- 支持用户配置协议、Base URL、Model ID 和 API Key。
+- 已建立 Provider Profile、Credential Version、Run Binding 和配置快照。
+- API Key 不进入 State、Context、SSE、Celery 参数和普通日志。
+- 已支持 OpenAI Responses、Anthropic Messages、Google Gemini、显式 OpenAI-compatible Chat Adapter 的基础结构。
+- 已完成 API 导入、错误映射和基本契约测试。
+
+C. Agent State 与 Research Loop
+
+- 已实现 ResearchState、State Version、Coverage Map、Information Gain、Gap 和 Next Action 基础结构。
+- ResearchGraph 支持 Planner → Research Loop → Writer 的状态执行。
+- 研究计划支持 5～8 个问题和动态问题状态。
+- 已实现基于覆盖度、信息增益和预算的基础继续/停止判断。
+- 已实现 Checkpoint 恢复、Worker Lease、取消和 Outbox 基础链路。
+
+D. Evidence Graph 与引用
+
+- Claim、Evidence、Source Snapshot、Source Chunk、Edge、Conflict 的数据库结构已建立。
+- Evidence accepted 与 Claim supported 已区分。
+- Exact Quote 定位、来源独立性和基础冲突识别已实现。
+- 报告引用可以追溯到 Claim、Evidence、Chunk、Snapshot 和原始 URL。
+- Evidence Graph API 已提供。
+
+E. Context Budget Manager
+
+- compression_artifacts 表和 Migration 0011 已完成。
+- Context Policy Registry、类型配额、MMR 去重和近重复裁剪已实现。
+- 已支持 extractive / summarized 层级压缩。
+- 已记录 token_before、token_after、压缩数量、裁剪数量、Hash 和 provenance。
+- Planner、Extractor、Writer 等节点已经使用 Context Manifest。
+- 前端已增加 Context Budget Manager 指标面板。
+- PostgreSQL 压缩烟测已成功：2029 → 1084 tokens。
+
+F. Research Memory
+
+- Working Memory：记录当前 State 摘要，并自动 supersede 旧版本。
+- Episodic Memory：记录节点、状态版本、覆盖度、信息增益和研究决策。
+- Semantic Memory：仅从 accepted Evidence 固化 Claim，并绑定来源引用。
+- Planner 已接入跨任务 Memory lead 检索。
+- 跨任务 Memory 仅作为 candidate lead，必须重新验证后才能进入当前 Evidence/Citation。
+- 已实现 expires_at、stale、forgotten 状态迁移。
+- 已新增 Celery 任务 deep_research.memory_lifecycle。
+
+G. Tool Policy 与受控工具
+
+- ToolDecision、PolicyGuard、ControlledToolGateway 已完成。
+- Tool 调用必须绑定 Action、Gap、预算和幂等键。
+- 首次外部搜索前必须先检索 Evidence Store。
+- 已有未读高收益来源时优先读取，不继续堆积搜索结果。
+- search_evidence 已完成当前 Run Evidence 检索、Evidence Card 和 Tool Call 审计。
+- analyze_data 已完成 aggregate、growth_rate、cagr、ratio、rank、compare、descriptive_stats 白名单操作。
+- analyze_data 不接受模型生成的 Python、Shell、路径或网络地址。
+- 重复工具调用可以幂等重放，不重复产生副作用。
+- 工具错误已映射为稳定的 HTTP 409/422 错误码。
+
+二、部分完成
+
+1. Memory 检索目前是受限的应用侧确定性词法召回；尚未完成版本化 tsvector + pg_trgm + RRF 投影。
+2. Memory 生命周期已具备状态迁移和 Celery 入口，但尚未接入正式 Celery Beat、Retention 策略和 superseded 链管理。
+3. Evidence Graph 已完成基础运行闭环；完整的时间/地区/单位/定义归一化和专门冲突消解搜索尚未完成。
+4. Research Loop 已具备动态继续/停止基础能力；独立 Evaluation Graph Node、LLM Critic 和完整 TerminationJudge 尚未完成。
+5. Report Writer 和 Citation 基础能力已存在；完整 Report Verifier、数字引用率自动检查和失败修复闭环尚未完成。
+6. 前端已有三栏工作台和 Context Metrics；Memory、Evaluation、Coverage 详情抽屉和 Context Item provenance 详情尚未完成。
+7. analyze_data 已持久化 Analysis Artifact，但尚未接入 Evidence Graph derived_from 边和报告引用注册表。
+8. SearchEvidenceTool、AnalyzeDataTool 已有单元测试和真实 PostgreSQL 烟测；完整 Fixture、幂等恢复和故障注入测试尚未完成。
+
+三、未完成 / 发布前阻塞项
+
+- 版本化 Evidence/Memory 检索投影及中文 OOV、短查询、混合中英文 Golden Fixture。
+- Memory Retrieval Recall/Precision、RRF 排名和 EXPLAIN 性能验证。
+- 独立 Evaluation Node、LLM Critic、Report Verifier、Golden Eval。
+- 高严重度冲突专门消解和未解决冲突报告披露自动检查。
+- Analysis Artifact → Evidence Graph → Report Citation 完整链路。
+- Context Metrics 详情抽屉和 Memory/Evaluation 前端可解释面板。
+- Celery 重投、数据库已提交但 Checkpoint 未写等 Failure Injection。
+- Prompt Injection、SSRF、跨 Host 重定向认证泄漏和 Secret 扫描 Release Gate。
+- 多用户、PDF/文件、Multi-Agent、Embedding/pgvector 仍不属于 V1。
+
+四、本轮真实验证结果（2026-08-31 17:14:22）
+
+- docker compose up -d --build：成功。
+- PostgreSQL Alembic Head：20260831_0013。
+- 业务新增表：compression_artifacts、memory_items、analysis_artifacts 均存在。
+- Checkpoint 表：checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations 均存在。
+- 容器状态：7 个服务运行正常。
+- 后端测试：73 项通过，1 项跳过。
+- Ruff：通过。
+- Python compileall：通过。
+- API import：通过。
+- 前端 TypeScript/Vite production build：通过。
+- 真实 PostgreSQL analyze_data CAGR 烟测：结果 0.10，测试数据已清理。
+- Memory 检索和生命周期执行路径：成功。
+
+五、推荐后续开发顺序
+
+1. 完成 Evidence/Memory PostgreSQL 检索投影：Normalizer、中文 Tokenizer、tsvector、pg_trgm、RRF 和投影重建脚本。
+2. 增加真实 PostgreSQL Fixture、Tool 幂等恢复和 Celery/Checkpoint Failure Injection。
+3. 将 Analysis Artifact 接入 Evidence Graph derived_from 与报告 Citation。
+4. 实现独立 Evaluation Node、Report Verifier、冲突披露和 Golden Eval。
+5. 完成 Context Item、Memory、Evaluation 前端详情面板。
+6. 执行完整 Release Gate，形成 GitHub 可公开演示版本。
+
+当前结论：
+
+V1 的核心技术主线已经具备可运行基础闭环：Agent State、Context Budget Manager、Working/Episodic/Semantic Memory、Tool Policy、Evidence Graph、PostgreSQL 持久化和 Docker 运行环境均已落地。当前不再是基础工程搭建阶段，后续重点转为检索质量、Evaluation/Verifier、故障恢复、前端可解释性和 Release Gate。
+十七、六项推进记录（2026-08-31 09:56:25.209）
+
+【第 1 项：Evidence / Memory PostgreSQL Hybrid Retrieval —— 已完成】
+- 新增迁移 0014，创建 retrieval_config_versions、evidence_search_documents、memory_search_documents。
+- 统一版本化 Normalizer：保留中英文、年份、型号与数字；中文生成词元和重叠二元组；提供稳定的 Reciprocal Rank Fusion。
+- Evidence/Memory 投影包含 tsvector + pg_trgm 字段及 GIN/BTREE 索引，支持脚本重建：scripts/rebuild_retrieval_projections.py。
+- search_evidence 已接入 PostgreSQL tsvector + pg_trgm 混合召回，并保留确定性排序与幂等 Tool Call。
+- 已在真实 PostgreSQL 数据上完成烟测：指定研究任务重建 66 条 Evidence 投影；检索规范化/RRF 单元测试通过；全量后端测试通过（当前 73 passed、1 skipped）。
+- 本项边界：Memory 运行时召回仍保留现有应用侧检索路径，Projection 重建与生命周期接入将在后续 Memory 加固中继续验证。
+
+下一项：第 2 项“真实数据库与故障恢复测试”。
+十八、第 2 项完成记录（2026-08-31 10:01:51.776）
+
+【第 2 项：真实数据库与故障恢复测试 —— 已完成】
+- 新增 scripts/verify_postgres_recovery.py，作为可重复执行的 PostgreSQL 18 集成烟测。
+- 已验证 PostgreSQL 18.0.6、pg_trgm、unaccent、Evidence 事实源与检索投影计数一致、Agent Event 的 (run_id, run_seq) 无重复。
+- 已验证事务回滚探针：写入后回滚不会残留数据。
+- 已验证 task_dispatch_outbox 关键状态字段契约。
+- 已在 Docker PostgreSQL 实例实测：accepted_evidence=122、projected_evidence=122、duplicate_event_keys=0、rollback_probe=passed、outbox_contract=passed。
+- pytest 全量通过（当前 73 passed、2 skipped）；新增集成测试契约可在 RUN_POSTGRES_INTEGRATION=1 下启用。
+
+下一项：第 3 项“Analysis Artifact → Evidence Graph / Report Citation”。
+十九、第 3 项完成记录（2026-08-31 10:15:46.694）
+
+【第 3 项：Analysis Artifact → Evidence Graph / Report Citation —— 已完成】
+- 新增迁移 0015：analysis_artifact_claims 图边表，以及 report_citations.analysis_artifact_id 可选追溯字段。
+- AnalyzeDataTool 在生成 Analysis Artifact 时自动绑定全部输入 Evidence 对应的 Claim，关系为 derived_from。
+- Report Citation 领域契约、ORM 和仓储已支持可选分析产物 ID；原有证据 Citation 兼容不受影响。
+- 已在真实 PostgreSQL 执行一次增长率分析烟测：生成 Analysis Artifact，绑定 2 条输入 Evidence，并写入 2 条 Claim 图边。
+- 新增图追溯与 Citation 字段单元测试，相关 Ruff 检查通过；Alembic 0015 已成功应用。
+
+下一项：第 4 项“Evaluation Node / Report Verifier / Golden Eval”。
+二十、第 4 项完成记录（2026-08-31 10:24:23.410）
+
+【第 4 项：Evaluation Node / Report Verifier / Golden Eval —— 已完成】
+- 新增 evaluation_snapshots 迁移 0016 与 ORM，研究循环每轮持久化 question-scope 的确定性评估快照和 verdict。
+- 新增确定性 Report Verifier：校验事实段 Citation Marker 是否存在于注册表、数字段引用覆盖和 Evidence 引用数量。
+- Report Writer 已接入 Verifier，保留原有报告生成行为并增加 citation_registry_size、unresolved_citations、unique_evidence_refs 等可验证指标。
+- 新增 evals/datasets/v1_golden.json 和 evals/graders/evaluation_grader.py，覆盖证据充分、独立来源不足和未解决冲突三类终止决策。
+- Golden Eval 通过率 100%；Alembic 0016、Ruff 与全量 pytest 均通过。
+
+下一项：第 5 项“前端可解释性面板”。
+二十一、第 5 项完成记录（2026-08-31 10:30:56.892）
+
+【第 5 项：前端可解释性面板 —— 已完成】
+- 研究工作台新增 Known / Unknown / Next State Ledger，直接展示已接受 Evidence 数、未满足 Coverage Dimension 数和下一动作公开摘要。
+- 新增 Research Memory 面板，展示 Working/Episodic 事件量、Memory Retrieval 次数、Hit/Miss，并明确历史记忆必须重新验证。
+- 新增 Evaluation 面板，展示 Coverage、Source Quality、Cross Validation 和 Information Gain，以及最新 Evaluator 决策。
+- 前端轮询真实读取 /memory-accesses，并与既有 Context Budget Manager、Research Coverage Map、Agent Activity、Evidence 面板联动。
+- 响应式样式已加入；TypeScript 类型检查和 Vite 生产构建通过。
+
+下一项：第 6 项“Release Gate / GitHub packaging”。
+二十二、第 6 项完成记录（2026-08-31 10:35:21.556）
+
+【第 6 项：Release Gate / GitHub packaging —— 已完成】
+- 新增 scripts/release_gate.py，检查必需文件、迁移头、Compose 配置和 MySQL 专属依赖残留。
+- README 已更新为当前 V1 能力，并加入 GitHub 提交前 Release Gate 与完整验证命令。
+- 已执行 Release Gate：required_files=true、no_mysql_references=true、compose_config=true、migration_head=20260831_0016。
+- 已执行全量后端测试：当前 75 passed、2 skipped。
+- 已执行前端 TypeScript 检查与 Vite 生产构建，构建成功。
+- Docker 全栈服务均正常运行；PostgreSQL 迁移头为 20260831_0016，evaluation_snapshots 已部署。
+- 六项推荐工作全部完成；V1 已达到可提交 GitHub、可本地演示和可验证回归的阶段。
+
+V1 当前收口状态：
+- 已完成：Hybrid Retrieval、真实 DB/故障恢复、Analysis Artifact Evidence Graph、Evaluation/Verifier/Golden Eval、前端可解释性、Release Gate/GitHub 打包。
+- 后续属于 V1.1/V2：Memory 运行时投影查询全面替换、更多 Golden 数据、PDF/多模态来源、语义向量检索、Multi-Agent、人机协同审批。
+二十三、V1 收口复核（2026-08-31 18:39:11，Asia/Shanghai）
+
+六项推荐任务均已标记为“已完成”。本次最终复核结果：
+- Release Gate 通过
+- PostgreSQL 18 Docker 烟测通过
+- 后端 pytest：75 passed、2 skipped
+- 前端 TypeScript / Vite build：通过
+- Alembic 当前迁移头：20260831_0016
+- Docker Compose 全栈服务：运行中
+
+V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2，不影响当前 V1 收口。
+
+二十四、GitHub CI MyPy 修复记录（2026-08-31 19:18:24，Asia/Shanghai）
+
+【严格 MyPy 检查 —— 已完成】
+- 修复 8 个模块中的 24 个严格类型错误，覆盖 Provider 配置数值解析、Conflict 可空分支、Report Claim ID 收窄、SQLAlchemy rowcount、ResearchState 分数解析、Coverage Map、Report Verification 和 LangGraph 节点泛型边界。
+- 为 Coverage Map 增加明确 TypedDict，消除 JSON object 的不安全数值转换。
+- 修复 Evaluation Snapshot 的实际字段错误：missing_dimension_keys 从不存在的 key 改为 dimension_key。
+- LangGraph 第三方类型重载只在三个节点注册边界进行局部 cast，不降低项目全局 strict MyPy 标准。
+
+本轮 GitHub CI 等价验证：
+- mypy apps/api/app：通过，98 个源文件 0 errors。
+- ruff check apps/api tests：通过。
+- pytest：83 passed、2 skipped。
+- pnpm --dir apps/web build：TypeScript 与 Vite 生产构建通过。
+- docker compose config --quiet：通过。
+
+当前结论：
+- GitHub CI 配置中的 api、web、compose 三个 Job 对应命令已在本地全部通过。
+- 两项跳过测试仍是需要显式 RUN_POSTGRES_INTEGRATION=1 的 PostgreSQL 集成测试，不影响当前 CI，但后续应在独立集成测试 Job 中启用。
+
+二十五、第二阶段规划建立（2026-08-31 22:25:05，Asia/Shanghai）
+
+- 已新建《第二阶段.txt》，将下一阶段定义为“从可演示 V1 Alpha 提升到可验证、可恢复、可发布的严格 V1”。
+- 已冻结 10 个工作包：真实数据库 CI、Evaluation API、语义 Verifier、Memory Runtime Retrieval、Dynamic Planning、Analysis Citation、Provider Capability、Failure Injection、安全/Golden Eval/前端收口和正式 Release Gate。
+- 下一项固定为 S2-0“GitHub CI 与真实数据库基线”；通过后再进入 S2-1。
+- 本记录只表示开发计划已建立，不表示第二阶段功能已经完成。
+
+二十六、S2-0 真实 PostgreSQL CI 基线完成（2026-09-01 00:02:21，Asia/Shanghai）
+
+【S2-0 —— 已完成】
+- GitHub Actions 已新增 PostgreSQL 18 + Redis 集成 Job。
+- CI 创建业务数据库和独立 Checkpoint 数据库，执行扩展安装、Alembic 迁移及 LangGraph Checkpoint 初始化。
+- `RUN_POSTGRES_INTEGRATION=1` 已启用；原先两个跳过的 PostgreSQL 集成测试改为真实数据库执行。
+- 恢复测试实际执行 PostgreSQL 版本、pg_trgm/unaccent、Evidence 投影、事件序号唯一性、事务回滚、Outbox 字段和四张 Checkpoint 表验证。
+- 本地隔离 PostgreSQL 18.0.6：Integration 2 passed；恢复烟测 `duplicate_event_keys=0`、`rollback_probe=passed`、`outbox_contract=passed`、`checkpoint_tables=4`。
+- Ruff、MyPy（98 files / 0 errors）和全量 Pytest 通过；默认环境的 2 个 skip 仅因未设置集成开关。
+
+二十七、S2-1 Knowledge / Gap / Action / Evaluation API 第一版完成（2026-09-01 00:02:21，Asia/Shanghai）
+
+【S2-1 —— 已完成】
+- 新增 Knowledge、Gap、Action、Evaluation 四类研究状态读取接口。
+- Knowledge/Gap 使用 ResearchState，Action 使用 Agent Event 回放，Evaluation 使用 PostgreSQL `evaluation_snapshots`，保持单一事实源。
+- Evaluation 查询按 owner 隔离并映射为强类型领域模型。
+- Ruff、MyPy（98 files / 0 errors）和全量 Pytest 通过。
+
+下一项：S2-2“语义证据支持验证与 Evaluation API 完整化”。
+
+二十八、S2-2 语义证据支持验证完成（2026-09-01 00:28:22，Asia/Shanghai）
+
+【S2-2 —— 已完成】
+- 新增确定性 `verify_evidence_support`，校验事实句与 Citation 对应 Claim/Exact Quote 的实质词项支持关系。
+- 报告验证结果新增 `semantic_support_rate`、已支持行数和未支持 Citation 编号，支持度可审计、可回归。
+- 新增语义支持 Golden 单元测试；不依赖模型自评，不把主题相关证据当作事实支持。
+- Ruff、MyPy（98 files / 0 errors）和全量 Pytest 通过。
+
+下一项：S2-3“Research Memory Runtime Retrieval：Working / Episodic / Semantic”。
+
+二十九、S2-3 Memory Runtime Retrieval 投影接入完成（2026-09-01 00:34:21，Asia/Shanghai）
+
+【S2-3 —— 已完成】
+- Memory 写入在同一 PostgreSQL 事务内刷新 `memory_search_documents`，保证事实表与检索投影一致。
+- 运行时检索通过 Projection Join 获取活跃、未过期候选，再执行确定性排序和访问审计。
+- Working / Episodic / Semantic 分层、跨任务 revalidation、TTL、遗忘和 Memory Access Log 保持有效。
+- Ruff、MyPy（98 files / 0 errors）和全量 Pytest 通过。
+
+下一项：S2-4“Dynamic Planning 与信息增益驱动调度”。
+
+三十、S2-4 动态计划边界与信息增益约束完成（2026-09-01 00:44:23，Asia/Shanghai）
+
+【S2-4 —— 已完成】
+- ResearchPlan 最大问题数扩展为 12，新增问题每轮硬上限为 3。
+- `append_dynamic_questions` 按规范化问题去重，超出动态总预算或单轮预算直接拒绝。
+- 现有信息增益、低收益停滞和预算停止机制继续作为硬边界。
+- 动态计划 Golden 测试、Ruff、MyPy（98 files / 0 errors）和全量 Pytest 通过。
+
+下一项：S2-5“Analysis Artifact 引用与 Provider Capability 完整化”。
+
+三十一、S2-5 Provider Capability 与运行配置可见性完成（2026-09-01 00:49:03，Asia/Shanghai）
+
+【S2-5 —— 已完成】
+- 新增 `/api/v1/llm/providers`，公开四类已注册 Adapter 的静态 Capability Matrix 和降级策略，不返回密钥。
+- 新增 `/api/v1/research-runs/{id}/llm-config`，读取创建时固化的 Provider/Model/Endpoint/Context 配置快照。
+- Analysis Artifact 的 Evidence Graph/Citation 追溯能力沿用既有实现，本轮补齐运行配置可验证边界。
+- Provider API 烟测返回 4 个适配器；Ruff、MyPy（99 files / 0 errors）和全量 Pytest 通过。
+
+下一项：S2-6“Failure Injection、Checkpoint 恢复与 Outbox 加固”。
+
+三十二、S2-6 故障恢复与 Outbox 幂等基线完成（2026-09-01 00:51:53，Asia/Shanghai）
+
+【S2-6 —— 已完成】
+- 恢复烟测新增 Outbox `dispatch_key` 重复检测，并继续验证事务回滚、事件序号唯一性、Evidence 投影和独立 Checkpoint 表。
+- 本地 Docker PostgreSQL 18.0.6：`duplicate_event_keys=0`、`duplicate_outbox_keys=0`、`rollback_probe=passed`、`checkpoint_tables=4`。
+- Ruff、MyPy（99 files / 0 errors）和全量 Pytest 通过。
+
+下一项：S2-7“安全、Golden Eval 与 Release Gate 加固”。
+
+三十三、S2-7 Failure Injection 与安全加固完成（2026-09-01 01:11:16，Asia/Shanghai）
+
+【S2-7 —— 已完成】
+- 新增 DNS 私网解析 SSRF 测试、跨 Host 重定向目标复检和认证 Header 不转发测试。
+- PostgreSQL 恢复烟测新增 Outbox `dispatch_key` 重复插入 Savepoint 故障注入，唯一约束触发后必须回滚。
+- Release Gate 新增静态检查、全量测试、Golden Eval、Secret 扫描和严格集成开关；高置信度 Secret 命中为 0。
+- 安全回归、Ruff、MyPy（99 files / 0 errors）和全量 Pytest 通过。
+
+三十四、S2-8 Golden Eval 与前端解释性收口完成（2026-09-01 01:11:16，Asia/Shanghai）
+
+【S2-8 —— 已完成】
+- Golden Eval 从 3 个案例扩展为 13 个，覆盖无证据、同源转载、陈旧、范围不一致、搜索/网页失败、重复 Query、低信息增益、预算耗尽、引用支持和分析重算错误。
+- 新增 `fail` / `write_limited` 终止判定；13/13 通过，准确率 1.0。
+- 前端轮询 Knowledge、Gaps、Actions、Evaluations API，Known/Unknown/Next Action/Evaluation 面板优先读取服务端事实源，并保留事件回退兼容。
+- Web TypeScript 类型检查与 Vite 生产构建通过。
+
+下一项：S2-9“严格 V1 Release Gate”。
+
+三十五、S2-9 严格 V1 Release Gate 完成（2026-09-01 01:21:40，Asia/Shanghai）
+
+【S2-9 —— 已完成】
+- `scripts/release_gate.py` 已执行 Ruff、MyPy、全量 Pytest、PostgreSQL Integration、Web Build、Golden Eval、Compose 和高置信度 Secret Scan，并支持 JSON 报告。
+- GitHub Actions 新增 Strict V1 release gate Job：依赖现有 CI Job，初始化 PostgreSQL 18 + LangGraph Checkpoint，上传 `artifacts/release_gate.json`。
+- README 已加入严格 Gate 的可复现命令，新增 `CHANGELOG.md`。
+- Docker Desktop 真实环境验证全部通过：Ruff、MyPy（99 files / 0 errors）、全量 Pytest、2 个 Integration、Web Build、Golden Eval 13/13（准确率 1.0）、Secret Scan 0 命中、Compose 配置通过。
+
+第二阶段 S2-0～S2-9 已全部完成。剩余发布动作是远端 GitHub Actions 连续三次通过、人工端到端演示，以及用户确认后创建 `v1.0.0` Tag。
+
+三十六、GitHub Actions Alembic 工作目录修复（2026-09-01 08:43:08，Asia/Shanghai）
+
+- 修复 Integration 与 Strict Release Gate Job 在 `apps/api` 目录执行 Alembic 导致 `No 'script_location' key found` 的问题。
+- 两个 Job 现在从仓库根目录读取 `alembic.ini` 并执行 `alembic upgrade head`、Checkpoint 初始化。
+- 本地 Alembic 当前迁移头为 `20260831_0016 (head)`，CI YAML 解析通过。
+- 该修复尚未在 GitHub 远端重新运行；需推送后确认 Integration 与 Strict Release Gate 均通过。
+
+三十七、GitHub 修复提交已成功推送（2026-09-01 08:56:58，Asia/Shanghai）
+
+- `codex/v1-integration-hardening` 已推送至 `origin`，提交 `2c5249c` 已包含 Alembic 工作目录修复。
+- 远端 CI 尚待确认；需检查 PostgreSQL integration 是否通过，并确认其依赖的 Strict V1 release gate 被执行且通过。
+
+三十八、Verification 与质量账本 API 完成（2026-09-01 09:34:08，Asia/Shanghai）
+
+【后续强化 1/6 —— 已完成】
+- 新增独立 Verification API，核验结果来自持久化 Report，不以页面临时计算替代事实源。
+- API 返回 verified、citation_count、analysis_artifact_citation_count、verification_result 和最新 Report Evaluation。
+- Gap、Action、Evaluation、Verification API 已有完整成功路径测试，Verification 另覆盖报告未生成的稳定错误码。
+- Ruff、MyPy、5 个 API 测试全部通过。
+
+三十九、真实 REPLAN 完成（2026-09-01 09:41:00，Asia/Shanghai）
+
+【后续强化 2/6 —— 已完成】
+- Evaluation 决策 replan 已接入 LangGraph 条件边和独立 REPLAN 节点。
+- Coverage Map 缺口会生成有界动态问题并持久化新 plan_version；旧问题状态不重置。
+- 图路由、动态追加边界、Ruff、MyPy 和 5 个测试通过。
+
+四十、PostgreSQL Memory 混合检索完成（2026-09-01 09:47:32，Asia/Shanghai）
+
+【后续强化 3/6 —— 已完成】
+- Memory 检索运行路径改为 tsvector/GIN 与 pg_trgm 双路 SQL 召回，再以 RRF 确定性融合。
+- Docker PostgreSQL 中文检索集成测试通过；历史 Memory 仍保持 revalidation_required 边界。
+
+四十一、Analysis Artifact 进入报告 Citation（2026-09-01 10:06:57，Asia/Shanghai）
+
+【后续强化 4/6 —— 已完成】
+- Evidence 到 AnalysisInput、AnalysisArtifact、ReportCitation 的追溯链已贯通。
+- Writer 可见分析 operation/formula/result，Citation 落库 analysis_artifact_id，Verification 可统计。
+- Analysis Provenance 与报告联合测试 5 个通过。
+
+四十二、Checkpoint 与 Celery 崩溃重投完成（2026-09-01 10:14:19，Asia/Shanghai）
+
+【后续强化 5/6 —— 已完成】
+- AsyncPostgresSaver 已验证 Pending Writes、Time Travel、旧版本读取和整线程删除。
+- Celery 过期租约接管、旧 Worker 写保护、重复重投拒绝与投递配置均有自动测试。
+- 真实 PostgreSQL 集成测试 2 个通过。
+
+四十三、Prompt Injection 与完整 Golden Eval 完成（2026-09-01 10:19:55，Asia/Shanghai）
+
+【后续强化 6/6 —— 已完成】
+- Prompt Injection Fixture 覆盖忽略系统指令、Secret 外泄和 Shell Tool 诱导；恶意候选无法进入 accepted Evidence。
+- Golden 指标：Stop Accuracy=1.0、Gap Recall=1.0、Evidence Support Precision=1.0、Early-stop Error Rate=0.0。
+- Release Gate 已由单一 accuracy 改为同时检查全部目标阈值。
+
+四十四、六项强化后的最终 Release Gate（2026-09-01 10:22:42，Asia/Shanghai）
+
+【本轮最终验证 —— 已完成】
+- 严格 Release Gate 总结果 passed=true，机器可读报告：artifacts/release_gate_post_hardening.json。
+- Ruff、MyPy（99 files / 0 errors）、全量 Pytest 全部通过。
+- 真实 PostgreSQL Integration 3/3 通过；Web Build、Compose、迁移头和 Secret Scan 通过。
+- Golden 全指标达标：Stop Accuracy 1.0、Gap Recall/Precision 1.0、Evidence Support Precision/Recall 1.0、Early-stop Error Rate 0.0。
+- 本轮用户指定的 6 项功能全部完成；当前剩余动作仅为 Git 提交、推送和 GitHub Actions 远端复验，不属于功能实现缺口。
+
+四十五、真实网页验收的搜索提供商退化修复（2026-09-01 12:20:46，Asia/Shanghai）
+
+【端到端热修复 —— 已完成】
+- 人工网页验收发现任务以 REPORT_NO_ACCEPTED_EVIDENCE 终止；安全边界工作正常，但 Evidence 获取链路未达到可发布标准。
+- 根因已由结构化事件和容器日志确认：SearXNG 通用引擎出现 Brave 限流、DuckDuckGo CAPTCHA、Google CSE 超时，HTTP 200 中多数实际为零结果；偶发候选又优先落在 403/付费墙/PDF 来源。
+- SearXNG Adapter 已增加 OpenAIRE publications 学术回退与一次瞬态超时重试；所有策略退化时返回 SEARCH_PROVIDER_DEGRADED，不再伪装成正常零结果。
+- Research Loop 已增加来源可读性排序：优先 arXiv、PubMed、PMC、CVF 公开 HTML，降低已知受限域名、DOI 跳转和 PDF-only URL 的读取优先级。
+- 新增 4 个回归测试，覆盖学术回退、提供商退化识别、瞬态重试和公开 HTML 排序。
+- 真实 SearXNG 冒烟验证返回 10 个候选，第一优先来源为 arXiv；PublicWebReader 成功提取 1,939 字正文。
+- 严格 Release Gate 再次 passed=true：Ruff、MyPy（99 files / 0 errors）、全量 Pytest、PostgreSQL Integration 3/3、Web Build、Golden Eval、Compose、迁移头与 Secret Scan 全部通过。
+- 当前代码位于 codex/fix-search-provider-fallback；尚需重启本地运行服务并进行新任务端到端复验，随后提交 PR 走远端 GitHub CI。
+
+运行环境更新（2026-09-01 12:22:41，Asia/Shanghai）：
+- SearXNG、API、Worker、Dispatcher 已重启，合并后及本次热修复代码均已重新加载。
+- /readyz 返回 ready；PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 四项均通过。
+- 下一验收动作是从网页创建一个全新研究任务；旧的 terminal/failed Run 不复用。
+
+四十六、V1.0.0 Release 已发布（2026-09-01 17:21:08，Asia/Shanghai）
+
+【发布状态 —— 已完成】
+- 修复分支已合并到 main。
+- main 合并后的 GitHub Actions 已全部通过：PostgreSQL integration、api、web、compose、Strict V1 release gate。
+- GitHub Release v1.0.0 已正式发布。
+- Deep Research Agent V1 的开发、验证和发布流程完成。
+
+四十七、Research Plan 覆盖率与研究调度改进（2026-09-01 18:12:00，Asia/Shanghai）
+
+【覆盖率改进 —— 已完成】
+- 技术失败与研究失败已分离：SEARCH_PROVIDER_DEGRADED 等 Provider 故障不再增加 Gap resolution_attempts、研究迭代或低信息增益连续轮次；连续技术故障使用独立 technical_retry / technical_degraded 状态。
+- 调度改为公平有效尝试：所有尚未研究的问题优先获得第一次有效机会，再安排第二来源补证；技术重试排在未尝试问题之后。
+- 独立来源口径统一为 source_owner_key；Question Coverage、Claim 级 Cross Validation、Information Gain 和来源独立性不再混用 URL、source_id 与 domain。
+- Evidence 已接入原子验收维度：Planner 要求每题生成 2～3 个可核验维度，Extractor 返回或确定性匹配 dimension_key，Coverage Map 按维度计算证据数、独立来源数和未满足原因。
+- Standard 预算由 15 次研究/搜索提高到 20 次，并在持久化计划前执行预算适配；20% 研究预算保留给补证和重规划。
+- REPLAN 改为原问题定向 Gap Resolution：生成新的差异化搜索提示并重置原 question_id，不再追加宽泛问题或增加覆盖率分母。
+- 搜索候选按可读性、查询相关性、既有 source_owner_key 多样性和受限来源风险排序，降低同站点证据集中。
+- Evaluation 已读取真实开放 Conflict 与弱 Claim，Cross Validation 改为 Claim 级独立来源判断；连续低信息增益或进入预算预留区时可提前触发 REPLAN。
+- 前端 Research Plan 状态已区分：绿色=验收完成、黄色=部分覆盖、紫色=Provider 降级、红色=有效研究后仍阻塞、灰色=未开始，并显示具体缺口原因。
+- 新增预算裁剪、Gap Resolution、不增加计划分母、来源多样性与技术失败不计研究轮次的回归测试。
+
+【验证结果 —— 已完成】
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- 全量 Pytest：109/109 通过；设置 RUN_POSTGRES_INTEGRATION=1 后无跳过，PostgreSQL Integration 3/3 通过。
+- Web TypeScript + Vite production build：通过。
+- Strict V1 Release Gate：passed=true；Golden Eval、Secret Scan、Compose、迁移头和真实 PostgreSQL 均通过。
+- Docker API、Worker、Dispatcher、Web 已重建；/readyz 的 PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：从网页创建一个全新研究任务，对比旧基线 Coverage=23%，确认真实联网环境下全局 Coverage、P1 Coverage、Claim Cross Validation 和技术降级次数；旧任务快照不会被新算法回写。
+
+四十八、Evidence Extractor 零证据热修复（2026-09-02 13:27:21，Asia/Shanghai）
+
+【Extractor 稳定性改进 —— 已完成】
+- 根据失败 Run `01a06076-bf1b-7b53-b89d-483445d3041c` 的数据库事件确认：14 次网页抽取中 10 次为 MODEL_OUTPUT_INVALID，4 次为合法空 items，最终 0 条 Evidence；REPORT_NO_ACCEPTED_EVIDENCE 是下游安全边界，不是根因。
+- Extractor 输出预算已由 2,400 提高到 6,000 Token。
+- 增加高相关双 Chunk 紧凑补救抽取和相关空结果受控重试。
+- 增加连续两个来源结构化失败后的 MODEL_CAPABILITY_INSUFFICIENT 熔断，避免无效消耗 20 次搜索预算。
+- Adapter 已归一化 finish_reason，并输出不包含模型原文、Prompt 或 Secret 的安全结构化失败 detail_code。
+- evidence.failed 公开事件已记录安全 detail_code。
+
+【验证结果 —— 已完成】
+- 相关测试：21/21 通过。
+- 全量测试：110 passed、3 skipped（默认未启用 PostgreSQL 集成环境）。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Docker API、Worker、Dispatcher 已重建。
+- /healthz：ok；/readyz：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：从网页创建全新研究任务进行真实 Provider 验收；本次未自动创建任务，因此未产生额外模型调用费用。
+
+四十九、Planner JSON 偶发失败与 96% 终态误导修复（2026-09-02 22:26:35，Asia/Shanghai）
+
+【Planner 结构化输出加固 —— 已完成】
+- Planner temperature 已固定为 0.0，OpenAI-compatible Adapter 已读取 Canonical Request 参数，不再硬编码 0.2。
+- Planner 保持 6,000 Token 上限；长度截断后的第二次生成保留 JSON Mode 并采用紧凑闭合指令。
+- 已区分 MODEL_OUTPUT_TRUNCATED、MODEL_OUTPUT_INVALID、MODEL_OUTPUT_SCHEMA_INVALID。
+- 已记录 strategy、finish_reason、响应长度、JSON 解析分类/位置和 Schema issue type 等安全诊断；不记录正文、完整 Prompt 或 Secret。
+- 前端已根据安全 detail_code 区分 Provider 降级、长度截断、非法 JSON 和 Schema 不合法。
+
+【零证据与失败进度修复 —— 已完成】
+- REPORT_NO_ACCEPTED_EVIDENCE 继续作为禁止无证据报告的安全边界。
+- run.failed 事件新增 evidence_evaluation 失败阶段以及搜索、页面和 accepted Evidence 指标。
+- failed 任务按实际失败节点计算进度，不再统一显示 96%/最终核验。
+- Planner、Research、Evaluation、Writer 的失败阶段均可视化为红色失败状态，终态优先展示真正失败原因。
+
+【验证结果 —— 已完成】
+- 相关回归测试：22/22 通过。
+- 全量 Pytest：111 passed、3 skipped（默认未启用 PostgreSQL 集成环境）。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web production build：通过。
+- Docker API、Worker、Dispatcher、Web 已重建并运行。
+- /healthz：ok；/readyz：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：在网页创建全新任务进行真实 Provider 验收，确认成功任务能进入 Evidence；若失败，页面应显示准确失败阶段与截断/Prompt JSON/Schema 诊断，而不是停在 96%。
+
+五十、有界最小 Planner 与独立紧凑重答（2026-09-02 22:56:33，Asia/Shanghai）
+
+【Planner 输出内容预算 —— 已完成】
+- 新增 ResearchPlanDraft 和 CompactResearchPlanDraft；模型不再生成可由程序确定的 goal 与问题 id。
+- goal 使用 Run 的不可变目标，q1～qN 由服务端确定性补齐，消除目标改写、ID 重复和 ID 格式错误。
+- 正常计划限定 5～8 个问题，并对所有长文本字段和数组数量设置硬上限；正常输出上限为 4,000 Token。
+- 首次长度截断、非法 JSON 或 Schema 失败后，第二次切换真正独立的紧凑合同，而不是重复相同 Schema 与提示。
+- 紧凑计划限定恰好 5 个问题、极短 rationale、每题 1 条证据要求、最多 1 条搜索提示和 2 条完成条件，输出上限为 1,200 Token。
+- Planner 最多两次生成；紧凑计划仍被长度截断时返回 PLAN_OUTPUT_BUDGET_EXCEEDED。
+
+【安全可观测性与前端诊断 —— 已完成】
+- ModelGatewayError 携带本次调用 Usage 与安全 diagnostics。
+- run.failed 仅持久化白名单字段：structured_output_strategy、finish_reason、output_tokens、max_output_tokens、response_length、provider_request_id、retry_mode、first_error_code。
+- 不保存模型正文、完整 Prompt、API Key 或认证 Header。
+- 页面显示结构化输出策略、终止原因、输出/最大 Token 与重答模式；PLAN_OUTPUT_BUDGET_EXCEEDED 映射到“研究计划”失败阶段。
+
+【验证结果 —— 已完成】
+- Planner/Adapter/重试测试：16/16 通过。
+- 全量 Pytest：113 passed、3 skipped（默认未启用 PostgreSQL 集成环境）。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript + Vite production build：通过。
+- Docker API、Worker、Dispatcher、Web 已重新构建并运行。
+- /healthz：ok；/readyz：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：浏览器强制刷新后创建一个全新任务；旧失败任务不会自动重跑。正常路径目标是 5～8 个有界问题，首次结构化失败后应切换 5 问题紧凑计划；只有紧凑计划仍被截断时才终止为 PLAN_OUTPUT_BUDGET_EXCEEDED。本次未自动调用真实模型，避免产生未经确认的 Provider 费用。
+
+五十一、Compact Planner CONNECT_TIMEOUT 重试链修复（2026-09-02 23:19:00，Asia/Shanghai）
+
+【根因核验 —— 已完成】
+- 失败 Run 01a062a8-8053-7092-a761-a708c4d1cc3a 的事件与 Worker 日志证明：普通 Planner 已返回 200 OK 并因长度截断进入 Compact，真正的终止点是 Compact 请求 CONNECT_TIMEOUT。
+- `_planner_retry_error` 将 Compact 的瞬态网络错误错误改为 retryable=False，导致外层 3 次重试策略失效。
+- Adapter 强制 Connection: close，连续模型调用无法复用已建立连接，增加重复 DNS/TCP/TLS 建连与偶发连接超时。
+
+【网络恢复与诊断修复 —— 已完成】
+- Compact 网络超时保留 retryable=True，ResearchGraph 按 3 秒、10 秒退避最多执行 3 次 Planner 尝试。
+- Compact 永久 Schema/JSON 错误继续受两次语义生成上限约束；再次 length 截断仍为 PLAN_OUTPUT_BUDGET_EXCEEDED。
+- 移除 Provider 请求的强制 Connection: close，恢复 Worker AsyncClient 连接池复用。
+- run.failed 安全诊断新增 attempt_stage 与 compact_trigger；前端不再将未收到响应渲染为 unknown、0/0 Token。
+- 页面现在可以明确显示“Compact Planner；进入原因：普通计划长度截断；重试：Compact 网络重试”。
+
+【验证结果 —— 已完成】
+- Planner/Retry/Adapter 测试：17/17 通过。
+- 全量 Pytest：通过，3 项默认 PostgreSQL 集成测试跳过。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript + Vite production build：通过。
+- Docker API、Worker、Dispatcher、Web 已重新构建并运行。
+- /healthz：ok；/readyz：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：Ctrl+F5 后创建全新研究任务。若 Provider 再发生瞬态 CONNECT_TIMEOUT，应先出现 model.retry_scheduled 并自动恢复；只有连续三次仍失败才进入终态。本次未自动调用真实 Provider，避免产生未经确认的费用。
+
+五十二、Planner TOO_LONG 确定性规范化（2026-09-02 23:39:25，Asia/Shanghai）
+
+【根因核验 —— 已完成】
+- Run 01a062be-a88d-7ad8-8306-ca07e86fd114 的 Compact Planner 返回合法 JSON，finish_reason=stop，651/1,200 Token。
+- 唯一 Schema issue 为 TOO_LONG；不是缺字段、类型错误、问题不足或 JSON 能力失败。
+- 9% 是 Planner 尚未落库时的正确失败进度，需修复的是长度偏差处理而非进度计算。
+
+【确定性 Length Normalizer —— 已完成】
+- 在 ResearchPlanDraft/CompactResearchPlanDraft 的 Pydantic 校验前规范化输出。
+- 字符串只执行空白归一与按合同上限裁剪；数组只保留合同允许的前 N 项，维持模型原顺序。
+- Compact 只保留前 5 个问题、每题首条 Evidence Requirement、首条 Search Hint 与前 2 条 Completion Criteria。
+- 不生成研究事实、不补缺失字段、不纠正非法优先级、不接受错误类型、不吞掉未知字段、不降低最少 5 问题门槛。
+- 单纯 TOO_LONG 无需第三次模型调用即可通过；其他实质性 Schema 错误继续严格拒绝。
+
+【验证结果 —— 已完成】
+- Planner 测试：6/6 通过；新增字符串与数组联合超限 Fixture。
+- 全量 Pytest：通过，3 项默认 PostgreSQL 集成测试跳过。
+- Ruff：通过。
+- MyPy：99 个源文件、0 error。
+- Web TypeScript + Vite production build：通过。
+- Docker API、Worker、Dispatcher 已重新构建并运行，Web 正常运行。
+- /healthz：ok；/readyz：PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+
+下一验收动作：创建新任务或恢复失败任务。相同合法 JSON 的 TOO_LONG 输出应被服务端机械裁剪后落库，研究进度由 9% 继续进入搜索与阅读。本次未自动调用 Provider，避免产生未经确认的费用。
+
+五十三、NO_ACCEPTED_EVIDENCE_AFTER_RESEARCH 根因修复（2026-09-03 10:50:21，Asia/Shanghai）
+
+【本次失败 Run 核验】Run 01a062db-1c77-7303-8e87-7b30528d2337 已通过 Planner，失败阶段为证据评估。12 次搜索中多次 `SEARCH_PROVIDER_DEGRADED`；仅 4 页成功读取，3 次 Evidence 抽取因 `MODEL_TIMEOUT` / `MODEL_NETWORK_ERROR` 失败，1 次返回 0 候选。0 accepted 的直接原因是搜索供给不足与模型抽取失败叠加，并非单纯 Schema 全部拒绝。
+
+【已完成】SearXNG 增加 Sogou 及 arxiv/OpenAIRE 降级路线；每轮成功读取上限 3 页；Evidence Extractor 对瞬时模型错误改用紧凑正文自动重试一次；新增搜索、网页读取、证据抽取失败计数；失败诊断细分为 `SEARCH_PROVIDER_EXHAUSTED`、`EVIDENCE_EXTRACTION_UNAVAILABLE`、`EVIDENCE_VALIDATION_EMPTY`、`NO_READABLE_SOURCE`；前端已按诊断码提示，严格证据门槛保持不变。
+
+【验证结果】搜索、研究循环、Evidence 抽取回归测试 17/17 通过；Ruff 通过；MyPy 99 个源码文件 0 error；Docker API、Worker、Dispatcher、Web 已重建并运行；`/healthz` 返回 ok。外部搜索引擎仍可能受网络波动影响，全不可用时不会伪造证据。
+
+【下一步】创建全新研究任务验证，不要只查看旧失败快照；若 SearXNG 全部超时，先恢复网络或启用当前网络可访问的引擎。
+
+五十四、SearXNG 中文降级引擎配置生效（2026-09-03 10:57:09，Asia/Shanghai）
+
+- 核验发现 Sogou 在 SearXNG 默认配置中原为 disabled，导致应用声明的降级路线无法实际使用。
+- 已在 `infra/searxng/settings.yml` 显式启用 `sogou`，重建后确认配置端点 `enabled=true`。
+- 本地只读验证 `engines=sogou` 返回 10 条结果且无 unresponsive engine；网络波动时仍会按应用策略重试并报告降级。
+
+五十五、修复版本服务重启确认（2026-09-03 10:58:39，Asia/Shanghai）
+
+- API、Worker、Dispatcher、Web 已再次强制重建并启动，确保失败诊断细分和 Evidence 紧凑重试由运行进程加载。
+- `/healthz` 返回 `{"status":"ok"}`；Celery Worker 已连接 Redis 并处于 ready 状态。
+
+五十六、当前完整性审查与 GitHub 提交前状态（2026-09-03 11:18:36，Asia/Shanghai）
+
+【本地 Strict V1 Release Gate】
+
+- 使用 `RUN_POSTGRES_INTEGRATION=1`、Docker PostgreSQL 和 Checkpoint 数据库执行 `scripts/release_gate.py --skip-compose`。
+- 结果：`passed=true`；required files、no MySQL references、migration、Ruff、MyPy、全量 Pytest、PostgreSQL integration、Web build、Golden Eval、Secret Scan 全部通过。
+- 默认直接运行 Pytest 仍会因环境变量未设置而显示 3 项 PostgreSQL 测试跳过；Strict gate 已显式打开集成测试开关并实际通过。
+
+【提交前未完成项】
+
+- 当前 `main` 工作区仍有未提交修改，且 `origin/main` 尚未包含这些修改。
+- GitHub Actions 必须在提交/推送后重新运行，不能用本地 Release Gate 代替远端结果。
+- 仍需用真实模型新建一次研究任务，验证搜索、网页读取、Evidence 抽取和报告引用的端到端运行态。
