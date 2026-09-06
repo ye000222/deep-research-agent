@@ -336,6 +336,17 @@ async def list_context_metrics(
         raise _not_found() from exc
 
 
+@router.get("/{run_id}/llm-calls", response_model=list[dict[str, object]])
+async def list_llm_calls(
+    run_id: UUID,
+    client: Annotated[ClientSession, Depends(get_client_session)],
+    service: Annotated[ResearchRunServiceProtocol, Depends(get_research_run_service)],
+) -> list[dict[str, object]]:
+    """Return redacted provider-call diagnostics for the run."""
+
+    return await service.list_llm_calls(client.owner_hash, run_id)
+
+
 @router.get("/{run_id}/memory", response_model=list[MemoryItemView])
 async def list_memory(
     run_id: UUID,

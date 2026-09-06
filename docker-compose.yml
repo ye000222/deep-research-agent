@@ -135,6 +135,27 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  beat:
+    image: deep-research-agent-api:local
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      APP_ENV: development
+      PYTHONPATH: /app/apps/api
+      DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
+      REDIS_URL: redis://redis:6379/0
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "beat", "--loglevel=INFO"]
+    volumes:
+      - ./apps/api:/app/apps/api:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
   web:
     build:
       context: .

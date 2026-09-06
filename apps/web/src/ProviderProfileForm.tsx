@@ -20,6 +20,16 @@ type ProviderProfile = {
   has_saved_credential: boolean;
 };
 
+type CapabilityProbe = {
+  passed: boolean;
+  test_type: string;
+  latency_ms: number;
+  capability_matrix: Record<string, string | boolean | number | null>;
+  selected_strategy: Record<string, string>;
+  error_code?: string | null;
+  detail_code?: string | null;
+};
+
 type Props = {
   onStatusChange: (
     configured: boolean,
@@ -59,6 +69,7 @@ export function ProviderProfileForm({onStatusChange}: Props) {
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
+  const [probeMessage, setProbeMessage] = useState("");
   const busyRef = useRef(false);
 
   useEffect(() => {
@@ -179,6 +190,45 @@ export function ProviderProfileForm({onStatusChange}: Props) {
     }
   }
 
+  async function testConnection() {
+    if (busyRef.current || !baseUrl.trim() || !model.trim() || (!profile && !apiKey.trim())) {
+      setProbeMessage("测试前请填写 Base URL、模型和 API Key（已保存配置可留空）。");
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    setProbeMessage("正在执行连接与结构化输出能力测试…");
+    try {
+      const result = profile
+        ? await api<CapabilityProbe>(`/api/v1/llm/profiles/${profile.profile_id}/test`, {
+            method: "POST",
+            body: JSON.stringify({test_type: "full"}),
+          })
+        : await api<CapabilityProbe>("/api/v1/llm/providers/connections/test", {
+            method: "POST",
+            body: JSON.stringify({
+              adapter_type: adapterType,
+              base_url: baseUrl.trim(),
+              model: model.trim(),
+              api_key: apiKey,
+              test_type: "full",
+            }),
+          });
+      const matrix = result.capability_matrix;
+      const strategy = Object.values(result.selected_strategy).filter(Boolean).join(", ");
+      setProbeMessage(
+        result.passed
+          ? `测试通过 · ${result.latency_ms}ms · Structured Output=${matrix.structured_output ?? "unknown"} · Tool Calling=${matrix.tool_calling ?? "unknown"}${strategy ? ` · ${strategy}` : ""}`
+          : `测试失败 · ${result.error_code ?? result.detail_code ?? "未知 Provider 错误"}`,
+      );
+    } catch (error) {
+      setProbeMessage(`测试失败：${errorMessage(error)}`);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="connection-grid">
       <label>
@@ -227,7 +277,11 @@ export function ProviderProfileForm({onStatusChange}: Props) {
         <button className="secondary-button" type="button" disabled={busy} onClick={() => void saveProfile()}>
           {busy ? "保存中…" : profile ? "更新配置" : "保存配置"}
         </button>
+        <button className="secondary-button" type="button" disabled={busy} onClick={() => void testConnection()}>
+          {busy ? "测试中…" : "测试连接"}
+        </button>
       </div>
+      {probeMessage && <small className="connection-probe-message">{probeMessage}</small>}
     </div>
   );
 }

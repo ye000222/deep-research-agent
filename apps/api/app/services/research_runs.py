@@ -21,6 +21,7 @@ from app.domain.reports import ReportCitationView, ReportView, VerificationView
 from app.domain.research_runs import AgentEventView, ResearchRunView
 from app.domain.research_tools import EvidenceView
 from app.domain.state import ResearchState
+from app.infrastructure.db.llm_calls import LLMCallRepository
 from app.infrastructure.db.reports import ReportRepository
 from app.infrastructure.db.research_runs import ResearchRunRepository
 from app.infrastructure.db.research_tools import ResearchToolRepository
@@ -84,6 +85,8 @@ class ResearchRunServiceProtocol(Protocol):
         self, owner_hash: str, run_id: UUID
     ) -> list[ContextManifestView]: ...
 
+    async def list_llm_calls(self, owner_hash: str, run_id: UUID) -> list[dict[str, object]]: ...
+
     async def list_memory(self, owner_hash: str, run_id: UUID) -> list[MemoryItemView]: ...
 
     async def search_evidence(
@@ -129,6 +132,7 @@ class ResearchRunService:
         context_manager: ContextBudgetManager,
         memory_manager: ResearchMemoryManager,
         controlled_tools: ControlledToolGateway,
+        llm_call_repository: LLMCallRepository,
     ) -> None:
         self._repository = repository
         self._research_repository = research_repository
@@ -137,6 +141,7 @@ class ResearchRunService:
         self._context_manager = context_manager
         self._memory_manager = memory_manager
         self._controlled_tools = controlled_tools
+        self._llm_call_repository = llm_call_repository
 
     async def create_run(
         self,
@@ -192,6 +197,9 @@ class ResearchRunService:
     ) -> list[ContextManifestView]:
         await self._repository.get(owner_hash, run_id)
         return await self._context_manager.list_metrics(run_id)
+
+    async def list_llm_calls(self, owner_hash: str, run_id: UUID) -> list[dict[str, object]]:
+        return await self._llm_call_repository.list_for_run(owner_hash, run_id)
 
     async def search_evidence(
         self, owner_hash: str, run_id: UUID, request: EvidenceSearchInput

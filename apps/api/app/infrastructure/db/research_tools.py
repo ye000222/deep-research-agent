@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TypedDict, cast
@@ -50,6 +52,16 @@ from app.infrastructure.db.research_models import (
 )
 from app.infrastructure.db.research_runs import ResearchRunNotFoundError
 from app.infrastructure.db.run_models import AgentEventRow, ResearchPlanItemRow, ResearchRunRow
+
+_SEARCH_QUERY_SEPARATOR_RE = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
+
+
+def normalize_search_query(value: str) -> str:
+    """Canonicalize query spelling before duplicate and idempotency checks."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = _SEARCH_QUERY_SEPARATOR_RE.sub(" ", normalized)
+    return " ".join(normalized.split())
 
 
 class ResearchLeaseLostError(RuntimeError):
@@ -190,7 +202,7 @@ class ResearchToolRepository:
                 if attempt_index < len(query_candidates)
                 else question.question
             )
-            normalized_query = " ".join(query.split()).lower()
+            normalized_query = normalize_search_query(query)
             duplicate_key = hashlib.sha256(
                 f"{run.plan_version}:{question.question_id}:{normalized_query}".encode()
             ).hexdigest()
@@ -300,7 +312,7 @@ class ResearchToolRepository:
             tool_call = await session.get(ResearchToolCallRow, target.tool_call_id)
             if tool_call is None:
                 raise ResearchLeaseLostError("tool call disappeared")
-            query_hash = hashlib.sha256(" ".join(target.query.split()).lower().encode()).hexdigest()
+            query_hash = hashlib.sha256(normalize_search_query(target.query).encode()).hexdigest()
             query_row = await session.scalar(
                 select(SearchQueryRow).where(
                     SearchQueryRow.run_id == run_id,

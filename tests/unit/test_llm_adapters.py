@@ -71,6 +71,48 @@ async def test_openai_responses_adapter_uses_native_schema() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_gateway_records_redacted_call_diagnostics() -> None:
+    respx.post("https://api.openai.com/v1/responses").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "resp_audited",
+                "output_text": json.dumps(PLAN),
+                "usage": {"input_tokens": 8, "output_tokens": 12},
+            },
+        )
+    )
+    recorded: list[dict[str, object]] = []
+
+    async def record(payload: dict[str, object]) -> None:
+        recorded.append(payload)
+
+    audited_request = request().model_copy(
+        update={
+            "metadata": {
+                "run_id": str(uuid4()),
+                "node": "planner",
+                "retry_mode": "normal_bounded",
+            }
+        }
+    )
+    async with httpx.AsyncClient() as client:
+        await LLMGateway(client, call_recorder=record).generate_structured(
+            adapter_type=AdapterType.OPENAI_RESPONSES,
+            base_url="https://api.openai.com/v1",
+            api_key=SecretStr("audit-secret"),
+            request=audited_request,
+        )
+
+    assert len(recorded) == 1
+    assert recorded[0]["node"] == "planner"
+    assert recorded[0]["provider_request_id"] == "resp_audited"
+    assert recorded[0]["status"] == "success"
+    assert "audit-secret" not in str(recorded[0])
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_anthropic_adapter_uses_output_config() -> None:
     route = respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(

@@ -293,3 +293,8 @@ select:disabled {
 @media (max-width: 1000px) {
   .explainability-grid { grid-template-columns: 1fr; }
 }
+.connection-probe-message {
+  grid-column: 1 / -1;
+  color: #b8f542;
+  line-height: 1.5;
+}

@@ -136,5 +136,167 @@
     "dynamic_questions_added": 1,
     "expected_gap_keys": ["new_dimension"],
     "expected_verdict": "continue"
+  },
+  {
+    "id": "prompt_injection_source_rejected",
+    "goal": "评估公开网页中的工业视觉方案",
+    "dimensions": ["technology"],
+    "claims": [{"dimension": "technology", "accepted_evidence": 2, "independent_sources": 2}],
+    "prompt_injection_rejections": 2,
+    "expected_gap_keys": [],
+    "expected_verdict": "write"
+  },
+  {
+    "id": "ssrf_source_blocked",
+    "goal": "读取候选来源",
+    "dimensions": ["sources"],
+    "claims": [{"dimension": "sources", "accepted_evidence": 0, "independent_sources": 0}],
+    "ssrf_blocks": 3,
+    "expected_gap_keys": ["sources"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "provider_timeout_recoverable",
+    "goal": "研究检测模型能力",
+    "dimensions": ["models"],
+    "claims": [{"dimension": "models", "accepted_evidence": 1, "independent_sources": 1}],
+    "provider_timeouts": 2,
+    "expected_gap_keys": ["models"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "provider_auth_failure",
+    "goal": "验证模型连接",
+    "dimensions": ["connection"],
+    "claims": [{"dimension": "connection", "accepted_evidence": 0, "independent_sources": 0}],
+    "provider_auth_failures": 1,
+    "expected_gap_keys": ["connection"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "citation_complete_numbers",
+    "goal": "生成带数字引用的报告",
+    "dimensions": ["report"],
+    "claims": [{"dimension": "report", "accepted_evidence": 2, "independent_sources": 2}],
+    "numeric_citations": 4,
+    "expected_gap_keys": [],
+    "expected_verdict": "write"
+  },
+  {
+    "id": "citation_missing_numeric_fact",
+    "goal": "核验市场规模数字",
+    "dimensions": ["market_size"],
+    "claims": [{"dimension": "market_size", "accepted_evidence": 2, "independent_sources": 2}],
+    "missing_numeric_citations": 1,
+    "unsupported_citations": 1,
+    "expected_gap_keys": ["market_size"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "single_first_party_fact",
+    "goal": "核验产品公开规格",
+    "dimensions": ["specification"],
+    "claims": [{"dimension": "specification", "accepted_evidence": 1, "independent_sources": 1, "first_party_direct": true}],
+    "expected_gap_keys": ["specification"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "two_independent_market_sources",
+    "goal": "评估市场规模和增长",
+    "dimensions": ["market_size", "growth"],
+    "claims": [
+      {"dimension": "market_size", "accepted_evidence": 2, "independent_sources": 2},
+      {"dimension": "growth", "accepted_evidence": 2, "independent_sources": 2}
+    ],
+    "expected_gap_keys": [],
+    "expected_verdict": "write"
+  },
+  {
+    "id": "definition_mismatch",
+    "goal": "比较不同统计口径",
+    "dimensions": ["definition"],
+    "claims": [{"dimension": "definition", "accepted_evidence": 2, "independent_sources": 2}],
+    "scope_mismatches": 1,
+    "expected_gap_keys": ["definition"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "freshness_window_expired",
+    "goal": "研究当前市场趋势",
+    "dimensions": ["trend"],
+    "claims": [{"dimension": "trend", "accepted_evidence": 2, "independent_sources": 2}],
+    "stale_claims": 2,
+    "expected_gap_keys": ["trend"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "diversity_insufficient",
+    "goal": "比较供应商方案",
+    "dimensions": ["vendors"],
+    "claims": [{"dimension": "vendors", "accepted_evidence": 4, "independent_sources": 1}],
+    "expected_gap_keys": ["vendors"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "analysis_artifact_verified",
+    "goal": "计算复合增长率",
+    "dimensions": ["growth"],
+    "claims": [{"dimension": "growth", "accepted_evidence": 2, "independent_sources": 2}],
+    "analysis_artifact_verified": true,
+    "expected_gap_keys": [],
+    "expected_verdict": "write"
+  },
+  {
+    "id": "analysis_artifact_missing_input",
+    "goal": "计算年度增长率",
+    "dimensions": ["growth"],
+    "claims": [{"dimension": "growth", "accepted_evidence": 1, "independent_sources": 1}],
+    "analysis_errors": 1,
+    "expected_gap_keys": ["growth"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "replan_new_dimension_resolved",
+    "goal": "研究工业视觉落地条件",
+    "dimensions": ["deployment", "operations"],
+    "claims": [
+      {"dimension": "deployment", "accepted_evidence": 2, "independent_sources": 2},
+      {"dimension": "operations", "accepted_evidence": 2, "independent_sources": 2}
+    ],
+    "dynamic_questions_added": 2,
+    "expected_gap_keys": [],
+    "expected_verdict": "write"
+  },
+  {
+    "id": "replan_new_dimension_unresolved",
+    "goal": "研究工业视觉落地条件",
+    "dimensions": ["deployment", "safety"],
+    "claims": [
+      {"dimension": "deployment", "accepted_evidence": 2, "independent_sources": 2},
+      {"dimension": "safety", "accepted_evidence": 0, "independent_sources": 0}
+    ],
+    "dynamic_questions_added": 1,
+    "expected_gap_keys": ["safety"],
+    "expected_verdict": "continue"
+  },
+  {
+    "id": "cancelled_before_external_call",
+    "goal": "取消研究任务",
+    "dimensions": ["cancel"],
+    "claims": [{"dimension": "cancel", "accepted_evidence": 0, "independent_sources": 0}],
+    "cancelled": true,
+    "no_verifiable_evidence": true,
+    "expected_gap_keys": ["cancel"],
+    "expected_verdict": "fail"
+  },
+  {
+    "id": "checkpoint_recovery_idempotent",
+    "goal": "从最新检查点恢复研究",
+    "dimensions": ["recovery"],
+    "claims": [{"dimension": "recovery", "accepted_evidence": 2, "independent_sources": 2}],
+    "checkpoint_replays": 1,
+    "duplicate_side_effects": 0,
+    "expected_gap_keys": [],
+    "expected_verdict": "write"
   }
 ]

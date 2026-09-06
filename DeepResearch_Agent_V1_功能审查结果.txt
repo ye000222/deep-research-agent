@@ -1363,3 +1363,54 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - 冲突仅发生在两份进度文档，代码文件无冲突；已保留当前分支最新阶段记录。
 - 已生成合并提交 `580249a` 并推送到 `origin/codex/v1-final-hardening`。
 - 当前分支已包含最新 `main`，等待 GitHub Actions 重新执行合并检查。
+
+六十、第三阶段 S3-0/S3-1 完成及 S3-2/S3-3 基础能力实现（2026-09-06 23:01:42，Asia/Shanghai）
+
+- 已从 `main@6566312` 创建 `codex/v1.1-stability`。
+- Release Gate 改为动态识别 Migration Head；新增空库升级测试，当前 Head 为 `20260906_0018`。
+- 修复干净数据库升级时 `pg_trgm`/`unaccent` 扩展缺失问题。
+- CI integration/release 改用独立 `deep_research_test` 数据库，并分别执行迁移。
+- S3-1 已完成：过期租约 Reconciler、唯一 Resume Outbox、`run.requeued` 事件、Celery 任务和 Beat 调度已实现；真实 PostgreSQL 测试通过。
+- S3-2 基础能力已完成：`llm_calls` 表、Migration、审计 Repository、Gateway 成功/失败诊断记录、API 和前端 MODEL CALLS 卡片已实现。
+- S3-3 基础能力已完成：Provider Quick/Full Connection Test API、结构化输出探测、脱敏和安全拒绝规则已实现，并有 API 测试。
+- 验证：全量 Pytest 通过；Ruff 通过；MyPy 101 个源文件 0 error；Web build 通过；Compose config 通过。
+- 尚未完成：保存 Profile 测试接口和能力结果持久化、至少 30 个端到端 Golden 案例、S3-5 调优、S3-6、S3-7。
+
+六十一、S3-4 Golden 案例基线完成（2026-09-06 23:44:57，Asia/Shanghai）
+
+- `evals/datasets/v1_golden.json` 已从 13 个固定案例扩展为 30 个案例，覆盖 Prompt Injection、SSRF、Provider 故障、引用完整性、来源独立性、陈旧/冲突、Analysis Artifact、动态 REPLAN、取消和 Checkpoint 恢复幂等等关键路径。
+- 确定性 Golden Grader 结果：30/30；Stop Decision Accuracy 100%；Gap Recall 100%；Evidence Support Precision 100%；Early Stop Error Rate 0%；Release Gate 通过。
+- 根据阶段约束，S3-5 调优暂不开始，后续调优必须以这 30 个案例作为固定回归基线。
+- S3-3 尚未完全关闭：保存 Profile 测试接口和能力结果持久化仍待实现；S3-6 前端诊断完善、S3-7 发布流程仍待完成。
+
+六十二、S3-3 保存 Profile 能力测试闭环完成（2026-09-07 00:03:14，Asia/Shanghai）
+
+- 新增 `llm_capability_tests` 表、`20260906_0019` Migration 和 Repository，记录能力矩阵、降级策略、Usage、Provider Request ID、错误码、验证/过期时间；API Key 不落库到该表。
+- 新增 `POST /api/v1/llm/profiles/{profile_id}/test`，使用当前 active Credential 临时解密并复用 Quick/Full Provider 探测，完成后保存结果。
+- 真实 PostgreSQL 集成测试覆盖保存 Profile、Credential Version、OpenAI-compatible Chat 探测、能力结果持久化与 Secret 脱敏，已通过。
+- Ruff、MyPy 105 个源文件、Unit/API、全量 Pytest 已通过；严格 PostgreSQL 集成测试已单独通过，默认全量 Pytest 的 4 项跳过是未设置集成环境变量导致，不代表严格门禁结果。
+- S3-3 已关闭；S3-4 已有 30 个 Golden 案例基线。尚未完成：S3-5 指标调优、S3-6 前端诊断收尾、S3-7 v1.1.0 发布。
+
+六十三、S3-5 基于 Golden 基线完成保守调优（2026-09-07 00:13:06，Asia/Shanghai）
+
+- 重复 Query 识别新增统一规范化：NFKC、大小写折叠、标点折叠和空白归一化；Tool duplicate key 与 SearchQuery 持久化 Hash 使用同一函数。
+- 未放宽 Evidence、来源独立性、引用和停止规则，只降低全角/半角、大小写、标点差异造成的重复搜索风险。
+- 30 个 Golden 案例调优前后均 30/30 通过：Stop Decision Accuracy 100%、Gap Recall 100%、Evidence Support Precision 100%、Early Stop Error Rate 0%。
+- 对比记录：`evals/reports/s3_5_golden_baseline.json`。
+- S3-6 仍需最终 UI/CI 收口；S3-7 尚未完成，不能宣称已发布 v1.1.0。
+
+六十四、S3-6 前端 Provider 诊断收口（2026-09-07 00:16:26，Asia/Shanghai）
+
+- 模型连接卡片新增“测试连接”：保存 Profile 使用专用测试 API，临时连接使用 Ephemeral Connection Test API。
+- 前端显示测试结果、延迟、Structured Output、Tool Calling、降级策略和安全错误码，绝不显示 API Key。
+- 研究工作台继续显示真实失败阶段、实际百分比、LLM Calls 成功/失败/重试诊断和恢复入口。
+- Web TypeScript/Vite production build 已通过；S3-6 代码收口完成。
+- S3-7 尚未完成：需等待连续三次 GitHub CI 全绿、真实 Provider Smoke Test、提交/推送、创建 `v1.1.0` Tag 和 GitHub Release。
+
+六十五、本地 Strict V1.1 Release Gate 通过（2026-09-07 00:18:12，Asia/Shanghai）
+
+- 执行 `scripts/release_gate.py --skip-compose --report-path artifacts/release_gate_s3_final.json`，结果 `passed=true`。
+- 动态 Migration Head 为 `20260906_0019`；Required Files、No MySQL References、Compose Config、Ruff、MyPy、全量 Pytest、严格 PostgreSQL Integration、Web Build、Golden Eval、Secret Scan 全部通过。
+- 严格 PostgreSQL 集成测试实际执行并通过；默认 Pytest 的跳过项仅因未设置 `RUN_POSTGRES_INTEGRATION=1`，不作为发布门禁结果。
+- 报告文件只保存在本地 `artifacts/release_gate_s3_final.json`，构建产物不纳入提交。
+- S3-7 尚未关闭：需要推送当前分支、取得连续三次 GitHub CI 全绿、执行真实 Provider Smoke Test，然后创建 `v1.1.0` Tag/Release。

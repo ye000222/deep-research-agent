@@ -187,6 +187,23 @@ type EvaluationSnapshot = Record<string, unknown> & {
   source_quality?: number;
   citation_support?: number;
 };
+type LLMCall = {
+  call_id: string;
+  node: string;
+  adapter: string;
+  model: string;
+  strategy: string;
+  provider_request_id: string | null;
+  finish_reason: string | null;
+  status: string;
+  usage: Record<string, unknown>;
+  latency_ms: number;
+  retry_mode: string;
+  error_code: string | null;
+  detail_code: string | null;
+  diagnostics: Record<string, unknown>;
+  created_at: string;
+};
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const STOPPED_STATUSES = new Set([
@@ -572,6 +589,7 @@ function App() {
   const [gapLedger, setGapLedger] = useState<GapLedger | null>(null);
   const [actionLedger, setActionLedger] = useState<ActionLedger | null>(null);
   const [evaluations, setEvaluations] = useState<EvaluationSnapshot[]>([]);
+  const [llmCalls, setLlmCalls] = useState<LLMCall[]>([]);
   const eventCursor = useRef(0);
   const [query, setQuery] = useState(
     "研究工业视觉缺陷检测领域的发展情况，分析技术路线、厂商、代表产品、大模型应用与未来三年趋势。",
@@ -603,6 +621,7 @@ function App() {
           setGapLedger(null);
           setActionLedger(null);
           setEvaluations([]);
+          setLlmCalls([]);
           setActiveRun(runs[0]);
           setActiveRunId(runs[0].run_id);
         }
@@ -623,7 +642,7 @@ function App() {
         if (eventCursor.current > 0) {
           eventHeaders["Last-Event-ID"] = String(eventCursor.current);
         }
-        const [statusResponse, eventResponse, evidenceResponse, contextResponse, memoryResponse, knowledgeResponse, gapsResponse, actionsResponse, evaluationsResponse] = await Promise.all([
+        const [statusResponse, eventResponse, evidenceResponse, contextResponse, memoryResponse, knowledgeResponse, gapsResponse, actionsResponse, evaluationsResponse, llmCallsResponse] = await Promise.all([
           fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId, {
             credentials: "include",
           }),
@@ -652,6 +671,9 @@ function App() {
           fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/evaluations", {
             credentials: "include",
           }),
+          fetch(API_BASE_URL + "/api/v1/research-runs/" + activeRunId + "/llm-calls", {
+            credentials: "include",
+          }),
         ]);
         if (!statusResponse.ok) throw new Error(`状态接口 HTTP ${statusResponse.status}`);
         if (!eventResponse.ok) throw new Error(`事件接口 HTTP ${eventResponse.status}`);
@@ -674,6 +696,9 @@ function App() {
         const currentEvaluations = evaluationsResponse.ok
           ? (await evaluationsResponse.json()) as EvaluationSnapshot[]
           : [];
+        const currentLlmCalls = llmCallsResponse.ok
+          ? (await llmCallsResponse.json()) as LLMCall[]
+          : [];
         if (incoming.length > 0) {
           eventCursor.current = Math.max(eventCursor.current, ...incoming.map((item) => item.seq));
           setEvents((current) => {
@@ -691,6 +716,7 @@ function App() {
           setGapLedger(currentGaps);
           setActionLedger(currentActions);
           setEvaluations(currentEvaluations);
+          setLlmCalls(currentLlmCalls);
           setMessage(runMessage(run));
           if (!STOPPED_STATUSES.has(run.status)) {
             timer = window.setTimeout(() => void poll(), 1000);
@@ -1285,6 +1311,14 @@ function App() {
               <small>{latestEvaluation?.verdict
                 ? `服务端 Evaluation verdict：${latestEvaluation.verdict}`
                 : latestResearchDecision?.public_summary ?? "尚未产生 Evaluation 决策。"}</small>
+            </article>
+            <article className="explainability-card">
+              <div className="context-metrics__heading"><span>MODEL CALLS</span><b>{llmCalls.length}</b></div>
+              <div className="ledger-row"><span>成功 / 失败</span><strong>{llmCalls.filter((call) => call.status === "success").length} / {llmCalls.filter((call) => call.status !== "success").length}</strong></div>
+              <div className="ledger-row"><span>重试调用</span><strong>{llmCalls.filter((call) => call.retry_mode !== "none").length}</strong></div>
+              <small>{llmCalls.length > 0
+                ? `最近：${llmCalls[llmCalls.length - 1].node} · ${llmCalls[llmCalls.length - 1].strategy} · ${llmCalls[llmCalls.length - 1].latency_ms}ms`
+                : "尚未记录模型调用诊断。"}</small>
             </article>
           </section>
           <div className="timeline">

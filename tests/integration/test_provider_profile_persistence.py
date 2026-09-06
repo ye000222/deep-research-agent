@@ -4,17 +4,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
+import httpx
 import pytest
+import respx
 from app.context.manager import ContextBudgetManager
 from app.core.config import Settings
 from app.domain.context import ContextCandidate, ContextItemType
 from app.domain.identifiers import uuid7
 from app.domain.planning import ResearchPlan
 from app.domain.providers import TokenUsage, UsageAccuracy
+from app.infrastructure.db.llm_call_models import LLMCallRow
+from app.infrastructure.db.llm_calls import LLMCallRepository
+from app.infrastructure.db.llm_capability_models import LLMCapabilityTestRow
 from app.infrastructure.db.memory_models import MemoryItemRow
 from app.infrastructure.db.postgres import PostgresRuntime
 from app.infrastructure.db.research_runs import ResearchRunRepository
-from app.infrastructure.db.run_models import AgentEventRow, ResearchRunRow
+from app.infrastructure.db.run_models import AgentEventRow, ResearchRunRow, TaskDispatchOutboxRow
 from app.main import create_app
 from app.memory.manager import ResearchMemoryManager
 from app.retrieval.projections import rebuild_memory
@@ -58,6 +63,18 @@ async def _exercise_worker_lease(settings: Settings, run_id: UUID) -> None:
             run_id,
             worker_task_id="integration-worker-1",
         )
+    finally:
+        await database.close()
+
+
+async def _count_capability_tests(settings: Settings, profile_id: UUID) -> int:
+    database = PostgresRuntime(settings.database_url)
+    try:
+        async with database.session_factory() as session:
+            result = await session.execute(
+                select(LLMCapabilityTestRow).where(LLMCapabilityTestRow.profile_id == profile_id)
+            )
+            return len(result.scalars().all())
     finally:
         await database.close()
 
@@ -206,6 +223,40 @@ async def _exercise_long_context_source_reference(settings: Settings, run_id: UU
         await database.close()
 
 
+async def _exercise_llm_call_audit(settings: Settings, run_id: UUID) -> None:
+    database = PostgresRuntime(settings.database_url)
+    try:
+        await LLMCallRepository(database.session_factory).record(
+            {
+                "run_id": str(run_id),
+                "node": "planner",
+                "adapter": "openai_compatible_chat",
+                "model": "integration-model-v1",
+                "strategy": "json_mode",
+                "provider_request_id": "integration-request-1",
+                "context_manifest_id": None,
+                "finish_reason": "stop",
+                "status": "success",
+                "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
+                "latency_ms": 42,
+                "retry_mode": "none",
+                "diagnostics": {"provider_request_id": "integration-request-1"},
+            }
+        )
+        async with database.session_factory() as session:
+            row = await session.scalar(
+                select(LLMCallRow).where(
+                    LLMCallRow.run_id == run_id,
+                    LLMCallRow.provider_request_id == "integration-request-1",
+                )
+            )
+            assert row is not None
+            assert row.status == "success"
+            assert row.usage["total_tokens"] == 30
+    finally:
+        await database.close()
+
+
 async def _exercise_expired_worker_redelivery(settings: Settings, run_id: UUID) -> None:
     database = PostgresRuntime(settings.database_url)
     repository = ResearchRunRepository(database.session_factory)
@@ -249,6 +300,50 @@ async def _exercise_expired_worker_redelivery(settings: Settings, run_id: UUID) 
                 )
             )
             assert event_types == ["run.created", "run.started", "run.recovered"]
+    finally:
+        await database.close()
+
+
+async def _exercise_stale_run_reconciler(settings: Settings, run_id: UUID) -> None:
+    database = PostgresRuntime(settings.database_url)
+    repository = ResearchRunRepository(database.session_factory)
+    try:
+        assert await repository.acquire_for_execution(
+            run_id,
+            worker_task_id="stale-worker",
+            lease_seconds=300,
+        )
+        async with database.session_factory() as session, session.begin():
+            await session.execute(
+                update(ResearchRunRow)
+                .where(ResearchRunRow.id == run_id)
+                .values(lease_until=datetime.now(UTC) - timedelta(seconds=1))
+            )
+
+        recovered = await repository.reconcile_expired_leases()
+        assert run_id in recovered
+        assert await repository.reconcile_expired_leases() == []
+        async with database.session_factory() as session:
+            row = await session.get(ResearchRunRow, run_id)
+            assert row is not None
+            assert row.status == "queued"
+            assert row.lease_until is None
+            dispatches = list(
+                await session.scalars(
+                    select(TaskDispatchOutboxRow)
+                    .where(TaskDispatchOutboxRow.run_id == run_id)
+                )
+            )
+            assert len(dispatches) == 2
+            assert any(dispatch.dispatch_type == "resume" for dispatch in dispatches)
+            event_types = list(
+                await session.scalars(
+                    select(AgentEventRow.event_type)
+                    .where(AgentEventRow.run_id == run_id)
+                    .order_by(AgentEventRow.run_seq)
+                )
+            )
+            assert "run.requeued" in event_types
     finally:
         await database.close()
 
@@ -305,6 +400,32 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
         assert switched_profile["credential_version"] == 2
         assert switched_profile["credential_last_four"] == "1234"
         assert "synthetic-integration-key" not in switched.text
+
+        with respx.mock:
+            respx.post("https://api.openai.com/v1/chat/completions").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "id": "saved-profile-probe",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": '{"ok":true}'},
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                    },
+                )
+            )
+            capability_test = restarted.post(
+                f"/api/v1/llm/profiles/{profile_id}/test",
+                json={"test_type": "quick"},
+            )
+        assert capability_test.status_code == 200
+        assert capability_test.json()["passed"] is True
+        assert capability_test.json()["profile_id"] == profile_id
+        assert "synthetic-integration-key" not in capability_test.text
+        assert asyncio.run(_count_capability_tests(settings, UUID(profile_id))) >= 1
 
         run_request = {
             "query": "  Verify   the empty research run lifecycle.  ",
@@ -407,6 +528,7 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
 
         asyncio.run(_exercise_memory_hybrid_retrieval(settings, UUID(planner_run_id)))
         asyncio.run(_exercise_long_context_source_reference(settings, UUID(planner_run_id)))
+        asyncio.run(_exercise_llm_call_audit(settings, UUID(planner_run_id)))
 
         planner_events = restarted.get(
             f"/api/v1/research-runs/{planner_run_id}/events?follow=false"
@@ -424,6 +546,19 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
             _exercise_expired_worker_redelivery(
                 settings,
                 UUID(redelivery_run.json()["run_id"]),
+            )
+        )
+
+        reconciler_run = restarted.post(
+            "/api/v1/research-runs",
+            json={**run_request, "query": "Reconcile a stale research worker lease."},
+            headers={"Idempotency-Key": "integration-reconciler-run-v1"},
+        )
+        assert reconciler_run.status_code == 202
+        asyncio.run(
+            _exercise_stale_run_reconciler(
+                settings,
+                UUID(reconciler_run.json()["run_id"]),
             )
         )
 

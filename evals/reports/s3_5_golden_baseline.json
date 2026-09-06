@@ -1,0 +1,22 @@
+{
+  "dataset": "evals/datasets/v1_golden.json",
+  "case_count": 30,
+  "before": {
+    "stop_decision_accuracy": 1.0,
+    "gap_recall": 1.0,
+    "evidence_support_precision": 1.0,
+    "early_stop_error_rate": 0.0
+  },
+  "after": {
+    "stop_decision_accuracy": 1.0,
+    "gap_recall": 1.0,
+    "evidence_support_precision": 1.0,
+    "early_stop_error_rate": 0.0
+  },
+  "changes": [
+    "Canonicalize search queries with NFKC, casefold, punctuation folding, and whitespace collapse.",
+    "Use the same canonical query for duplicate tool-call keys and persisted SearchQuery hashes.",
+    "Keep Evidence validation, source independence, and citation gates unchanged."
+  ],
+  "decision": "No threshold relaxation was justified by the fixed Golden Set; tuning only reduced duplicate-query risk."
+}

@@ -12,6 +12,7 @@ from app.context.manager import ContextBudgetManager, ContextManifestPersistence
 from app.core.config import Settings
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.checkpoints.lifecycle import CheckpointRuntime
+from app.infrastructure.db.llm_calls import LLMCallRepository
 from app.infrastructure.db.postgres import PostgresRuntime
 from app.infrastructure.db.reports import (
     ReportRepository,
@@ -60,6 +61,25 @@ async def _run_memory_lifecycle() -> dict[str, int]:
         await database.close()
 
 
+@celery_app.task(name="deep_research.reconcile_stale_runs")  # type: ignore[untyped-decorator]
+def reconcile_stale_runs() -> str:
+    """Requeue expired worker leases for dispatcher delivery."""
+
+    return asyncio.run(_reconcile_stale_runs())
+
+
+async def _reconcile_stale_runs() -> str:
+    settings = Settings()
+    database = PostgresRuntime(settings.database_url)
+    try:
+        recovered = await ResearchRunRepository(
+            database.session_factory
+        ).reconcile_expired_leases()
+        return f"recovered={len(recovered)}"
+    finally:
+        await database.close()
+
+
 @celery_app.task(bind=True, name="deep_research.execute_run")  # type: ignore[untyped-decorator]
 def execute_research_run(task: Task, run_id: str) -> str:
     task_id = str(task.request.id)
@@ -80,6 +100,7 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         trust_env=False,
     )
     repository = ResearchRunRepository(database.session_factory)
+    llm_calls = LLMCallRepository(database.session_factory)
     research_repository = ResearchToolRepository(database.session_factory)
     report_repository = ReportRepository(database.session_factory)
     state_repository = ResearchStateRuntimeRepository(database.session_factory)
@@ -91,7 +112,7 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         AnalyzeDataTool(database.session_factory),
     )
     cipher = SecretCipher(load_or_create_master_key(settings))
-    gateway = LLMGateway(client)
+    gateway = LLMGateway(client, call_recorder=llm_calls.record)
     planner = PlannerService(bindings, cipher, gateway, contexts)
     research_loop = ResearchLoopService(
         research_repository,

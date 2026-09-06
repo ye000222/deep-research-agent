@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
@@ -11,9 +13,20 @@ from pydantic import SecretStr
 
 from app.domain.provider_profiles import ProviderProfileView
 from app.domain.providers import AdapterType
+from app.infrastructure.db.llm_capability_tests import LLMCapabilityTestRepository
 from app.infrastructure.db.models import CredentialVersionRow, ProviderProfileRow
 from app.infrastructure.db.provider_profiles import ProviderProfileRepository
 from app.security.secrets import EncryptedSecret, SecretCipher
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderProfileTestMaterial:
+    profile_id: UUID
+    credential_version_id: UUID
+    adapter_type: AdapterType
+    base_url: str
+    model: str
+    api_key: SecretStr
 
 
 class ProviderProfileServiceProtocol(Protocol):
@@ -49,17 +62,41 @@ class ProviderProfileServiceProtocol(Protocol):
 
     async def delete_profile(self, owner_hash: str, profile_id: UUID) -> None: ...
 
+    async def get_test_material(
+        self, owner_hash: str, profile_id: UUID
+    ) -> ProviderProfileTestMaterial: ...
+
+    async def record_capability_test(
+        self,
+        *,
+        profile_id: UUID,
+        credential_version_id: UUID,
+        adapter_type: str,
+        model: str,
+        test_type: str,
+        passed: bool,
+        capability_matrix: Mapping[str, object],
+        selected_fallbacks: Mapping[str, object],
+        usage: Mapping[str, object],
+        latency_ms: int,
+        provider_request_id: str | None,
+        error_code: str | None,
+        detail_code: str | None,
+    ) -> object: ...
+
 
 class ProviderProfileService:
     def __init__(
         self,
         repository: ProviderProfileRepository,
         cipher: SecretCipher,
+        capability_tests: LLMCapabilityTestRepository | None = None,
         *,
         allow_insecure_endpoints: bool,
     ) -> None:
         self._repository = repository
         self._cipher = cipher
+        self._capability_tests = capability_tests
         self._allow_insecure_endpoints = allow_insecure_endpoints
 
     async def list_profiles(self, owner_hash: str) -> list[ProviderProfileView]:
@@ -194,6 +231,60 @@ class ProviderProfileService:
 
     async def delete_profile(self, owner_hash: str, profile_id: UUID) -> None:
         await self._repository.delete(owner_hash, profile_id)
+
+    async def get_test_material(
+        self, owner_hash: str, profile_id: UUID
+    ) -> ProviderProfileTestMaterial:
+        profile, credential = await self._repository.get_active(owner_hash, profile_id)
+        plaintext = self._cipher.decrypt(
+            self._encrypted_secret(credential),
+            credential_id=credential.id,
+            adapter_type=profile.adapter_type,
+            credential_version=credential.credential_version,
+        )
+        return ProviderProfileTestMaterial(
+            profile_id=profile.id,
+            credential_version_id=credential.id,
+            adapter_type=AdapterType(profile.adapter_type),
+            base_url=profile.normalized_base_url,
+            model=profile.model,
+            api_key=plaintext,
+        )
+
+    async def record_capability_test(
+        self,
+        *,
+        profile_id: UUID,
+        credential_version_id: UUID,
+        adapter_type: str,
+        model: str,
+        test_type: str,
+        passed: bool,
+        capability_matrix: Mapping[str, object],
+        selected_fallbacks: Mapping[str, object],
+        usage: Mapping[str, object],
+        latency_ms: int,
+        provider_request_id: str | None,
+        error_code: str | None,
+        detail_code: str | None,
+    ) -> object:
+        if self._capability_tests is None:
+            raise RuntimeError("capability test persistence is not configured")
+        return await self._capability_tests.record(
+            profile_id=profile_id,
+            credential_version_id=credential_version_id,
+            adapter_type=adapter_type,
+            model=model,
+            test_type=test_type,
+            passed=passed,
+            capability_matrix=capability_matrix,
+            selected_fallbacks=selected_fallbacks,
+            usage=usage,
+            latency_ms=latency_ms,
+            provider_request_id=provider_request_id,
+            error_code=error_code,
+            detail_code=detail_code,
+        )
 
     def _normalize_base_url(self, raw_url: str) -> tuple[str, str]:
         parsed = urlsplit(raw_url.strip())

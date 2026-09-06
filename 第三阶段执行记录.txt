@@ -1,0 +1,144 @@
+Deep Research Agent V1.1 第三阶段执行记录
+=======================================
+
+开始时间：2026-09-06 22:18:46（Asia/Shanghai）
+基线分支：main
+基线提交：6566312 Codex/v1 final hardening (#4)
+工作分支：codex/v1.1-stability
+
+本文件用于记录第三阶段实际执行结果，下一次继续任务时以本文件、当前仓库代码和 Git 提交历史为准。
+
+执行目标
+--------
+
+1. 创建 codex/v1.1-stability
+2. 修复 Release Gate 的硬编码 Migration Head
+3. 增加 v1.0 → 当前 Head 数据库升级测试
+4. 完成 S3-1：测试数据库隔离和 Stale-Run Reconciler
+5. 完成 S3-2：llm_calls 持久化审计和诊断面板
+6. 完成 S3-3：Provider Quick/Full Connection Test
+7. 建立至少 30 个端到端 Golden 案例后，再进行 S3-5 指标调优
+8. 完成 S3-6 前端诊断并发布 v1.1.0
+
+执行规则
+--------
+
+- 以当前仓库实际状态为准，不重复已完成工作。
+- 不提交 build/ 等构建产物。
+- 每完成一项，记录时间、提交、测试结果和未完成风险。
+- 所有失败必须记录原因和恢复动作，不用“通过”掩盖跳过测试。
+- 最终发布前必须重新执行完整 Release Gate、PostgreSQL 集成测试和 Golden Eval。
+
+任务状态
+--------
+
+- S3-0：进行中
+- S3-1：未开始
+- S3-2：未开始
+- S3-3：未开始
+- S3-4：未开始
+- S3-5：未开始
+- S3-6：未开始
+- S3-7：未开始
+
+变更记录
+--------
+
+### 2026-09-06 22:18:46：创建第三阶段稳定性分支
+
+- 已确认 main 与 origin/main 同步，基线为 6566312。
+- 已创建工作分支 codex/v1.1-stability。
+- 当前工作区仅有未跟踪 build/，不纳入本阶段提交。
+
+### 2026-09-06 23:01:42：S3-0 与 S3-1 完成，S3-2/S3-3 基础能力完成
+
+【S3-0 已完成】
+
+- Release Gate 已动态识别 Migration Head，不再硬编码 `0016`。
+- 新增隔离 PostgreSQL Migration 升级测试：从空数据库执行 `alembic upgrade head`，当前 Head 为 `20260906_0018`。
+- 发现并修复 `pg_trgm`/`unaccent` 扩展未在干净数据库中创建的问题。
+- CI integration/release 使用独立 `deep_research_test` 数据库；业务库和测试库分别执行迁移。
+
+【S3-1 已完成】
+
+- 新增 `ResearchRunRepository.reconcile_expired_leases`。
+- 过期 Worker 租约会被安全地重新排队，并写入唯一 Resume Outbox、`run.requeued` 事件。
+- 旧 Worker 因租约身份失效不能继续提交副作用。
+- 新增 `deep_research.reconcile_stale_runs` Celery 任务。
+- 新增 Celery Beat，每 60 秒执行 Stale-Run Reconciler；Memory 生命周期每 15 分钟执行。
+- 新增真实 PostgreSQL 租约、重投和 Reconciler 集成测试。
+
+【S3-2 基础能力已完成】
+
+- 新增 `llm_calls` 表、`20260906_0018` Migration 和 Repository。
+- Gateway 记录成功/失败、Provider Request ID、策略、Finish Reason、Token Usage、耗时、重试模式和脱敏诊断。
+- API 新增 `GET /api/v1/research-runs/{id}/llm-calls`。
+- 前端新增 MODEL CALLS 诊断卡片。
+- 新增 Gateway 审计回调单元测试。
+
+【S3-3 基础能力已完成】
+
+- 新增 `POST /api/v1/llm/providers/connections/test`。
+- 支持 `quick/full` 请求类型、临时 API Key、结构化输出探测、策略和 Usage 返回。
+- API Key 不持久化、不返回；非 HTTPS Endpoint 拒绝。
+- 新增 Provider Connection Test API 测试。
+
+【验证结果】
+
+- Migration 升级集成测试：通过。
+- PostgreSQL 租约/重投/隔离数据库集成测试：通过。
+- Unit/API 测试：通过。
+- 全量 Pytest：通过；默认 PostgreSQL 集成测试仍需 `RUN_POSTGRES_INTEGRATION=1` 才执行。
+- Ruff：通过。
+- MyPy：101 个源文件，0 error。
+- Web production build：通过。
+- Docker Compose config：通过。
+
+【尚未完成】
+
+- S3-2 仍需补齐调用列表的更丰富前端详情和 Release Gate 覆盖。
+- S3-3 仍需为已保存 Profile 增加专用测试接口和能力结果持久化。
+- S3-4 至少 30 个端到端 Golden 案例尚未建立；在此之前不开始 S3-5 调优。
+- S3-6/S3-7 尚未开始。
+
+### 2026-09-06 23:44:57：S3-4 Golden 案例基线完成
+
+- 将 `evals/datasets/v1_golden.json` 从 13 个固定案例扩展为 30 个案例。
+- 新增覆盖：Prompt Injection 来源拒绝、SSRF 阻断、Provider 超时/鉴权失败、数字引用完整性、单一一手来源不足、口径不一致、陈旧证据、来源多样性不足、Analysis Artifact 重算、真实 REPLAN 新维度、取消、Checkpoint 恢复幂等等场景。
+- 运行确定性 Golden Grader：30/30 通过；Stop Decision Accuracy=1.00；Gap Recall=1.00；Evidence Support Precision=1.00；Early Stop Error Rate=0；Release Gate=True。
+- 按约束，S3-5 指标调优尚未开始，必须先保留该 30 案例基线。
+- 当前 S3-3 仍有明确缺口：已保存 Profile 的专用测试接口与能力结果持久化尚未补齐。
+
+### 2026-09-07 00:03:14：S3-3 保存 Profile 能力测试闭环完成
+
+- 新增 `llm_capability_tests` 表、`20260906_0019` Migration 和 Repository，保存能力矩阵、降级策略、Usage、Provider Request ID、错误码、验证/过期时间；不保存 API Key。
+- Provider Profile Service 增加解密后临时测试材料解析，新增 `POST /api/v1/llm/profiles/{profile_id}/test`，复用 Quick/Full 探测链路并在测试完成后持久化结果。
+- 增加真实 PostgreSQL 集成验证：保存 Profile、轮换后的 active Credential、OpenAI-compatible Chat 探测、能力结果持久化和 Secret 脱敏均通过。
+- Ruff、MyPy（105 个源文件）、Unit/API Pytest、全量 Pytest 均通过；全量 Pytest 默认有 4 个 PostgreSQL 测试按环境变量跳过，严格集成命令已单独通过。
+- S3-3 现已完成。S3-4 的 30 个 Golden 案例基线已完成；S3-5 仍按约束暂不调优。
+
+### 2026-09-07 00:13:06：S3-5 基于 Golden 基线完成保守调优
+
+- 在重复 Query 识别入口增加统一规范化：NFKC、大小写折叠、标点折叠和空白归一化。
+- Tool duplicate key 与持久化 `SearchQuery.normalized_hash` 现在共享同一规范化函数，避免全角/半角、大小写或标点差异造成重复搜索。
+- 未放宽 Evidence、来源独立性、引用或停止门槛；调优只降低重复 Query 风险。
+- 30 个 Golden 案例调优前后均为 30/30；Stop Decision Accuracy=1.00、Gap Recall=1.00、Evidence Support Precision=1.00、Early Stop Error Rate=0。
+- 对比记录已保存到 `evals/reports/s3_5_golden_baseline.json`。
+- S3-6 前端诊断已有 LLM Calls 面板和真实失败阶段投影，仍需最终发布前做一次 UI/CI 收口；S3-7 尚未发布。
+
+### 2026-09-07 00:16:26：S3-6 前端 Provider 诊断收口
+
+- 模型连接卡片新增“测试连接”按钮：已保存 Profile 调用专用 Profile Test API，未保存配置调用临时 Connection Test API。
+- 页面显示测试通过/失败、延迟、Structured Output、Tool Calling、降级策略和安全错误码；不显示 API Key。
+- 保留研究工作台的真实失败阶段百分比、LLM Calls 成功/失败/重试统计和恢复入口，不把失败任务伪装成 100%。
+- Web TypeScript/Vite production build 通过。
+- S3-6 代码收口完成；S3-7 仍需连续三次 GitHub CI 全绿、真实 Provider Smoke Test、远端发布 Tag/Release。
+
+### 2026-09-07 00:18:12：本地 Strict V1.1 Release Gate 通过
+
+- 执行 `scripts/release_gate.py --skip-compose --report-path artifacts/release_gate_s3_final.json`，结果 `passed=true`。
+- 动态 Migration Head：`20260906_0019`。
+- Required Files、No MySQL References、Compose Config、Ruff、MyPy、全量 Pytest、PostgreSQL Integration、Web Build、Golden Eval、Secret Scan 全部通过。
+- PostgreSQL Integration 严格模式实际执行并通过；默认 `pytest -q` 的跳过项仅因为未设置 `RUN_POSTGRES_INTEGRATION=1`，不能替代严格门禁。
+- Release Gate 报告保存于本地构建产物 `artifacts/release_gate_s3_final.json`，构建目录不纳入 Git 提交。
+- S3-7 当前阻塞条件：尚未推送本分支、尚未取得连续三次远端 GitHub CI 全绿、尚未执行真实 Provider Smoke Test 和创建 GitHub `v1.1.0` Release。
