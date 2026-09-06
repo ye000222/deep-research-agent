@@ -19,11 +19,29 @@ PNPM = "pnpm.cmd" if sys.platform == "win32" else "pnpm"
 REQUIRED = (
     "docker-compose.yml",
     "README.md",
-    "apps/api/alembic/versions/20260831_0016_evaluation_snapshots.py",
     "apps/api/app/retrieval/projections.py",
     "apps/api/app/evaluation/report_verifier.py",
     "evals/datasets/v1_golden.json",
 )
+
+
+def migration_head() -> tuple[str, Path] | tuple[None, None]:
+    """Return the newest single Alembic revision tracked in the repository.
+
+    Release validation must follow the repository's actual migration chain rather
+    than a stale, hard-coded filename.  The timestamped revision naming convention
+    is part of the project's migration policy.
+    """
+
+    versions = ROOT / "apps" / "api" / "alembic" / "versions"
+    candidates: list[tuple[str, Path]] = []
+    for path in versions.glob("*.py"):
+        match = re.match(r"^(\d{8}_\d{4})_.*\.py$", path.name)
+        if match:
+            candidates.append((match.group(1), path))
+    if not candidates:
+        return None, None
+    return max(candidates, key=lambda item: item[0])
 
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -34,7 +52,11 @@ SECRET_PATTERNS = (
 
 
 def check_files() -> list[str]:
-    return [item for item in REQUIRED if not (ROOT / item).exists()]
+    missing = [item for item in REQUIRED if not (ROOT / item).exists()]
+    _, head_path = migration_head()
+    if head_path is None:
+        missing.append("apps/api/alembic/versions/<timestamped migration head>.py")
+    return missing
 
 
 def check_mysql_references() -> list[str]:
@@ -174,12 +196,13 @@ def main() -> int:
         )
     secret_hits = check_secret_scan()
     golden = check_golden_eval()
+    head_revision, _ = migration_head()
     command_ok = all(bool(item["passed"]) for item in commands)
     checks = {
         "required_files": not missing,
         "no_mysql_references": not mysql,
         "compose_config": compose_ok,
-        "migration_head": "20260831_0016" if not missing else "unknown",
+        "migration_head": head_revision or "unknown",
         "commands": command_ok,
         "golden_eval": bool(golden["passed"]),
         "secret_scan": not secret_hits,

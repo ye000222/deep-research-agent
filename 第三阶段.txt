@@ -398,6 +398,21 @@ V1 主功能已经形成完整闭环：研究计划、搜索、网页读取、�
 - 浏览器强制刷新后创建全新研究任务。若 Compact Planner 再遇临时连接超时，活动流应出现最多两条 `model.retry_scheduled`，而不是第一次超时立即终止。
 - 本次未自动重新调用真实模型，避免未经用户确认产生 Provider 费用。
 
+### 2026-09-06 20:32:13：S3-0 发布基线启动
+
+- 已审查第二阶段与第三阶段任务，并以当前仓库状态为准重新确认未完成项。
+- 发现 Release Gate 将 Alembic Migration Head 硬编码为 `20260831_0016`，与当前实际最新迁移 `20260902_0017_context_source_ref_text.py` 不一致。
+- 已将 `scripts/release_gate.py` 改为扫描 `apps/api/alembic/versions`，动态识别最新时间戳迁移，并将实际 revision 写入审计结果。
+- 已完成脚本语法检查和 Head 识别验证，当前识别结果为 `20260902_0017`。
+- S3-0 尚未整体完成：仍需同步合并后的 `main`、验证从 V1.0 到当前 Head 的升级路径，并在 GitHub CI 中重新跑 Release Gate。
+
+### 2026-09-06 21:44:31：Pull Request 冲突已解决
+
+- 已同步远程 `origin/main` 最新提交 `c16a79a`。
+- 冲突仅发生在两份进度文档，代码文件无冲突；已保留当前分支的最新阶段记录。
+- 已生成合并提交 `580249a` 并推送到 `origin/codex/v1-final-hardening`。
+- 当前分支已包含最新 `main`，等待 GitHub Actions 重新执行合并检查。
+
 ### 2026-09-03 11:07:25（Asia/Shanghai）：历史 session 恢复与未完成项核验
 
 - 历史文件实际路径为 `C:\Users\Lenovo\.codex\sessions\2026\09\03\rollout-2026-09-03T00-12-37-01a062e4-cdad-7063-b0e6-3f29cb700d96.jsonl`；用户提供的路径少了 `Lenovo` 与 `.codex` 之间的反斜杠。
