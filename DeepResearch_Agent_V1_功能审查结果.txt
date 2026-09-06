@@ -1414,3 +1414,11 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - 严格 PostgreSQL 集成测试实际执行并通过；默认 Pytest 的跳过项仅因未设置 `RUN_POSTGRES_INTEGRATION=1`，不作为发布门禁结果。
 - 报告文件只保存在本地 `artifacts/release_gate_s3_final.json`，构建产物不纳入提交。
 - S3-7 尚未关闭：需要推送当前分支、取得连续三次 GitHub CI 全绿、执行真实 Provider Smoke Test，然后创建 `v1.1.0` Tag/Release。
+
+六十六、S3 稳定性分支提交并推送（2026-09-07 00:21:54，Asia/Shanghai）
+
+- 已创建提交 `3258c37 feat: complete V1.1 stability hardening`。
+- `codex/v1.1-stability` 已推送到 `origin`，本地与远端一致。
+- PR 地址：`https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-stability`。
+- 本地 `build/` 构建目录未跟踪且未提交。
+- 尚未宣称 v1.1.0 已发布：仍需 PR 连续三次 GitHub CI 全绿、真实 Provider Smoke Test、过期 running 任务核对和 GitHub Tag/Release。

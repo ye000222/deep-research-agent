@@ -142,3 +142,11 @@ Deep Research Agent V1.1 第三阶段执行记录
 - PostgreSQL Integration 严格模式实际执行并通过；默认 `pytest -q` 的跳过项仅因为未设置 `RUN_POSTGRES_INTEGRATION=1`，不能替代严格门禁。
 - Release Gate 报告保存于本地构建产物 `artifacts/release_gate_s3_final.json`，构建目录不纳入 Git 提交。
 - S3-7 当前阻塞条件：尚未推送本分支、尚未取得连续三次远端 GitHub CI 全绿、尚未执行真实 Provider Smoke Test 和创建 GitHub `v1.1.0` Release。
+
+### 2026-09-07 00:21:54：S3 稳定性分支提交并推送
+
+- 已创建提交 `3258c37 feat: complete V1.1 stability hardening`。
+- 已推送 `codex/v1.1-stability` 到 `origin`，远端分支与本地提交一致。
+- Pull Request 地址：`https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-stability`。
+- `build/` 仍为本地未跟踪构建目录，未加入提交。
+- 下一步外部门禁：创建 PR、等待连续三次 GitHub CI 全绿；随后执行真实 Provider Smoke Test，确认无过期 running 任务，再创建 `v1.1.0` Tag/Release。
