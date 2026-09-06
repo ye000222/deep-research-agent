@@ -1342,3 +1342,17 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - 当前 `main` 工作区仍有未提交修改，且 `origin/main` 尚未包含这些修改。
 - GitHub Actions 必须在提交/推送后重新运行，不能用本地 Release Gate 代替远端结果。
 - 仍需用真实模型新建一次研究任务，验证搜索、网页读取、Evidence 抽取和报告引用的端到端运行态。
+
+五十七、修复分支已成功推送（2026-09-03 11:54:30，Asia/Shanghai）
+
+- `codex/v1-final-hardening` 已成功推送到 `origin`，远端分支跟踪已建立。
+- 提交：`a45097b fix: harden V1 research reliability and release gate`。
+- 下一步：在 GitHub 创建 Pull Request 合并到 `main`，等待 PostgreSQL integration、api、web、compose 和 Strict V1 release gate 全部通过。
+
+五十八、第三阶段 S3-0 启动与 Migration Head 校正（2026-09-06 20:32:13，Asia/Shanghai）
+
+- 对照《第二阶段.txt》和《第三阶段.txt》重新审查当前仓库，确认第二阶段仍有严格验收缺口，第三阶段尚未完成正式 S3-0～S3-7。
+- 发现 `scripts/release_gate.py` 将 Migration Head 硬编码为 `20260831_0016`，但仓库实际最新迁移为 `20260902_0017_context_source_ref_text.py`。
+- 已将 Release Gate 改为动态扫描 `apps/api/alembic/versions` 识别最新时间戳迁移，并记录实际 revision。
+- 脚本语法和 Head 识别验证通过，当前识别结果为 `20260902_0017`。
+- S3-0 尚未整体完成：仍需同步合并后的 `main`、验证 V1.0 到当前 Head 的升级路径，并重新取得 GitHub CI Release Gate 结果。
