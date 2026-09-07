@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, SecretStr
 
 from app.api.dependencies import get_client_session, get_profile_service
+from app.api.v1.llm_providers import ConnectionTestRequest, ConnectionTestResponse, test_connection
 from app.domain.provider_profiles import ProviderProfileView
 from app.domain.providers import AdapterType
 from app.infrastructure.db.provider_profiles import ProfileNotFoundError
@@ -39,6 +40,10 @@ class ProviderProfileUpdate(BaseModel):
 
 class CredentialRotate(BaseModel):
     api_key: SecretStr = Field(min_length=1, max_length=10_000)
+
+
+class ProfileCapabilityTestRequest(BaseModel):
+    test_type: str = Field(default="quick", pattern="^(quick|full)$")
 
 
 class ProviderProfileResponse(BaseModel):
@@ -124,6 +129,53 @@ async def rotate_credential(
     except ProfileNotFoundError as exc:
         raise _not_found() from exc
     return ProviderProfileResponse.from_view(profile)
+
+
+@router.post("/{profile_id}/test", response_model=ConnectionTestResponse)
+async def test_saved_profile(
+    profile_id: UUID,
+    payload: ProfileCapabilityTestRequest,
+    client: Annotated[ClientSession, Depends(get_client_session)],
+    service: Annotated[ProviderProfileServiceProtocol, Depends(get_profile_service)],
+) -> ConnectionTestResponse:
+    try:
+        material = await service.get_test_material(client.owner_hash, profile_id)
+        result = await test_connection(
+            ConnectionTestRequest(
+                adapter_type=material.adapter_type,
+                base_url=material.base_url,
+                model=material.model,
+                api_key=material.api_key,
+                test_type=payload.test_type,
+            )
+        )
+        from datetime import UTC, datetime, timedelta
+
+        capability = await service.record_capability_test(
+            profile_id=material.profile_id,
+            credential_version_id=material.credential_version_id,
+            adapter_type=material.adapter_type.value,
+            model=material.model,
+            test_type=payload.test_type,
+            passed=result.passed,
+            capability_matrix=result.capability_matrix.model_dump(mode="json"),
+            selected_fallbacks=result.selected_strategy,
+            usage=result.usage,
+            latency_ms=result.latency_ms,
+            provider_request_id=result.provider_request_id,
+            error_code=result.error_code,
+            detail_code=result.detail_code,
+        )
+        expires_at = getattr(capability, "expires_at", datetime.now(UTC) + timedelta(hours=24))
+        return result.model_copy(
+            update={
+                "profile_id": str(material.profile_id),
+                "credential_version_id": str(material.credential_version_id),
+                "capability_expires_at": expires_at.isoformat(),
+            }
+        )
+    except ProfileNotFoundError as exc:
+        raise _not_found() from exc
 
 
 @router.delete("/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from time import perf_counter
 from typing import Any, cast
 from urllib.parse import quote
 
@@ -41,10 +42,103 @@ class ModelGatewayError(RuntimeError):
 class LLMGateway:
     """Translate canonical requests without retaining credentials or conversation state."""
 
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        call_recorder: Callable[[dict[str, object]], Awaitable[None]] | None = None,
+    ) -> None:
         self._client = client
+        self._call_recorder = call_recorder
 
     async def generate_structured(
+        self,
+        *,
+        adapter_type: AdapterType,
+        base_url: str,
+        api_key: SecretStr,
+        request: CanonicalModelRequest,
+        allow_regeneration: bool = True,
+    ) -> CanonicalModelResult:
+        started = perf_counter()
+        try:
+            result = await self._generate_structured(
+                adapter_type=adapter_type,
+                base_url=base_url,
+                api_key=api_key,
+                request=request,
+                allow_regeneration=allow_regeneration,
+            )
+        except ModelGatewayError as exc:
+            await self._record_call(
+                request,
+                adapter_type=adapter_type,
+                latency_ms=(perf_counter() - started) * 1000,
+                status="error",
+                strategy=str(exc.diagnostics.get("structured_output_strategy", "unknown")),
+                provider_request_id=exc.diagnostics.get("provider_request_id"),
+                finish_reason=exc.diagnostics.get("finish_reason"),
+                usage=exc.usage,
+                error_code=exc.code,
+                detail_code=exc.detail_code,
+                diagnostics=exc.diagnostics,
+            )
+            raise
+        await self._record_call(
+            request,
+            adapter_type=adapter_type,
+            latency_ms=(perf_counter() - started) * 1000,
+            status="success",
+            strategy=result.capability_strategy.get("structured_output", "unknown"),
+            provider_request_id=result.provider_request_id,
+            finish_reason=result.finish_reason,
+            usage=result.usage,
+            diagnostics={"warnings": list(result.warnings)},
+        )
+        return result
+
+    async def _record_call(
+        self,
+        request: CanonicalModelRequest,
+        *,
+        adapter_type: AdapterType,
+        latency_ms: float,
+        status: str,
+        strategy: str,
+        provider_request_id: object,
+        finish_reason: object,
+        usage: TokenUsage | None,
+        error_code: str | None = None,
+        detail_code: str | None = None,
+        diagnostics: Mapping[str, object] | None = None,
+    ) -> None:
+        if self._call_recorder is None or not request.metadata.get("run_id"):
+            return
+        payload: dict[str, object] = {
+            "run_id": request.metadata["run_id"],
+            "node": request.metadata.get("node", request.role),
+            "adapter": adapter_type.value,
+            "model": request.model,
+            "strategy": strategy,
+            "provider_request_id": provider_request_id,
+            "context_manifest_id": str(request.context_manifest_id),
+            "finish_reason": finish_reason,
+            "status": status,
+            "usage": usage.model_dump(mode="json") if usage is not None else {},
+            "latency_ms": round(max(0.0, latency_ms)),
+            "retry_mode": request.metadata.get("retry_mode", "none"),
+            "error_code": error_code,
+            "detail_code": detail_code,
+            "diagnostics": dict(diagnostics or {}),
+        }
+        try:
+            await self._call_recorder(payload)
+        except Exception:
+            # Diagnostics must never turn a successful provider call into a failed
+            # research step.  The call itself remains observable in provider logs.
+            return
+
+    async def _generate_structured(
         self,
         *,
         adapter_type: AdapterType,

@@ -12,6 +12,8 @@ from app.infrastructure.db import analysis_models as _analysis_models
 from app.infrastructure.db import context_models as _context_models
 from app.infrastructure.db import evaluation_models as _evaluation_models
 from app.infrastructure.db import evidence_graph_models as _evidence_graph_models
+from app.infrastructure.db import llm_call_models as _llm_call_models
+from app.infrastructure.db import llm_capability_models as _llm_capability_models
 from app.infrastructure.db import memory_models as _memory_models
 from app.infrastructure.db import models as _profile_models
 from app.infrastructure.db import report_models as _report_models
@@ -31,6 +33,8 @@ _registered_model_modules = (
     _evaluation_models,
     _analysis_models,
     _context_models,
+    _llm_call_models,
+    _llm_capability_models,
     _memory_models,
     _retrieval_models,
     _report_models,

@@ -425,6 +425,67 @@ class ResearchRunRepository:
             )
             return True
 
+    async def reconcile_expired_leases(self, *, limit: int = 100) -> list[UUID]:
+        """Requeue runs whose worker lease expired without a terminal result.
+
+        The reconciler is deliberately idempotent: the row lock prevents two
+        reconcilers from creating duplicate resume dispatches, while the unique
+        dispatch key makes a retry safe after a process crash.
+        """
+
+        if limit < 1:
+            return []
+        recovered: list[UUID] = []
+        now = datetime.now(UTC)
+        async with self._sessions() as session, session.begin():
+            rows = (
+                await session.scalars(
+                    select(ResearchRunRow)
+                    .where(
+                        ResearchRunRow.status == RunStatus.RUNNING.value,
+                        ResearchRunRow.lease_until.is_not(None),
+                        ResearchRunRow.lease_until <= now,
+                    )
+                    .order_by(ResearchRunRow.lease_until)
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            for run in rows:
+                run.status = RunStatus.QUEUED.value
+                run.phase = RunPhase.INITIALIZING.value
+                run.termination_reason = "stale_worker_lease_recovered"
+                run.lease_owner = None
+                run.lease_until = None
+                run.worker_task_id = None
+                run.updated_at = now
+                run.state_version += 1
+                dispatch_key = f"{run.id}:reconcile:{run.state_version}"
+                session.add(
+                    TaskDispatchOutboxRow(
+                        id=uuid7(),
+                        run_id=run.id,
+                        dispatch_type="resume",
+                        dispatch_key=dispatch_key,
+                        payload_ref={"run_id": str(run.id), "reason": "stale_lease"},
+                        status="pending",
+                    )
+                )
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="run.requeued",
+                    public_summary="检测到过期 Worker 租约; 任务已重新排队等待 Checkpoint 恢复。",
+                    refs={
+                        "run_id": str(run.id),
+                        "reason": "stale_worker_lease_recovered",
+                        "dispatch_key": dispatch_key,
+                    },
+                    metrics=None,
+                )
+                recovered.append(run.id)
+        return recovered
+
     async def save_generated_plan(
         self,
         run_id: UUID,

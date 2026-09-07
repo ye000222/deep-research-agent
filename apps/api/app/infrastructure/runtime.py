@@ -9,6 +9,8 @@ from app.context.manager import ContextBudgetManager
 from app.core.config import Settings
 from app.core.readiness import ReadinessRegistry
 from app.infrastructure.checkpoints.lifecycle import CheckpointRuntime
+from app.infrastructure.db.llm_calls import LLMCallRepository
+from app.infrastructure.db.llm_capability_tests import LLMCapabilityTestRepository
 from app.infrastructure.db.postgres import PostgresRuntime
 from app.infrastructure.db.provider_profiles import ProviderProfileRepository
 from app.infrastructure.db.reports import ReportRepository
@@ -47,6 +49,7 @@ class ApplicationRuntime:
             profile_service = ProviderProfileService(
                 ProviderProfileRepository(business_db.session_factory),
                 cipher,
+                LLMCapabilityTestRepository(business_db.session_factory),
                 allow_insecure_endpoints=settings.allow_insecure_provider_endpoints,
             )
             client_sessions = ClientSessionManager(
@@ -65,6 +68,7 @@ class ApplicationRuntime:
             ContextBudgetManager(business_db.session_factory),
             ResearchMemoryManager(business_db.session_factory),
             controlled_tools,
+            LLMCallRepository(business_db.session_factory),
         )
         return cls(
             business_db=business_db,

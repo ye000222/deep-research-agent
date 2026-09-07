@@ -16,5 +16,15 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=("json",),
     timezone="UTC",
+    beat_schedule={
+        "reconcile-stale-runs": {
+            "task": "deep_research.reconcile_stale_runs",
+            "schedule": 60.0,
+        },
+        "memory-lifecycle": {
+            "task": "deep_research.memory_lifecycle",
+            "schedule": 900.0,
+        },
+    },
 )
 celery_app.autodiscover_tasks(("app.worker",), force=True)

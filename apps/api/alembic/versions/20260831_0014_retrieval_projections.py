@@ -13,6 +13,12 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # Retrieval indexes depend on extensions that must exist in every business
+    # database, including isolated upgrade-test databases.  Keep this idempotent
+    # so a deployment that provisions extensions during database initialization
+    # remains safe.
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    op.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
     op.create_table(
         "retrieval_config_versions",
         sa.Column("id", sa.Uuid(), nullable=False),
