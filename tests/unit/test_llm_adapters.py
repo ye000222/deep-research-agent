@@ -211,6 +211,35 @@ async def test_compatible_adapter_falls_back_when_json_mode_is_rejected() -> Non
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_deepseek_origin_retries_documented_v1_endpoint_on_connect_timeout() -> None:
+    origin = respx.post("https://api.deepseek.com/chat/completions").mock(
+        side_effect=httpx.ConnectTimeout("handshake timeout")
+    )
+    v1 = respx.post("https://api.deepseek.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "chat_v1_fallback",
+                "choices": [{"message": {"content": json.dumps(PLAN)}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 30},
+            },
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        result = await LLMGateway(client).generate_structured(
+            adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT,
+            base_url="https://api.deepseek.com",
+            api_key=SecretStr("compatible-secret"),
+            request=request(),
+        )
+
+    assert origin.called
+    assert v1.called
+    assert ResearchPlan.model_validate(result.parsed_object).goal == PLAN["goal"]
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_compatible_adapter_extracts_json_surrounded_by_explanation() -> None:
     respx.post("https://api.deepseek.com/chat/completions").mock(
         return_value=httpx.Response(

@@ -1430,3 +1430,27 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - 复查结果：过期 `running` 数量为 0；状态为 queued=45、failed=52、interrupted=51、completed_with_limitations=1。
 - 真实 Provider Smoke Test 尚未执行：本机没有可用 Provider API Key，不能用 synthetic key 代替真实测试。
 - `v1.1.0` Tag 尚不存在；必须完成真实 Smoke Test 后再创建 Tag/Release。
+
+六十八、DeepSeek 兼容端点超时修复（2026-09-07 12:12:22，Asia/Shanghai）
+
+- API 容器实测确认：`https://api.deepseek.com/chat/completions` 发生 `CONNECT_TIMEOUT`；带 `/v1` 的 `https://api.deepseek.com/v1/chat/completions` 可正常到达 Provider（无效占位 Key 返回快速 401）。
+- 已在 OpenAI-compatible Adapter 增加仅针对 `api.deepseek.com` origin 的 `/v1/chat/completions` 受限回退，并新增回退测试；不会为任意自定义 Base URL 静默猜测路径。
+- 前端已增加 DeepSeek Base URL `/v1` 提示。旧配置可直接重新测试，新配置建议填写 `https://api.deepseek.com/v1`。
+- 验证：LLM Adapter 单元测试 13 项通过、Ruff 通过、Web production build 通过。
+- 真实 Smoke Test 仍待用户使用有效 Key 和 Provider 当前支持的模型重试；未完成前不创建 `v1.1.0` Tag/Release。
+- 当前未完成的 S3-7：提交/推送 smoke-fix 分支、创建 PR、连续三次 GitHub CI 全绿、真实 Provider Smoke Test、无过期 running 任务复核、合并并发布 Tag/Release。
+
+六十九、DeepSeek 修复部署与分支推送（2026-09-07 12:19:11，Asia/Shanghai）
+
+- 修复提交 `fb3bd64` 已推送至 `origin/codex/v1.1-smoke-fix`；PR 创建入口为 `https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-smoke-fix`。
+- 运行状态复核：重启前 `running` 任务为 0；API/Worker 重启后均正常，`/healthz` 为 `ok`。
+- 当前已保存 API Key 没有被判定为无效：历史失败发生于 TLS 连接阶段，认证尚未执行。真实 Smoke Test 仍需页面重测并取得 `passed=true`。
+- `v1.1.0` 仍未创建；待 PR CI、真实 Smoke 和合并门禁通过后发布。
+
+七十、真实 Provider 连接 Smoke 通过（2026-09-07 16:52:53，Asia/Shanghai）
+
+- 原已保存 API Key 测试通过，持久化能力记录为 `passed=true`、`latency_ms=8689`，无 `error_code/detail_code`。
+- 模型：`deepseek-v4-flash`；Structured Output=`emulated/json_mode`；Usage=`exact`；Tool Calling=`unknown`。
+- Tool Calling 未探测不构成阻塞：兼容模型通过 AgentDecision JSON 进入确定性 Tool Policy，模型不能直接执行 Tool。
+- 过期 `running` 任务复核为 0；修复分支远端提交为 `4b32af4`。
+- 当前 S3-7 剩余：创建/检查修复 PR、CI 门禁、一个最小端到端研究 Smoke、合并到 `main`、创建并发布 `v1.1.0` Tag/Release。
