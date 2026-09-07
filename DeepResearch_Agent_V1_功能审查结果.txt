@@ -1446,3 +1446,11 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - 运行状态复核：重启前 `running` 任务为 0；API/Worker 重启后均正常，`/healthz` 为 `ok`。
 - 当前已保存 API Key 没有被判定为无效：历史失败发生于 TLS 连接阶段，认证尚未执行。真实 Smoke Test 仍需页面重测并取得 `passed=true`。
 - `v1.1.0` 仍未创建；待 PR CI、真实 Smoke 和合并门禁通过后发布。
+
+七十、真实 Provider 连接 Smoke 通过（2026-09-07 16:52:53，Asia/Shanghai）
+
+- 原已保存 API Key 测试通过，持久化能力记录为 `passed=true`、`latency_ms=8689`，无 `error_code/detail_code`。
+- 模型：`deepseek-v4-flash`；Structured Output=`emulated/json_mode`；Usage=`exact`；Tool Calling=`unknown`。
+- Tool Calling 未探测不构成阻塞：兼容模型通过 AgentDecision JSON 进入确定性 Tool Policy，模型不能直接执行 Tool。
+- 过期 `running` 任务复核为 0；修复分支远端提交为 `4b32af4`。
+- 当前 S3-7 剩余：创建/检查修复 PR、CI 门禁、一个最小端到端研究 Smoke、合并到 `main`、创建并发布 `v1.1.0` Tag/Release。

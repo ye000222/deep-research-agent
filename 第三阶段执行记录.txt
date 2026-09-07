@@ -177,3 +177,12 @@ Deep Research Agent V1.1 第三阶段执行记录
 - API 与 Worker 已重启并加载修复；API `/healthz` 返回 `status=ok`，两个容器均正常运行。
 - Pull Request 尚待在 GitHub 创建：`https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-smoke-fix`。
 - 下一项是用原已保存 Key 重新执行连接测试。若仍失败，应按新的错误码区分模型名、认证、限流或 Provider 服务错误；不能再把 `CONNECT_TIMEOUT` 直接归因于 Key。
+
+### 2026-09-07 16:52:53：真实 Provider 连接 Smoke 通过
+
+- 用户使用原已保存 API Key 重新测试成功；数据库脱敏记录确认 `passed=true`、延迟 `8689ms`、错误码为空。
+- 实际模型为 `deepseek-v4-flash`；Structured Output=`emulated`，选中策略=`json_mode`，Usage Reporting=`exact`。
+- Tool Calling=`unknown` 不阻塞本项目：OpenAI-compatible 路径允许通过受 Schema 校验的 AgentDecision JSON 和确定性 Tool Policy 执行工具。
+- 复核过期 `running` 任务数量为 0。
+- 远端分支 `origin/codex/v1.1-smoke-fix` 已确认指向 `4b32af4`；`v1.1.0` Tag 继续保持未创建，等待修复 PR 的 CI 与合并。
+- 本次通过的是真实 Provider 连接/结构化输出 Smoke；发布前仍建议完成一个最小端到端研究 Run，确认搜索、证据、报告与引用链。
