@@ -186,3 +186,12 @@ Deep Research Agent V1.1 第三阶段执行记录
 - 复核过期 `running` 任务数量为 0。
 - 远端分支 `origin/codex/v1.1-smoke-fix` 已确认指向 `4b32af4`；`v1.1.0` Tag 继续保持未创建，等待修复 PR 的 CI 与合并。
 - 本次通过的是真实 Provider 连接/结构化输出 Smoke；发布前仍建议完成一个最小端到端研究 Run，确认搜索、证据、报告与引用链。
+
+### 2026-09-07 17:40:55：PR #6 合并与远端 CI 审查通过
+
+- GitHub 公开状态确认 PR #6 `Codex/v1.1 smoke fix` 已于 2026-09-07 17:12:59（Asia/Shanghai）合并到 `main`。
+- PR Head 为 `739f7d09e9ed3ffcf35fcb5d4bbe7105a0695181`，Merge Commit 为 `0d5e99f16721622e4087dc7a4b0e94c6351fe792`。
+- 对应 Actions Run `34104359287` 的五个 Job 均为成功：PostgreSQL integration、api、web、compose、Strict V1 release gate。
+- 本地 `main` 已 `pull --ff-only` 快进到 `0d5e99f`，与 `origin/main` 一致，工作区无未提交修改。
+- 复核过期 `running` 任务为 0；真实 Provider 连接/结构化输出 Smoke 已通过。
+- GitHub Tags 与 Releases 页面均未发现 `v1.1.0`。当前唯一发布阻塞项是：完成一个最小端到端研究 Smoke（建议门禁），然后创建并发布 `v1.1.0` Tag/Release。

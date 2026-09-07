@@ -1454,3 +1454,12 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - Tool Calling 未探测不构成阻塞：兼容模型通过 AgentDecision JSON 进入确定性 Tool Policy，模型不能直接执行 Tool。
 - 过期 `running` 任务复核为 0；修复分支远端提交为 `4b32af4`。
 - 当前 S3-7 剩余：创建/检查修复 PR、CI 门禁、一个最小端到端研究 Smoke、合并到 `main`、创建并发布 `v1.1.0` Tag/Release。
+
+七十一、PR #6 合并与 CI 最终审查（2026-09-07 17:40:55，Asia/Shanghai）
+
+- PR #6 已合并：Head `739f7d09e9ed3ffcf35fcb5d4bbe7105a0695181`，Merge Commit `0d5e99f16721622e4087dc7a4b0e94c6351fe792`。
+- 本次 PR 对应 GitHub Actions Run `34104359287` 五项全部成功：PostgreSQL integration、api、web、compose、Strict V1 release gate。
+- 本地与远端 `main` 已同步到 `0d5e99f`，工作区干净；过期 `running` 任务为 0。
+- 真实 Provider Connection/Structured Output Smoke 已通过，结果为 8689ms、`emulated/json_mode`、Usage exact。
+- `v1.1.0` Git Tag 和 GitHub Release 尚不存在，因此 S3-7 仍不能标记完全完成。
+- 推荐剩余顺序：运行一个最小端到端研究 Smoke，确认 Evidence/Citation/Report 链后创建 annotated Tag `v1.1.0` 并发布 GitHub Release。
