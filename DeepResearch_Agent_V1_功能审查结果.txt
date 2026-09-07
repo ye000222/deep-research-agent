@@ -1439,3 +1439,10 @@ V1 可提交 GitHub 并进行本地演示；未完成项已明确归入 V1.1/V2�
 - 验证：LLM Adapter 单元测试 13 项通过、Ruff 通过、Web production build 通过。
 - 真实 Smoke Test 仍待用户使用有效 Key 和 Provider 当前支持的模型重试；未完成前不创建 `v1.1.0` Tag/Release。
 - 当前未完成的 S3-7：提交/推送 smoke-fix 分支、创建 PR、连续三次 GitHub CI 全绿、真实 Provider Smoke Test、无过期 running 任务复核、合并并发布 Tag/Release。
+
+六十九、DeepSeek 修复部署与分支推送（2026-09-07 12:19:11，Asia/Shanghai）
+
+- 修复提交 `fb3bd64` 已推送至 `origin/codex/v1.1-smoke-fix`；PR 创建入口为 `https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-smoke-fix`。
+- 运行状态复核：重启前 `running` 任务为 0；API/Worker 重启后均正常，`/healthz` 为 `ok`。
+- 当前已保存 API Key 没有被判定为无效：历史失败发生于 TLS 连接阶段，认证尚未执行。真实 Smoke Test 仍需页面重测并取得 `passed=true`。
+- `v1.1.0` 仍未创建；待 PR CI、真实 Smoke 和合并门禁通过后发布。

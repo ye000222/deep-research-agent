@@ -169,3 +169,11 @@ Deep Research Agent V1.1 第三阶段执行记录
 - 新增连接超时回退单元测试；LLM Adapter 测试 13 项通过，Ruff 通过，Web production build 通过。
 - 真实 Provider Smoke Test 尚未完成：仍需使用有效的 DeepSeek Key 和可用模型（例如以 Provider 当前支持列表为准）从页面重新测试；不得在聊天或日志中粘贴 Key。
 - 当前分支为 `codex/v1.1-smoke-fix`，尚未提交、推送或创建 PR；`v1.1.0` Tag/Release 继续保持未创建状态。
+
+### 2026-09-07 12:19:11：修复加载与运行状态复核
+
+- 修复已提交为 `fb3bd64 fix: recover DeepSeek compatible endpoint timeout`，并推送到远端分支 `codex/v1.1-smoke-fix`。
+- 重启前检查 `research_runs.status='running'` 数量为 0；不存在正在执行的任务被重启中断。
+- API 与 Worker 已重启并加载修复；API `/healthz` 返回 `status=ok`，两个容器均正常运行。
+- Pull Request 尚待在 GitHub 创建：`https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-smoke-fix`。
+- 下一项是用原已保存 Key 重新执行连接测试。若仍失败，应按新的错误码区分模型名、认证、限流或 Provider 服务错误；不能再把 `CONNECT_TIMEOUT` 直接归因于 Key。
