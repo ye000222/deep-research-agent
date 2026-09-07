@@ -7,7 +7,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from time import perf_counter
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import SecretStr
@@ -421,14 +421,48 @@ class LLMGateway:
         url = _endpoint(base_url, "chat/completions")
         headers = {"Authorization": f"Bearer {api_key.get_secret_value()}"}
         if force_prompt_json:
-            return await self._post_json(url, headers=headers, body=body), False
+            return await self._post_compatible_json(
+                base_url, url, headers=headers, body=body
+            ), False
         try:
-            return await self._post_json(url, headers=headers, body=body), True
+            return await self._post_compatible_json(
+                base_url, url, headers=headers, body=body
+            ), True
         except ModelGatewayError as exc:
             if exc.code != "MODEL_REQUEST_INVALID":
                 raise
         body.pop("response_format")
-        return await self._post_json(url, headers=headers, body=body), False
+        return await self._post_compatible_json(
+            base_url, url, headers=headers, body=body
+        ), False
+
+    async def _post_compatible_json(
+        self,
+        base_url: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Post to a compatible endpoint with a bounded provider path fallback.
+
+        DeepSeek documents its OpenAI-compatible endpoint under ``/v1`` while
+        users commonly paste the origin (``https://api.deepseek.com``).  The
+        origin path can hang during TLS negotiation instead of returning a
+        useful 404, so retry that one known canonical path on a connect timeout.
+        We do not guess paths for arbitrary compatible providers.
+        """
+        try:
+            return await self._post_json(url, headers=headers, body=body)
+        except ModelGatewayError as exc:
+            fallback = _compatible_v1_fallback(base_url, url)
+            if (
+                fallback is None
+                or exc.code != "MODEL_TIMEOUT"
+                or exc.detail_code != "CONNECT_TIMEOUT"
+            ):
+                raise
+            return await self._post_json(fallback, headers=headers, body=body)
 
     async def _post_json(
         self,
@@ -492,6 +526,14 @@ def _request_error_detail(exc: httpx.RequestError) -> str:
 
 def _endpoint(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _compatible_v1_fallback(base_url: str, attempted_url: str) -> str | None:
+    parsed = urlsplit(base_url.strip())
+    if parsed.hostname != "api.deepseek.com" or parsed.path.rstrip("/"):
+        return None
+    attempted = urlsplit(attempted_url)
+    return f"{attempted.scheme}://{attempted.netloc}/v1/chat/completions"
 
 
 def _content_text(request: CanonicalModelRequest) -> str:

@@ -159,3 +159,13 @@ Deep Research Agent V1.1 第三阶段执行记录
 - 复查结果：过期 `running` 数量为 0；状态汇总为 queued=45、failed=52、interrupted=51、completed_with_limitations=1。
 - 真实 Provider Smoke Test 尚未执行：本机未检测到任何 Provider API Key，且不能用 synthetic key 冒充真实验证。
 - `v1.1.0` Tag 尚不存在，必须在真实 Smoke Test 和远端发布门禁完成后创建。
+
+### 2026-09-07 12:12:22：真实 Provider Smoke Test 前置连接修复
+
+- 从 API 容器验证：`https://api.deepseek.com/chat/completions` 在连接阶段超时，而官方兼容端点 `https://api.deepseek.com/v1/chat/completions` 可快速返回认证响应。
+- 根因是用户配置了 DeepSeek origin Base URL，缺少 `/v1` 路径；这不是 API Key 泄漏或数据库故障。
+- OpenAI-compatible Adapter 增加受限回退：仅当 Host 为 `api.deepseek.com`、路径为空且首请求为 `CONNECT_TIMEOUT` 时，自动尝试 `/v1/chat/completions`；不对任意自定义 Provider 猜测路径。
+- Provider 配置页面增加 DeepSeek `/v1` 填写提示；已保存的旧配置无需重新录入即可通过后端回退。
+- 新增连接超时回退单元测试；LLM Adapter 测试 13 项通过，Ruff 通过，Web production build 通过。
+- 真实 Provider Smoke Test 尚未完成：仍需使用有效的 DeepSeek Key 和可用模型（例如以 Provider 当前支持列表为准）从页面重新测试；不得在聊天或日志中粘贴 Key。
+- 当前分支为 `codex/v1.1-smoke-fix`，尚未提交、推送或创建 PR；`v1.1.0` Tag/Release 继续保持未创建状态。

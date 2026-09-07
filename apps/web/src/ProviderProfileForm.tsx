@@ -253,6 +253,9 @@ export function ProviderProfileForm({onStatusChange}: Props) {
       <label className="wide-field">
         <span>Base URL</span>
         <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
+        {adapterType === "openai_compatible_chat" && (
+          <small>DeepSeek 官方地址建议填写 https://api.deepseek.com/v1；留空路径时后端会自动尝试该兼容端点。</small>
+        )}
       </label>
       <label>
         <span>模型名称</span>
