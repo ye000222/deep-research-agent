@@ -150,3 +150,12 @@ Deep Research Agent V1.1 第三阶段执行记录
 - Pull Request 地址：`https://github.com/ye000222/deep-research-agent/pull/new/codex/v1.1-stability`。
 - `build/` 仍为本地未跟踪构建目录，未加入提交。
 - 下一步外部门禁：创建 PR、等待连续三次 GitHub CI 全绿；随后执行真实 Provider Smoke Test，确认无过期 running 任务，再创建 `v1.1.0` Tag/Release。
+
+### 2026-09-07 11:33:41：PR 合并与过期任务清理核验
+
+- 已确认 PR #5 已合并到 `origin/main`，合并提交为 `a706fcd5a862160e8458648cefd557d3542875c2`。
+- 本地 `main` 已快进到该合并提交；当前发布基线不再是旧的 `6566312`。
+- 初次只读检查发现 2 个已过期 `running` 任务；使用项目内置 Stale-Run Reconciler 恢复为 `queued`，写入 Resume Outbox 和 `run.requeued` 事件。
+- 复查结果：过期 `running` 数量为 0；状态汇总为 queued=45、failed=52、interrupted=51、completed_with_limitations=1。
+- 真实 Provider Smoke Test 尚未执行：本机未检测到任何 Provider API Key，且不能用 synthetic key 冒充真实验证。
+- `v1.1.0` Tag 尚不存在，必须在真实 Smoke Test 和远端发布门禁完成后创建。
