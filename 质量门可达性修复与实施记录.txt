@@ -1,0 +1,27 @@
+# 质量门可达性修复与实施记录
+
+日期：2026-09-11
+阶段：1 / 4
+
+## 问题
+
+最近任务即使 Coverage 达到 100%，仍持续显示 `completed_with_limitations`。根因是普通 `.com` 来源固定评分 0.72，而质量门要求 0.75；交叉验证又按模型生成的 `claim_id` 统计，跨来源的同一事实只要措辞不同就永远不会合并。
+
+## 实施
+
+1. `source_reliability` 增加低质量镜像域名、可信工业厂商主域名、政府/教育/组织域名分层。
+2. 未知 `.com` 保持 0.74，不能单独通过质量门；可信厂商官网评分 0.86；CSDN/文库镜像评分 0.55。
+3. 交叉验证改为按高风险验收维度统计独立来源数量；普通一来源维度不再被错误纳入双来源分母。
+4. 新增来源评分单元测试。
+
+## 验证
+
+执行：
+
+`.venv\\Scripts\\python.exe -m pytest tests/unit/test_source_reliability.py tests/unit/test_evidence_graph_relations.py tests/unit/test_research_budget.py -q`
+
+结果：19 passed。
+
+## 后续
+
+仍需完成语义 Claim 合并、Token/Writer 预算闭环和 Worker 队列治理；本阶段不会直接把未解决的研究缺口标记为成功。

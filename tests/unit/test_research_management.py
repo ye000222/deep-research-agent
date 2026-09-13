@@ -1,4 +1,9 @@
-from app.domain.research_management import ResearchFactCounts, calculate_information_gain
+import pytest
+from app.domain.research_management import (
+    ResearchFactCounts,
+    allocate_budget_shares,
+    calculate_information_gain,
+)
 
 
 def _facts(
@@ -16,6 +21,53 @@ def _facts(
         evidence_candidates=candidates,
         coverage=coverage,
     )
+
+
+def test_budget_shares_are_deterministic_and_sum_to_iteration_limit() -> None:
+    allocation = allocate_budget_shares(
+        max_iterations=20,
+        max_searches=20,
+        max_pages=30,
+        max_tokens=100_000,
+    )
+    display = allocation["derived_display"]
+    assert isinstance(display, dict)
+    assert display["research_iterations"] + display["report_iterations"] + display[
+        "validation_iterations"
+    ] == 20
+    assert display["writer_tokens"] == 10_000
+    assert (
+        allocation["planner_tokens"]
+        + allocation["research_tokens"]
+        + allocation["verification_tokens"]
+        + allocation["writer_tokens_initial"]
+        + allocation["safety_tokens"]
+        == 100_000
+    )
+    assert "research_searches" not in allocation
+    assert "report_pages" not in allocation
+    limits = allocation["executable_resource_limits"]
+    assert isinstance(limits, dict)
+    assert limits == {
+        "logical_queries": 20,
+        "provider_requests": 20,
+        "pages_fetched": 30,
+        "pages_extracted": 30,
+        "extraction_calls": 30,
+        "verification_calls": 2,
+        "scheduler_actions": 20,
+        "productive_iterations": 20,
+    }
+
+
+def test_budget_shares_reject_negative_limits() -> None:
+    with pytest.raises(ValueError):
+        allocate_budget_shares(
+            max_iterations=-1,
+            max_searches=1,
+            max_pages=1,
+            max_tokens=1,
+        )
 
 
 def test_information_gain_rewards_new_independent_knowledge() -> None:

@@ -81,10 +81,25 @@ python scripts/release_gate.py --skip-compose --report-path artifacts/release_ga
 ```powershell
 .\scripts\start.ps1 -NoBrowser   # 不自动打开浏览器
 .\scripts\start.ps1 -NoBuild     # 跳过镜像构建，仅启动已有镜像
+.\scripts\start.ps1 -DockerContext my-linux-engine -NoBrowser  # 使用独立 Docker 引擎，不依赖 Docker Desktop
 .\scripts\stop.ps1               # 停止全部服务（保留数据）
 .\scripts\stop.ps1 -Data         # 停止并删除全部数据卷（不可恢复）
 .\scripts\status.ps1             # 查看服务运行状态
 ```
+
+命令行 Docker 本身只是客户端，仍需要一个可访问的 Docker 引擎。项目不再把 Docker Desktop
+作为唯一引擎：可以先设置 `DOCKER_HOST`，或创建/选择一个连接到 WSL2、远程 Linux、Podman
+兼容引擎的 Docker context，再启动项目：
+
+```powershell
+docker context ls
+$env:DOCKER_CONTEXT = "my-linux-engine"
+.\scripts\start.ps1 -NoBrowser -NoAutoStartDockerDesktop
+```
+
+当指定了 `-DockerContext`、`DOCKER_CONTEXT` 或 `DOCKER_HOST` 时，启动脚本不会尝试拉起
+Docker Desktop；如果该引擎不可用，会直接提示当前连接信息和诊断命令。若未指定替代引擎，
+脚本仍保留原有的 Docker Desktop 自动启动行为。
 
 若 PowerShell 执行策略禁止运行脚本，可先执行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`，或直接使用 `start.bat`。
 

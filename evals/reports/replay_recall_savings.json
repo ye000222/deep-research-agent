@@ -1,0 +1,313 @@
+{
+  "mode": "replay (deterministic, fixed pages, no provider/network)",
+  "policy": "relevant_block_selector vs first-14k-prefix baseline",
+  "case_count": 30,
+  "key_evidence_present_beyond_prefix": 30,
+  "key_evidence_recovered_by_selector": 30,
+  "baseline_evidence_hit_cases": 0,
+  "candidate_evidence_hit_cases": 30,
+  "avg_input_savings_pct": 32.4,
+  "cases": [
+    {
+      "case_id": "replay_01",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9460,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_02",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9477,
+      "input_savings_pct": 32.3,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_03",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9445,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_04",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9459,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_05",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9469,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_06",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9467,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_07",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9447,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_08",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9447,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_09",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9457,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_10",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9471,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_11",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9469,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_12",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9468,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_13",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9474,
+      "input_savings_pct": 32.3,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_14",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9472,
+      "input_savings_pct": 32.3,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_15",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9478,
+      "input_savings_pct": 32.3,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_16",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9464,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_17",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9448,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_18",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9463,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_19",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9431,
+      "input_savings_pct": 32.6,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_20",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9459,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_21",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9477,
+      "input_savings_pct": 32.3,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_22",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9480,
+      "input_savings_pct": 32.3,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_23",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9426,
+      "input_savings_pct": 32.7,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_24",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9453,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_25",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9467,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_26",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9444,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_27",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9445,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_28",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9464,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_29",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9467,
+      "input_savings_pct": 32.4,
+      "candidate_covers_evidence": true
+    },
+    {
+      "case_id": "replay_30",
+      "evidence_present_in_prefix": false,
+      "baseline_recall": 0.0,
+      "candidate_recall": 1.0,
+      "baseline_input_chars": 14000,
+      "candidate_input_chars": 9452,
+      "input_savings_pct": 32.5,
+      "candidate_covers_evidence": true
+    }
+  ],
+  "caveat": "Deterministic recall/savings only. NOT real-model accuracy, 429 rate, or real-internet p95; those require real Provider + network + cost approval."
+}

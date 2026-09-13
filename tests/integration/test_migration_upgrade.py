@@ -41,16 +41,12 @@ def test_clean_database_upgrades_to_current_head() -> None:
 
     with psycopg.connect(admin_dsn, autocommit=True) as admin:
         admin.execute(
-            psycopg.sql.SQL("CREATE DATABASE {}").format(
-                psycopg.sql.Identifier(database_name)
-            )
+            psycopg.sql.SQL("CREATE DATABASE {}").format(psycopg.sql.Identifier(database_name))
         )
 
     try:
         environment = os.environ.copy()
-        environment["DATABASE_URL"] = target_sqlalchemy_url.render_as_string(
-            hide_password=False
-        )
+        environment["DATABASE_URL"] = target_sqlalchemy_url.render_as_string(hide_password=False)
         completed = subprocess.run(
             [sys.executable, "-m", "alembic", "upgrade", "head"],
             cwd=ROOT,
@@ -61,15 +57,13 @@ def test_clean_database_upgrades_to_current_head() -> None:
             check=False,
         )
         assert completed.returncode == 0, (
-            "Alembic upgrade failed:\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
+            f"Alembic upgrade failed:\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
         )
 
         with psycopg.connect(target_dsn) as target:
             revision = target.execute("SELECT version_num FROM alembic_version").fetchone()
         assert revision is not None
-        assert revision[0] == "20260906_0019"
+        assert revision[0] == "20260912_0023"
     finally:
         with psycopg.connect(admin_dsn, autocommit=True) as admin:
             admin.execute(

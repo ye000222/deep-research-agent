@@ -63,3 +63,37 @@ def test_connection_test_rejects_non_https_endpoint() -> None:
 
     assert response.status_code == 422
     assert response.json()["detail"]["error_code"] == "INVALID_BASE_URL"
+
+
+def test_connection_test_rejects_private_https_endpoint() -> None:
+    settings = Settings(app_env="test", external_probes_enabled=False)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/llm/providers/connections/test",
+            json={
+                "adapter_type": "openai_responses",
+                "base_url": "https://127.0.0.1/v1",
+                "model": "probe-model",
+                "api_key": "secret-probe-key",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error_code"] == "INVALID_BASE_URL"
+
+
+def test_connection_test_rejects_internal_hostname() -> None:
+    settings = Settings(app_env="test", external_probes_enabled=False)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/llm/providers/connections/test",
+            json={
+                "adapter_type": "openai_responses",
+                "base_url": "https://service.internal/v1",
+                "model": "probe-model",
+                "api_key": "secret-probe-key",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error_code"] == "INVALID_BASE_URL"

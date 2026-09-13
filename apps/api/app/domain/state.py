@@ -160,7 +160,14 @@ class NextAction(BaseModel):
 class BudgetLimits(BaseModel):
     max_iterations: int = Field(default=8, ge=1)
     max_searches: int = Field(default=15, ge=0)
+    max_logical_queries: int = Field(default=15, ge=0)
+    max_provider_requests: int = Field(default=30, ge=0)
     max_pages: int = Field(default=30, ge=0)
+    max_pages_fetched: int = Field(default=30, ge=0)
+    max_pages_extracted: int = Field(default=15, ge=0)
+    max_extraction_calls: int = Field(default=15, ge=0)
+    max_verification_calls: int = Field(default=5, ge=0)
+    max_scheduler_actions: int = Field(default=60, ge=0)
     max_model_tokens: int = Field(default=100_000, ge=1)
     max_wall_clock_seconds: int = Field(default=720, ge=1)
 
@@ -168,8 +175,18 @@ class BudgetLimits(BaseModel):
 class BudgetUsage(BaseModel):
     iterations: int = Field(default=0, ge=0)
     searches: int = Field(default=0, ge=0)
+    logical_queries: int = Field(default=0, ge=0)
+    search_provider_requests: int = Field(default=0, ge=0)
     pages: int = Field(default=0, ge=0)
+    pages_fetched: int = Field(default=0, ge=0)
+    pages_extracted: int = Field(default=0, ge=0)
+    extraction_calls: int = Field(default=0, ge=0)
+    verification_calls: int = Field(default=0, ge=0)
+    scheduler_actions: int = Field(default=0, ge=0)
+    productive_iterations: int = Field(default=0, ge=0)
+    technical_retries: int = Field(default=0, ge=0)
     model_tokens: int = Field(default=0, ge=0)
+    model_budget_guarded: bool = False
 
 
 class QualitySnapshot(BaseModel):
@@ -248,9 +265,25 @@ class ResearchState(BaseModel):
             raise ValueError("iteration budget exceeded")
         if self.budget_usage.searches > self.budget_limits.max_searches:
             raise ValueError("search budget exceeded")
-        if self.budget_usage.pages > self.budget_limits.max_pages:
+        page_overrun_is_terminal = (
+            self.status is RunStatus.FAILED and self.stop_reason is StopReason.BUDGET_EXHAUSTED
+        )
+        if self.budget_usage.pages > self.budget_limits.max_pages and not page_overrun_is_terminal:
             raise ValueError("page budget exceeded")
-        if self.budget_usage.model_tokens > self.budget_limits.max_model_tokens:
+        # Provider usage is known only after an in-flight model call returns. A
+        # bounded final call may therefore report a small overrun. Preserve that
+        # truthful terminal/writing snapshot; pre-call Budget Policy is
+        # responsible for preventing any subsequent model invocation.
+        model_overrun_is_terminal = self.phase in {
+            ResearchPhase.WRITE,
+            ResearchPhase.VERIFY,
+            ResearchPhase.FINALIZE,
+        }
+        if (
+            self.budget_usage.model_tokens > self.budget_limits.max_model_tokens
+            and not model_overrun_is_terminal
+            and not self.budget_usage.model_budget_guarded
+        ):
             raise ValueError("model token budget exceeded")
         return self
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -36,10 +38,12 @@ PLANNER_INSTRUCTIONS = """你是 DeepResearch Agent 的 Research Planner。
 只负责把研究目标拆成 5 到 8 个可验证、尽量互斥且共同完备的研究问题。
 严格控制长度: scope_summary 最多 160 字; question 最多 120 字; rationale 最多 80 字;
 evidence_requirements 每题 1 到 2 条且每条最多 60 字;
-search_hints 每题 1 到 2 条且每条最多 80 字;
+ search_hints 每题 1 到 2 条且每条最多 80 字; 必须保留该问题的专有主题词,
+ 技术问题优先给一条中文检索词和一条英文检索词; 不要填“官方、论文、权威来源”等通用来源词;
 completion_criteria 2 到 4 条且每条最多 60 字。
 不要输出 goal 或 question id; 它们由服务端从不可变任务配置生成。
 每个证据要求必须可由网页原文直接核验。
+涉及市场规模、占比、增长率、预测或未来趋势的要求, 必须明确写出“至少两个独立来源”。
 Priority 1 只分配给直接回答研究目标所必需的定义、核心技术路线和关键事实;
 厂商罗列、趋势和扩展案例通常为 Priority 2 或 3。
 不要把五个行业、全部厂商、市场规模和未来趋势合并为一个无法在两次检索内完成的宽泛问题。
@@ -56,8 +60,9 @@ COMPACT_PLANNER_INSTRUCTIONS = """你是 DeepResearch Agent 的 Compact Research
 - question 最多 100 字;
 - rationale 最多 50 字;
 - evidence_requirements 每题恰好 1 条, 最多 50 字;
-- search_hints 每题最多 1 条, 最多 50 字;
+- search_hints 每题最多 1 条, 最多 50 字, 必须包含问题的专有主题词而非通用来源词;
 - completion_criteria 恰好 2 条, 每条最多 60 字。
+涉及市场、数值或预测的要求必须写明至少两个独立来源。
 不要输出 goal 或 question id; 服务端会补齐。
 禁止解释、背景介绍、重复目标和额外字段。只返回满足 Schema 的 JSON 对象。"""
 
@@ -76,17 +81,20 @@ class PlannerService:
         cipher: SecretCipher,
         gateway: LLMGateway,
         contexts: ContextBudgetManager | None = None,
+        budget_repository: Any | None = None,
     ) -> None:
         self._bindings = bindings
         self._cipher = cipher
         self._gateway = gateway
         self._contexts = contexts
+        self._budget_repository = budget_repository
 
     async def generate(
         self,
         run_id: UUID,
         *,
         memory_leads: tuple[MemoryItemView, ...] = (),
+        worker_task_id: str | None = None,
     ) -> tuple[ResearchPlan, TokenUsage]:
         binding = await self._bindings.get(run_id)
         api_key = self._cipher.decrypt(
@@ -124,6 +132,44 @@ class PlannerService:
             _PLANNER_OUTPUT_TOKENS,
             binding.max_output_tokens or _PLANNER_OUTPUT_TOKENS,
         )
+        reservation = None
+        reservation_id = uuid4()
+        if worker_task_id is not None and self._budget_repository is not None:
+            reservation = await self._budget_repository.reserve_model_tokens(
+                run_id,
+                worker_task_id=worker_task_id,
+                question_id="__planner__",
+                node="planner",
+                attempt_id=reservation_id,
+                estimated_input=1_500,
+                max_output=output_tokens,
+            )
+            if not reservation.granted:
+                raise ModelGatewayError(
+                    "PLANNER_BUDGET_EXHAUSTED",
+                    retryable=False,
+                    detail_code=reservation.reason or reservation.status,
+                )
+
+        async def settle_planner(usage: TokenUsage) -> None:
+            budget_repository = self._budget_repository
+            if reservation is not None and budget_repository is not None:
+                await budget_repository.settle_model_reservation(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                    attempt_id=reservation_id,
+                    actual_total=usage.total_tokens,
+                    usage_estimated=usage.accuracy != UsageAccuracy.EXACT,
+                )
+
+        async def release_planner() -> None:
+            budget_repository = self._budget_repository
+            if reservation is not None and budget_repository is not None:
+                await budget_repository.release_model_reservation(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                    attempt_id=reservation_id,
+                )
         manifest_id = uuid4()
         model_context = task_brief
         if self._contexts is not None:
@@ -181,7 +227,7 @@ class PlannerService:
             response_contract=ResearchPlanDraft.model_json_schema(),
             # Planning is a control-plane operation. Prefer deterministic output
             # over creative variation so compatible Prompt JSON paths are stable.
-            generation_parameters={"temperature": 0.0},
+            generation_parameters={"temperature": 0.0, "reasoning_enabled": False},
             max_output_tokens=output_tokens,
             context_manifest_id=manifest_id,
             metadata={
@@ -192,7 +238,9 @@ class PlannerService:
         )
         first_error: ModelGatewayError | None = None
         try:
-            result = await self._gateway.generate_structured(
+            result = await self._generate_structured_with_deadline(
+                run_id,
+                worker_task_id,
                 adapter_type=binding.adapter_type,
                 base_url=binding.base_url,
                 api_key=api_key,
@@ -201,6 +249,7 @@ class PlannerService:
             )
         except ModelGatewayError as exc:
             if exc.code not in _PLANNER_RETRYABLE_OUTPUT_ERRORS:
+                await release_planner()
                 raise
             first_error = exc
         else:
@@ -224,18 +273,25 @@ class PlannerService:
                     ),
                 )
             else:
+                await settle_planner(result.usage)
                 return materialize_research_plan(binding.goal, draft), result.usage
 
         if first_error is None:  # pragma: no cover - defensive state guard
             raise ModelGatewayError("MODEL_OUTPUT_SCHEMA_INVALID", retryable=False)
-        compact_request = await self._build_compact_request(
-            run_id=run_id,
-            binding=binding,
-            task_brief=task_brief,
-            first_error=first_error,
-        )
         try:
-            compact_result = await self._gateway.generate_structured(
+            compact_request = await self._build_compact_request(
+                run_id=run_id,
+                binding=binding,
+                task_brief=task_brief,
+                first_error=first_error,
+            )
+        except Exception:
+            await release_planner()
+            raise
+        try:
+            compact_result = await self._generate_structured_with_deadline(
+                run_id,
+                worker_task_id,
                 adapter_type=binding.adapter_type,
                 base_url=binding.base_url,
                 api_key=api_key,
@@ -243,6 +299,13 @@ class PlannerService:
                 allow_regeneration=False,
             )
         except ModelGatewayError as exc:
+            budget_repository = self._budget_repository
+            if reservation is not None and budget_repository is not None:
+                await budget_repository.mark_model_reservation_uncertain(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                    attempt_id=reservation_id,
+                )
             raise _planner_retry_error(exc, first_error=first_error) from exc
 
         usage = _combine_optional_usage(first_error.usage, compact_result.usage)
@@ -254,11 +317,12 @@ class PlannerService:
                 )
             )
         except ValidationError as exc:
+            await settle_planner(usage)
             schema_error = ModelGatewayError(
                 "MODEL_OUTPUT_SCHEMA_INVALID",
                 retryable=False,
                 detail_code=_schema_failure_detail(compact_result, exc),
-                usage=usage,
+                usage=compact_result.usage,
                 diagnostics=_result_diagnostics(
                     compact_result,
                     max_output_tokens=compact_request.max_output_tokens,
@@ -266,7 +330,34 @@ class PlannerService:
                 ),
             )
             raise _planner_retry_error(schema_error, first_error=first_error) from exc
+        await settle_planner(usage)
         return materialize_research_plan(binding.goal, compact_draft), usage
+
+    async def _generate_structured_with_deadline(
+        self,
+        run_id: UUID,
+        worker_task_id: str | None,
+        **kwargs: Any,
+    ) -> CanonicalModelResult:
+        remaining: float | None = None
+        budget_repository = self._budget_repository
+        deadline_reader = (
+            getattr(budget_repository, "deadline_remaining_seconds", None)
+            if budget_repository is not None
+            else None
+        )
+        if worker_task_id is not None and callable(deadline_reader):
+            remaining = await deadline_reader(
+                run_id,
+                worker_task_id=worker_task_id,
+            )
+        if remaining is not None and remaining <= 0:
+            raise ModelGatewayError("DEADLINE_EXHAUSTED", retryable=False)
+        try:
+            call = self._gateway.generate_structured(**kwargs)
+            return await asyncio.wait_for(call, timeout=remaining)
+        except TimeoutError as exc:
+            raise ModelGatewayError("DEADLINE_EXHAUSTED", retryable=False) from exc
 
     async def _build_compact_request(
         self,
@@ -331,7 +422,7 @@ class PlannerService:
             instructions=COMPACT_PLANNER_INSTRUCTIONS,
             content_parts=(ContentPart(kind="text", value=task_brief),),
             response_contract=CompactResearchPlanDraft.model_json_schema(),
-            generation_parameters={"temperature": 0.0},
+            generation_parameters={"temperature": 0.0, "reasoning_enabled": False},
             max_output_tokens=output_tokens,
             context_manifest_id=manifest_id,
             metadata={
@@ -368,6 +459,7 @@ def _result_diagnostics(
     retry_mode: str,
 ) -> dict[str, str | int]:
     return {
+        **result.diagnostics,
         "structured_output_strategy": result.capability_strategy.get(
             "structured_output", "unknown"
         ),
@@ -400,6 +492,7 @@ def _planner_retry_error(
         **error.diagnostics,
         "retry_mode": retry_mode,
         "first_error_code": first_error.code,
+        "first_finish_reason": str(first_error.diagnostics.get("finish_reason", "unknown")),
         "attempt_stage": "planner_compact",
         "compact_trigger": compact_trigger,
     }
@@ -408,11 +501,7 @@ def _planner_retry_error(
         if error.usage is not None
         else first_error.usage
     )
-    code = (
-        "PLAN_OUTPUT_BUDGET_EXCEEDED"
-        if error.code == "MODEL_OUTPUT_TRUNCATED"
-        else error.code
-    )
+    code = "PLAN_OUTPUT_BUDGET_EXCEEDED" if error.code == "MODEL_OUTPUT_TRUNCATED" else error.code
     return ModelGatewayError(
         code,
         retryable=error.retryable,
@@ -427,9 +516,7 @@ def _schema_failure_detail(
     error: ValidationError,
 ) -> str:
     raw_strategy = result.capability_strategy.get("structured_output", "unknown")
-    strategy = "".join(
-        character if character.isalnum() else "_" for character in raw_strategy
-    )
+    strategy = "".join(character if character.isalnum() else "_" for character in raw_strategy)
     finish_reason = "".join(
         character if character.isalnum() else "_"
         for character in (result.finish_reason or "unknown")
@@ -445,6 +532,4 @@ def _schema_failure_detail(
         }
     )
     issues = "_".join(issue_types) or "validation_error"
-    return (
-        f"SCHEMA_INVALID_{strategy}_FINISH_{finish_reason}_ISSUES_{issues}"
-    ).upper()[:100]
+    return (f"SCHEMA_INVALID_{strategy}_FINISH_{finish_reason}_ISSUES_{issues}").upper()[:100]

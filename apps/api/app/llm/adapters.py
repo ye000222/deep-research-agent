@@ -93,7 +93,7 @@ class LLMGateway:
             provider_request_id=result.provider_request_id,
             finish_reason=result.finish_reason,
             usage=result.usage,
-            diagnostics={"warnings": list(result.warnings)},
+            diagnostics={**result.diagnostics, "warnings": list(result.warnings)},
         )
         return result
 
@@ -204,7 +204,17 @@ class LLMGateway:
         else:  # pragma: no cover - exhaustive enum guard
             raise ModelGatewayError("UNSUPPORTED_ADAPTER", retryable=False)
 
+        response_diagnostics = (
+            _chat_output_metrics(payload)
+            if adapter_type == AdapterType.OPENAI_COMPATIBLE_CHAT
+            else {}
+        )
         try:
+            # Even a closed JSON object can be incomplete when the provider hit its limit.
+            if _finish_reason_is_length(finish_reason):
+                raise ModelGatewayError(
+                    "MODEL_OUTPUT_INVALID", retryable=False, detail_code="PROVIDER_LENGTH_STOP"
+                )
             parsed = _parse_json_object(text)
         except ModelGatewayError as exc:
             if (
@@ -226,15 +236,18 @@ class LLMGateway:
                         parse_detail=exc.detail_code,
                     ),
                     usage=usage,
-                    diagnostics=_structured_output_diagnostics(
-                        strategy=strategy,
-                        finish_reason=finish_reason,
-                        usage=usage,
-                        max_output_tokens=request.max_output_tokens,
-                        text=text,
-                        provider_request_id=request_id,
-                        retry_mode=request.metadata.get("retry_mode", "none"),
-                    ),
+                    diagnostics={
+                        **response_diagnostics,
+                        **_structured_output_diagnostics(
+                            strategy=strategy,
+                            finish_reason=finish_reason,
+                            usage=usage,
+                            max_output_tokens=request.max_output_tokens,
+                            text=text,
+                            provider_request_id=request_id,
+                            retry_mode=request.metadata.get("retry_mode", "none"),
+                        ),
+                    },
                 ) from exc
             retry_payload, retry_json_mode = await self._openai_compatible(
                 base_url,
@@ -246,6 +259,7 @@ class LLMGateway:
                 compact_repair=_finish_reason_is_length(finish_reason),
             )
             text = _chat_completion_text(retry_payload)
+            response_diagnostics = _chat_output_metrics(retry_payload)
             retry_usage = _usage(
                 retry_payload.get("usage"),
                 input_key="prompt_tokens",
@@ -258,6 +272,10 @@ class LLMGateway:
             retry_strategy = "json_mode" if retry_json_mode else "prompt_json"
             strategy = f"{retry_strategy}_regenerated_once"
             try:
+                if _finish_reason_is_length(finish_reason):
+                    raise ModelGatewayError(
+                        "MODEL_OUTPUT_INVALID", retryable=False, detail_code="PROVIDER_LENGTH_STOP"
+                    )
                 parsed = _parse_json_object(text)
             except ModelGatewayError as retry_exc:
                 error_code = _structured_output_error_code(
@@ -274,17 +292,18 @@ class LLMGateway:
                         parse_detail=retry_exc.detail_code,
                     ),
                     usage=usage,
-                    diagnostics=_structured_output_diagnostics(
-                        strategy=strategy,
-                        finish_reason=finish_reason,
-                        usage=usage,
-                        max_output_tokens=request.max_output_tokens,
-                        text=text,
-                        provider_request_id=request_id,
-                        retry_mode=request.metadata.get(
-                            "retry_mode", "generic_regeneration"
+                    diagnostics={
+                        **response_diagnostics,
+                        **_structured_output_diagnostics(
+                            strategy=strategy,
+                            finish_reason=finish_reason,
+                            usage=usage,
+                            max_output_tokens=request.max_output_tokens,
+                            text=text,
+                            provider_request_id=request_id,
+                            retry_mode=request.metadata.get("retry_mode", "generic_regeneration"),
                         ),
-                    ),
+                    },
                 ) from retry_exc
         return CanonicalModelResult(
             text=text,
@@ -293,6 +312,7 @@ class LLMGateway:
             usage=usage,
             provider_request_id=request_id,
             capability_strategy={"structured_output": strategy},
+            diagnostics={**response_diagnostics, "response_length": len(text)},
         )
 
     async def _openai_responses(
@@ -403,10 +423,7 @@ class LLMGateway:
                 if compact_repair
                 else "前一次响应无法解析。请重新生成完整 JSON。"
             )
-            user_prompt = (
-                f"{prompt}\n\n"
-                f"{compact_instruction} 确保首字符是 {{, 末字符是 }}。"
-            )
+            user_prompt = f"{prompt}\n\n{compact_instruction} 确保首字符是 {{, 末字符是 }}。"
         body: dict[str, Any] = {
             "model": request.model,
             "messages": [
@@ -416,6 +433,13 @@ class LLMGateway:
             "max_tokens": request.max_output_tokens,
             "temperature": _generation_temperature(request),
         }
+        # The switch is provider-specific: never send it to arbitrary compatible servers.
+        if (
+            urlsplit(base_url).hostname == "api.deepseek.com"
+            and request.model in {"deepseek-v4-flash", "deepseek-v4-pro"}
+            and request.generation_parameters.get("reasoning_enabled") is False
+        ):
+            body["thinking"] = {"type": "disabled"}
         if not force_prompt_json:
             body["response_format"] = {"type": "json_object"}
         url = _endpoint(base_url, "chat/completions")
@@ -425,16 +449,12 @@ class LLMGateway:
                 base_url, url, headers=headers, body=body
             ), False
         try:
-            return await self._post_compatible_json(
-                base_url, url, headers=headers, body=body
-            ), True
+            return await self._post_compatible_json(base_url, url, headers=headers, body=body), True
         except ModelGatewayError as exc:
             if exc.code != "MODEL_REQUEST_INVALID":
                 raise
         body.pop("response_format")
-        return await self._post_compatible_json(
-            base_url, url, headers=headers, body=body
-        ), False
+        return await self._post_compatible_json(base_url, url, headers=headers, body=body), False
 
     async def _post_compatible_json(
         self,
@@ -658,6 +678,26 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     )
 
 
+def _chat_output_metrics(payload: Mapping[str, Any]) -> dict[str, str | int]:
+    """Retain counters only; never return or persist private reasoning text."""
+
+    metrics: dict[str, str | int] = {}
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            reasoning = message.get("reasoning_content")
+            metrics["reasoning_content_present"] = int(bool(reasoning))
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            count = details.get("reasoning_tokens")
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                metrics["reasoning_tokens"] = count
+    return metrics
+
+
 def _chat_completion_finish_reason(payload: Mapping[str, Any]) -> str | None:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -686,16 +726,11 @@ def _structured_output_failure_detail(
     parse_detail: str | None,
 ) -> str:
     safe_strategy = re.sub(r"[^A-Z0-9]+", "_", strategy.upper()).strip("_")
-    safe_finish = re.sub(
-        r"[^A-Z0-9]+", "_", (finish_reason or "UNKNOWN").upper()
-    ).strip("_")
-    safe_parse = re.sub(
-        r"[^A-Z0-9]+", "_", (parse_detail or "PARSE_UNKNOWN").upper()
-    ).strip("_")
-    return (
-        f"OUTPUT_INVALID_{safe_strategy}_FINISH_{safe_finish}_"
-        f"{safe_parse}_CHARS_{len(text)}"
-    )[:100]
+    safe_finish = re.sub(r"[^A-Z0-9]+", "_", (finish_reason or "UNKNOWN").upper()).strip("_")
+    safe_parse = re.sub(r"[^A-Z0-9]+", "_", (parse_detail or "PARSE_UNKNOWN").upper()).strip("_")
+    return (f"OUTPUT_INVALID_{safe_strategy}_FINISH_{safe_finish}_{safe_parse}_CHARS_{len(text)}")[
+        :100
+    ]
 
 
 def _structured_output_diagnostics(
@@ -736,9 +771,7 @@ def _structured_output_error_code(
     *,
     finish_reason: str | None,
 ) -> str:
-    if parse_error_code == "MODEL_OUTPUT_INVALID" and _finish_reason_is_length(
-        finish_reason
-    ):
+    if parse_error_code == "MODEL_OUTPUT_INVALID" and _finish_reason_is_length(finish_reason):
         return "MODEL_OUTPUT_TRUNCATED"
     return parse_error_code
 

@@ -1,0 +1,123 @@
+Deep Research Agent V1.1 研究覆盖率提升修复与续接记录
+=====================================================
+
+记录时间：2026-09-08 23:15:40（Asia/Shanghai）
+当前分支：codex/v1.1-budget-guard
+基线提交：ddf5df1 docs: record V1.1 merge gate audit
+工作区状态：存在大量未提交的 V1.1 稳定性与质量改动，必须整体保留，禁止 reset/restore 或只挑选本文件列出的改动。
+
+一、本轮用户反馈
+----------------
+
+- 最新真实 Provider 研究任务终于达到 100% 执行完成，但终态为 completed_with_limitations。
+- 页面显示总体 Coverage 只有 35%，6 个研究问题仅 1 个完全通过；10 条 Evidence 只覆盖 3 个来源。
+- 用户要求提高真实覆盖率，并保存本轮对话和工作记录，供下一次无风险续接。
+
+二、真实运行复盘
+----------------
+
+复盘 Run：01a0816c-5cfe-7810-bb7f-20f8d9f5609f。
+
+- 质量 Coverage：0.3462；Accepted Evidence：10；独立 Owner：3。
+- 资源：11 次研究轮次、3 次真实搜索、8 次搜索复用、15 个成功读取页面、12 个页面读取失败。
+- 6 个问题中 q1/q4 为 0，q2/q6 为部分覆盖，q3 达到 100%。
+- Evidence 模型调用消耗约 84k Token，报告 Writer 进入确定性回退；预算被大量旧候选重抽取和失败页面消耗。
+
+三、确认的根因
+--------------
+
+1. Source Snapshot 查询过去是 Run 级复用，其他问题的快照只要尚未被当前问题接受，就可能进入当前问题；这会把无关页面当作“已有候选”。
+2. Research Loop 过去只要存在任意 reusable page/result 就跳过新搜索；因此 q4/q5/q6 的新问题可能没有真正执行独立搜索。
+3. 非技术性质量重试仍优先沿用旧查询候选，没有针对当前未满足的 acceptance dimension 发出差异化查询。
+4. 页面预算预留为 3 时，过去只检查搜索排名前三；若前三个 URL 均读取失败，即使第 4～8 名可读也不会继续尝试。
+5. 完成判断过去对所有问题一律要求两来源，超出了普通验收维度的计划要求，造成已经满足的普通问题继续消耗轮次和模型预算。
+6. Evidence Extractor 对 DeepSeek V4 未关闭 reasoning，结构化抽取容易消耗过多输出预算并触发 Compact Rescue。
+
+四、本轮已完成的代码修复
+------------------------
+
+1. 问题级快照隔离
+
+- `ResearchToolRepository.prepare_target` 只允许当前 question 搜索或评估过的 Source Snapshot 进入 reusable_pages。
+- 首轮目标的 PostgreSQL 集成路径已真实执行，确认不会带入其他问题的候选或快照。
+
+2. 区分故障恢复与质量重试
+
+- `ResearchTarget` 新增 `attempt_index`。
+- attempt_index=0 且存在缓存时允许无网络复用，满足 Worker/Provider 故障恢复的幂等要求。
+- attempt_index>0 表示上一轮质量验收未满足；即使仍有缓存候选，也必须执行一次新的搜索，再把旧候选作为补充。
+- 新查询的 SearchQuery 审计只记录本次 Provider 实际返回的结果，不把旧缓存伪装成本次查询结果。
+
+3. 缺口导向的差异化查询
+
+- 首轮使用 Planner 的第一个 search hint。
+- 第二轮将问题与当前第一个未满足的 acceptance criterion 组合。
+- 第三轮使用备用 hint、未满足 criterion 与官方文档/案例限定词；三轮查询形态确定性不同。
+- 查询仍经过 normalize 与 duplicate key，保持 Tool 幂等和可审计性。
+
+4. 增加有界研究机会
+
+- 每题非技术性 Gap 的上限从 2 轮提高为 3 轮；Standard 的 20 轮硬预算不变，Agent 不能突破 Run 预算。
+- 低 Coverage 优先调度仍保留；已满足维度不会因为上限提高而强制跑满三轮。
+
+5. 失败候选后继续读取
+
+- 每轮最多检查 8 个候选 URL，但只把成功读取/进入抽取的页面计入授予的页面槽位。
+- 前三名不可读时可继续尝试后续候选，不再把读取失败错误当作成功页面预算消耗。
+
+6. 按计划维度判断完成
+
+- 普通验收维度只需至少 1 条 Evidence/1 个 Owner；市场规模、份额、预测、增长率、趋势、领先、比较和显式独立来源条件仍需 2 个独立 Owner。
+- 问题只有在所有计划维度达到各自要求后才标记 researched；未满足时保持 retrying/partial/blocked。
+- 不降低 Evidence Score、Exact Quote、Schema、范围语义和 Citation 门槛。
+
+7. 抽取预算收敛
+
+- 普通与 Compact Evidence Extractor 请求均设置 temperature=0 和 reasoning_enabled=false。
+- 该开关由 Provider Adapter 安全应用；不增加 max_output_tokens，不用更大 Token 掩盖结构化输出失控。
+
+五、修改文件
+------------
+
+- apps/api/app/infrastructure/db/research_tools.py
+- apps/api/app/services/research_loop.py
+- apps/api/app/services/evidence_extractor.py
+- tests/unit/test_research_loop.py
+- tests/unit/test_evidence_extractor.py
+- tests/integration/test_provider_profile_persistence.py
+- DeepResearch_Agent_V1_功能审查结果.txt
+- 研究完成度提升方案与续接记录.txt
+- 本文件
+
+六、验证结果
+------------
+
+- 目标研究循环/Evidence 回归：27 passed。
+- 全量 pytest：163 passed。
+- PostgreSQL Integration：4/4 passed，未跳过。
+- Ruff：passed。
+- MyPy：103 source files，0 error。
+- Web typecheck/build：passed。
+- Golden 30 案例：passed。
+- Secret Scan、MySQL 检查、Compose config：passed。
+- 完整 Strict Release Gate：passed。
+- 机器报告：evals/reports/current_release_gate_coverage_hardening.json。
+- 服务已重启；/readyz 显示 postgres、checkpoint_postgres、redis、searxng 全部 ready。
+
+七、保证边界
+------------
+
+- 本轮修复可确认消除了跨问题快照压制新搜索、重试不发新查询、前三 URL 失败便放弃、普通问题被强制双来源四个确定性低覆盖根因。
+- 自动测试证明状态、预算、数据库和发布门不回归；它不能保证互联网中一定存在满足每个问题的公开可读来源。
+- 当前不能宣称真实 Coverage 已达到 85%；必须用同一类研究目标再运行至少一次真实 Provider Smoke，并比较搜索次数、问题级 coverage_map、页面失败率和 Evidence Owner 分布。
+- completed_with_limitations 仍是合法安全终态；来源确实不足、Provider 长期不可用或硬预算耗尽时，系统必须披露限制而不能伪造 100% 质量覆盖。
+
+八、下一次续接步骤
+------------------
+
+1. 先运行 `git status --short`、`git branch --show-current`、`git log -1 --oneline`，确认仍在 codex/v1.1-budget-guard 且未丢失工作区修改。
+2. 读取本文件和 `研究依赖故障持久化恢复与最终查漏补缺记录.txt`，不要重复旧修复。
+3. 由用户在网页发起同主题真实研究；记录新 run_id。
+4. 对比至少以下指标：真实 searches 应覆盖每个首轮问题；search_reuses 不应跨问题替代搜索；coverage、priority_one_coverage、source_count、pages、page_read_failures、各 q 的 requirement_statuses。
+5. 若仍低覆盖，按 Evidence Funnel 定位是 Search zero result、Read failure、Extractor rejection、dimension mismatch 还是独立来源不足；只修对应断点，不降低门槛。
+6. 完成真实对照后再决定是否 commit/push；当前尚未提交、推送或发布。

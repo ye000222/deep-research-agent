@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
 from uuid import UUID
 
 from app.context.manager import ContextBudgetManager
@@ -18,6 +19,7 @@ from app.domain.evidence_graph import EvidenceGraphView
 from app.domain.memory import MemoryAccessView, MemoryItemView
 from app.domain.planning import ResearchPlan
 from app.domain.reports import ReportCitationView, ReportView, VerificationView
+from app.domain.research_management import allocate_budget_shares
 from app.domain.research_runs import AgentEventView, ResearchRunView
 from app.domain.research_tools import EvidenceView
 from app.domain.state import ResearchState
@@ -35,21 +37,45 @@ from app.tools.gateway import ControlledToolGateway
 _BUDGETS: dict[str, dict[str, object]] = {
     "quick": {
         "max_iterations": 5,
-        "max_searches": 5,
-        "max_pages": 10,
+        "max_searches": 6,
+        "max_logical_queries": 6,
+        "max_provider_requests": 8,
+        "max_pages": 5,
+        "max_pages_fetched": 10,
+        "max_pages_extracted": 5,
+        "max_extraction_calls": 5,
+        "max_verification_calls": 2,
+        "max_scheduler_actions": 24,
         "max_tokens": 30_000,
+        "max_wall_clock_seconds": 180,
     },
     "standard": {
         "max_iterations": 20,
-        "max_searches": 20,
-        "max_pages": 30,
+        "max_searches": 14,
+        "max_logical_queries": 14,
+        "max_provider_requests": 24,
+        "max_pages": 14,
+        "max_pages_fetched": 30,
+        "max_pages_extracted": 14,
+        "max_extraction_calls": 14,
+        "max_verification_calls": 6,
+        "max_scheduler_actions": 60,
         "max_tokens": 100_000,
+        "max_wall_clock_seconds": 480,
     },
     "deep": {
         "max_iterations": 30,
-        "max_searches": 30,
-        "max_pages": 60,
+        "max_searches": 24,
+        "max_logical_queries": 24,
+        "max_provider_requests": 48,
+        "max_pages": 28,
+        "max_pages_fetched": 60,
+        "max_pages_extracted": 28,
+        "max_extraction_calls": 28,
+        "max_verification_calls": 10,
+        "max_scheduler_actions": 100,
         "max_tokens": 220_000,
+        "max_wall_clock_seconds": 1_200,
     },
 }
 
@@ -101,9 +127,7 @@ class ResearchRunServiceProtocol(Protocol):
         self, owner_hash: str, run_id: UUID
     ) -> list[MemoryAccessView]: ...
 
-    async def list_evaluations(
-        self, owner_hash: str, run_id: UUID
-    ) -> list[EvaluationSnapshot]: ...
+    async def list_evaluations(self, owner_hash: str, run_id: UUID) -> list[EvaluationSnapshot]: ...
 
     async def get_report(self, owner_hash: str, run_id: UUID) -> ReportView: ...
 
@@ -114,6 +138,8 @@ class ResearchRunServiceProtocol(Protocol):
     ) -> ReportCitationView: ...
 
     async def cancel_run(self, owner_hash: str, run_id: UUID) -> ResearchRunView: ...
+
+    async def pause_run(self, owner_hash: str, run_id: UUID) -> ResearchRunView: ...
 
     async def resume_run(self, owner_hash: str, run_id: UUID) -> ResearchRunView: ...
 
@@ -160,13 +186,65 @@ class ResearchRunService:
         key = idempotency_key.strip()
         if not key or len(key) > 200:
             raise ValueError("Idempotency-Key must contain 1 to 200 characters")
+        budget = dict(_BUDGETS[budget_tier])
+        budget["deadline_at"] = (
+            datetime.now(UTC)
+            + timedelta(seconds=cast(int, budget["max_wall_clock_seconds"]))
+        ).isoformat()
+        budget["performance_policy_version"] = "fair_first_pass.v1"
+        budget["relevant_chunks_enabled"] = True
+        budget["extraction_cache_enabled"] = True
+        budget["report_draft_cache_enabled"] = True
+        budget["adaptive_scheduler_enabled"] = True
+        budget["cheap_triage_enabled"] = True
+        budget["cross_question_search_cache_enabled"] = True
+        budget["max_evidence_call_tokens"] = 12_000
+        budget["allocation"] = allocate_budget_shares(
+            max_iterations=cast(int, budget["max_iterations"]),
+            max_searches=cast(int, budget["max_searches"]),
+            max_pages=cast(int, budget["max_pages"]),
+            max_tokens=cast(int, budget["max_tokens"]),
+            max_logical_queries=cast(int, budget["max_logical_queries"]),
+            max_provider_requests=cast(int, budget["max_provider_requests"]),
+            max_pages_fetched=cast(int, budget["max_pages_fetched"]),
+            max_pages_extracted=cast(int, budget["max_pages_extracted"]),
+            max_extraction_calls=cast(int, budget["max_extraction_calls"]),
+            max_verification_calls=cast(int, budget["max_verification_calls"]),
+            max_scheduler_actions=cast(int, budget["max_scheduler_actions"]),
+        )
+        budget["budget_pool_schema"] = {
+            "version": "resource_pools.v3",
+            "contract": (
+                "Every pool maps to an enforced hard-limit key, a live usage key, "
+                "and optional in-flight reservations. Legacy shares live only under "
+                "allocation.derived_display."
+            ),
+            "model_token_pools": {
+                "planner": "allocation.planner_tokens",
+                "research": "allocation.research_tokens",
+                "verification": "allocation.verification_tokens",
+                "writer": "allocation.writer_tokens_initial",
+                "safety": "allocation.safety_tokens",
+            },
+            "hard_resource_limits": {
+                "logical_queries": "max_logical_queries",
+                "provider_requests": "max_provider_requests",
+                "pages_fetched": "max_pages_fetched",
+                "pages_extracted": "max_pages_extracted",
+                "extraction_calls": "max_extraction_calls",
+                "verification_calls": "max_verification_calls",
+                "scheduler_actions": "max_scheduler_actions",
+                "productive_iterations": "max_iterations",
+                "wall_clock": "deadline_at",
+            },
+        }
         return await self._repository.create(
             owner_hash,
             idempotency_key=key,
             original_query=query,
             normalized_goal=normalized,
             credential_version_id=saved_profile_version_id,
-            budget_snapshot={"tier": budget_tier, **_BUDGETS[budget_tier]},
+            budget_snapshot={"tier": budget_tier, **budget},
         )
 
     async def list_runs(self, owner_hash: str, *, limit: int) -> list[ResearchRunView]:
@@ -217,20 +295,15 @@ class ResearchRunService:
             raise ValueError("tool run_id does not match path")
         return await self._controlled_tools.analyze_data(request)
 
-
     async def list_memory(self, owner_hash: str, run_id: UUID) -> list[MemoryItemView]:
         await self._repository.get(owner_hash, run_id)
         return await self._memory_manager.list_items(owner_hash, run_id)
 
-    async def list_memory_accesses(
-        self, owner_hash: str, run_id: UUID
-    ) -> list[MemoryAccessView]:
+    async def list_memory_accesses(self, owner_hash: str, run_id: UUID) -> list[MemoryAccessView]:
         await self._repository.get(owner_hash, run_id)
         return await self._memory_manager.list_accesses(owner_hash, run_id)
 
-    async def list_evaluations(
-        self, owner_hash: str, run_id: UUID
-    ) -> list[EvaluationSnapshot]:
+    async def list_evaluations(self, owner_hash: str, run_id: UUID) -> list[EvaluationSnapshot]:
         return await self._research_repository.list_evaluations(owner_hash, run_id)
 
     async def get_report(self, owner_hash: str, run_id: UUID) -> ReportView:
@@ -265,6 +338,11 @@ class ResearchRunService:
     async def cancel_run(self, owner_hash: str, run_id: UUID) -> ResearchRunView:
         run = await self._repository.cancel(owner_hash, run_id)
         await self._synchronize_lifecycle_state(run_id, node_name="cancel_boundary")
+        return run
+
+    async def pause_run(self, owner_hash: str, run_id: UUID) -> ResearchRunView:
+        run = await self._repository.pause(owner_hash, run_id)
+        await self._synchronize_lifecycle_state(run_id, node_name="pause_boundary")
         return run
 
     async def resume_run(self, owner_hash: str, run_id: UUID) -> ResearchRunView:

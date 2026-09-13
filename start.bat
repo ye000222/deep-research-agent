@@ -2,10 +2,11 @@
 rem ============================================================
 rem  DeepResearch Agent - one-click launcher
 rem  Double-click this file, or run from a terminal:
-rem    start.bat [-NoBrowser] [-NoBuild]
+rem    start.bat [-NoBrowser] [-NoBuild] [-DockerContext NAME]
 rem  It calls scripts\start.ps1 which starts the full stack
 rem  (postgres / redis / searxng / api / worker / dispatcher / web)
-rem  via Docker Compose and opens http://localhost:5174.
+rem  via Docker Compose and opens http://localhost:5174. Docker Desktop is
+rem  optional when the command-line Docker client points to another engine.
 rem ============================================================
 chcp 65001 >nul
 setlocal

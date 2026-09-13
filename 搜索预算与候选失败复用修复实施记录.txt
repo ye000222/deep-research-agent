@@ -1,0 +1,40 @@
+# 搜索预算与候选失败复用修复实施记录
+
+日期：2026-09-11 13:50（Asia/Shanghai）
+
+## 问题证据
+
+Run：`01a08ef0-04f5-723c-a56f-a68b8584ea56`
+
+- 搜索次数 `20/20`，页面仅 `2/30`，模型 Token 仅 `8,523/100,000`。
+- 事件显示 q1、q3、q5、q4、q6、q7、q8 多次重复搜索；其中大量候选因 `WEBPAGE_PREFETCH_FAILED`、`WEBPAGE_EXTRACTION_EMPTY`、`WEBPAGE_REQUEST_REJECTED` 被拒绝。
+- 原逻辑只在首轮使用缓存候选；质量重试即使仍有未处理候选，也会再次调用外部搜索，导致搜索预算先耗尽。
+
+## 实施
+
+1. `apps/api/app/services/research_loop.py`
+   - 所有尝试优先复用当前问题仍可用的候选和快照，不仅限于首轮。
+   - 只有可复用候选池真正耗尽时才调用外部搜索。
+2. `apps/api/app/infrastructure/db/research_tools.py`
+   - `source.rejected` 事件保存失败 URL、域名和错误码。
+   - `prepare_target` 排除当前 Run/问题已经失败的 URL，避免同一不可读页面反复重试。
+   - 新候选仍经过正常网页安全检查、正文读取、证据抽取和引用校验，不会把搜索摘要直接当作证据。
+3. 保留搜索硬预算，不通过无限放大搜索次数掩盖来源不可用问题；搜索预算耗尽时仍会明确记录真实限制。
+
+## 验证
+
+- `ruff check apps/api tests scripts`：通过。
+- `python -m compileall -q apps/api/app`：通过。
+- `python -m pytest tests/unit -q`：206 项通过。
+- 新增 PostgreSQL JSON 字段查询已在运行数据库验证可执行。
+- Worker 已重新创建并加载最新代码。
+
+## 预期结果
+
+- 同一批失败候选不再重复消耗搜索次数。
+- 搜索预算会优先用于尚未触达问题或真正新的查询路径，页面/Token 预算可继续发挥作用。
+- 旧 Run 不回写；需创建新 Run 验证搜索次数不再在低页面数时快速达到上限。
+
+## 边界
+
+如果搜索服务持续返回不可读来源，系统仍可能因真实搜索预算或来源耗尽而生成受限报告；这时应查看具体 `error_code`，不能降低证据验收标准。

@@ -1,0 +1,51 @@
+{
+  "passed": true,
+  "checks": {
+    "required_files": true,
+    "no_mysql_references": true,
+    "compose_config": true,
+    "migration_head": "20260910_0022",
+    "commands": true,
+    "golden_eval": true,
+    "secret_scan": true
+  },
+  "missing_files": [],
+  "forbidden_references": [],
+  "commands": [
+    {
+      "name": "ruff",
+      "passed": true,
+      "returncode": 0,
+      "output_tail": "All checks passed!"
+    },
+    {
+      "name": "mypy",
+      "passed": true,
+      "returncode": 0,
+      "output_tail": "Success: no issues found in 113 source files"
+    },
+    {
+      "name": "pytest",
+      "passed": true,
+      "returncode": 0,
+      "output_tail": "........................................................................ [ 33%]\n........................................................................ [ 66%]\n........................................................................ [100%]\n============================== warnings summary ===============================\n.venv\\Lib\\site-packages\\fastapi\\testclient.py:1\n  D:\\agentProject\\.venv\\Lib\\site-packages\\fastapi\\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\ntests/api/test_llm_provider_connections.py::test_connection_test_rejects_non_https_endpoint\n  D:\\agentProject\\.venv\\Lib\\site-packages\\fastapi\\routing.py:352: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.\n    return await dependant.call(**values)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html"
+    },
+    {
+      "name": "postgres_integration",
+      "passed": true,
+      "returncode": 0,
+      "output_tail": ".......                                                                  [100%]\n============================== warnings summary ===============================\n.venv\\Lib\\site-packages\\fastapi\\testclient.py:1\n  D:\\agentProject\\.venv\\Lib\\site-packages\\fastapi\\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html"
+    },
+    {
+      "name": "web_build",
+      "passed": true,
+      "returncode": 0,
+      "output_tail": "vite v7.3.6 building client environment for production...\ntransforming...\n✓ 30 modules transformed.\nrendering chunks...\ncomputing gzip size...\ndist/index.html                   0.50 kB │ gzip:  0.32 kB\ndist/assets/index-CK-rsL2b.css   15.61 kB │ gzip:  3.66 kB\ndist/assets/index-BAPGLt13.js   241.31 kB │ gzip: 75.64 kB\n✓ built in 702ms\n$ pnpm typecheck && vite build\n$ tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json"
+    }
+  ],
+  "golden_eval": {
+    "passed": true,
+    "output": "_keys\": [], \"expected_gap_keys\": [], \"gap_true_positives\": 0, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"citation_missing_numeric_fact\", \"coverage\": 1.0, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"market_size\"], \"expected_gap_keys\": [\"market_size\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"single_first_party_fact\", \"coverage\": 0.0, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"specification\"], \"expected_gap_keys\": [\"specification\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"two_independent_market_sources\", \"coverage\": 1.0, \"verdict\": \"write\", \"expected_verdict\": \"write\", \"passed\": true, \"predicted_gap_keys\": [], \"expected_gap_keys\": [], \"gap_true_positives\": 0, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"definition_mismatch\", \"coverage\": 1.0, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"definition\"], \"expected_gap_keys\": [\"definition\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"freshness_window_expired\", \"coverage\": 1.0, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"trend\"], \"expected_gap_keys\": [\"trend\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"diversity_insufficient\", \"coverage\": 0.0, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"vendors\"], \"expected_gap_keys\": [\"vendors\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"analysis_artifact_verified\", \"coverage\": 1.0, \"verdict\": \"write\", \"expected_verdict\": \"write\", \"passed\": true, \"predicted_gap_keys\": [], \"expected_gap_keys\": [], \"gap_true_positives\": 0, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"analysis_artifact_missing_input\", \"coverage\": 0.0, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"growth\"], \"expected_gap_keys\": [\"growth\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"replan_new_dimension_resolved\", \"coverage\": 1.0, \"verdict\": \"write\", \"expected_verdict\": \"write\", \"passed\": true, \"predicted_gap_keys\": [], \"expected_gap_keys\": [], \"gap_true_positives\": 0, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"replan_new_dimension_unresolved\", \"coverage\": 0.5, \"verdict\": \"continue\", \"expected_verdict\": \"continue\", \"passed\": true, \"predicted_gap_keys\": [\"safety\"], \"expected_gap_keys\": [\"safety\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"cancelled_before_external_call\", \"coverage\": 0.0, \"verdict\": \"fail\", \"expected_verdict\": \"fail\", \"passed\": true, \"predicted_gap_keys\": [\"cancel\"], \"expected_gap_keys\": [\"cancel\"], \"gap_true_positives\": 1, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}, {\"case_id\": \"checkpoint_recovery_idempotent\", \"coverage\": 1.0, \"verdict\": \"write\", \"expected_verdict\": \"write\", \"passed\": true, \"predicted_gap_keys\": [], \"expected_gap_keys\": [], \"gap_true_positives\": 0, \"gap_false_positives\": 0, \"gap_false_negatives\": 0, \"early_stop_error\": false, \"support_checks\": []}]}"
+  },
+  "secret_hits": []
+}

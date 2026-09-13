@@ -1,0 +1,40 @@
+# Worker 并发与排队进度治理实施记录
+
+日期：2026-09-11 12:25（Asia/Shanghai）
+阶段：4 / 4
+
+## 问题
+
+图2 的 `3% / queued` 并不是研究已经完成 3%，而是前端把 queued 状态套用了初始化阶段的默认进度（5% 阶段权重 × 50% 阶段占比，四舍五入后约 3%）。同时，运行环境中的 Worker 实际以 `--concurrency=1` 启动；历史 Run 显示任务已被 Dispatcher 发布，但要等待数分钟才能取得 Worker，造成“刷新后长时间不动”的体验。
+
+## 实施
+
+1. `apps/web/src/App.tsx`：queued 任务明确显示真实 `0%`，阶段节点全部保持 pending，不再伪造初始化进度；状态文案显示已等待时长，并保留模型/搜索持久化重试状态文案。
+2. `docker-compose.yml`：新增 `WORKER_CONCURRENCY` 配置，默认值为 2，允许部署环境按 CPU、Provider 限流和成本策略覆盖；不提高模型并发，模型调用仍受 Token reservation 保护。
+3. `apps/api/app/worker/tasks.py`：生产 Worker 开启有限网页并行读取（页面预算先原子预留，写入和状态归并仍串行）。
+4. `apps/api/app/infrastructure/db/research_tools.py`：补救检索按未满足验收维度选择来源类型提示（市场/趋势→统计、白皮书、行业报告；原理/技术→官方技术文档、论文；案例/部署→官方案例、Application Note；比较→规格和 Benchmark），并保留原问题与缺口文本，避免泛关键词重复搜索。
+
+## 验证
+
+- 后端语法编译：`python -m compileall -q apps/api/app` 通过。
+- 全量 Ruff：`ruff check apps/api tests scripts` 通过。
+- 全量单元测试：`python -m pytest tests/unit -q`，结果 200 项通过（pytest 缓存目录权限警告不影响测试）。
+- 重点研究循环/预算回归：`38` 项通过。
+- Ruff：研究工具与研究循环文件检查通过。
+- Web 类型检查：`npm.cmd run typecheck` 通过。
+- Web 生产构建：`npm.cmd run build` 通过。
+- Compose 配置解析确认默认 `--concurrency=2`。
+- 已重建运行中的 Worker 容器；`docker inspect` 与启动日志均确认 `concurrency: 2 (prefork)`，并成功连接 Redis、加载全部任务，定时 `reconcile_stale_runs` 正常执行。
+- 容器健康检查：Web `http://localhost:5174` 返回 HTTP 200，Compose 中 API、Dispatcher、Worker、Beat、PostgreSQL、Redis、SearXNG 均处于运行状态；`/health` 不是本项目已注册路由（返回 404），不作为故障判断依据。
+- 运行态复核（2026-09-11 13:18）：发现 Windows 挂载目录未触发 Vite 热更新，浏览器仍缓存旧的“15 轮”模块；已重建 Web 容器并刷新页面，页面实际显示“Standard · 20 轮 / 20 次搜索 / 30 页”。
+
+## 结果与边界
+
+- 新 queued Run 会显示 0%，表示尚未开始执行；不能据此承诺排队等待为零。
+- 默认两个 Worker 进程将显著降低单并发 FIFO 等待；实际吞吐仍受搜索服务、网页读取、Provider 限流和单 Run 预算影响。
+- 本阶段没有降低 Coverage、来源质量、交叉验证或引用质量门；无法满足硬门时仍应显示 `completed_with_limitations`，但停止原因和预算诊断会保留。
+- PostgreSQL 集成测试因当前终端未设置隔离测试库变量而未执行，不能把单元测试等同于完整生产 Graph 评测；不得用业务库代替隔离测试库。
+
+## 后续建议
+
+在隔离数据库和固定 Provider 回放集上跑 30 案例，记录 Coverage 中位数、质量门达标率、技术失败率、Token、页面数和排队/执行耗时；若仍有缺口，再针对具体维度补充来源适配器，而不是继续放宽质量阈值。

@@ -1,0 +1,86 @@
+V1.1 Token 预算与 Worker 诊断修复记录
+======================================
+
+记录时间：2026-09-07 18:47:28（Asia/Shanghai）
+工作分支：codex/v1.1-budget-guard
+发布状态：尚未发布 v1.1.0
+
+一、现场症状
+------------
+
+- 页面在 82%“报告生成”显示 `WORKER_EXECUTION_FAILED`，诊断码为 `UNKNOWN`。
+- 同一 Run 已有部分问题成功，保存 8 条 accepted Evidence、5 个独立来源、8 个引用候选。
+- 页面模型 Token 错误显示为 0/100,000。
+
+二、已确认根因
+--------------
+
+- Run ID：`01a07b4d-4736-7da5-a5d2-b03197469e50`。
+- Planner：6,647 Token。
+- Evidence Extractor：140,120 Token。
+- 实际已知总量：146,767 Token，超过 Standard 上限 100,000。
+- 预算只在研究轮次边界检查；单页 Evidence Extractor 的兼容模型隐式再生成可把一次逻辑抽取消耗扩大到 30,000 Token 以上。
+- State Runtime 拒绝超限快照后，Worker 的失败同步再次触发同一异常，二次异常覆盖原始异常，最终表现为 UNKNOWN。
+
+三、本次代码修复
+----------------
+
+- 每次 Evidence 模型调用前读取 Run Token 余额并执行确定性 Guard。
+- 为报告 Writer 预留 3,000～10,000 Token，余额不足时停止新增抽取并进入带限制写作。
+- 普通 Extractor Context 输入上限 6,000、输出上限 3,500 Token。
+- Compact Extractor Context 输入上限 3,000、输出上限 1,800 Token。
+- Evidence Extractor 禁用 Adapter 内部不可见的自动双次再生成，改由服务层执行一次受预算约束的 Compact Retry。
+- 首次失败、结构修复和空结果补救的 Usage 均合并计入 Run。
+- 终态和写作态保留 Provider 返回后的真实 Token 超额；研究态仍拒绝超限。
+- Worker 先记录原始异常，再 best-effort 同步终态；同步失败不再替换原始 traceback。
+- 前端从 planner/evidence/writer 分项计算真实模型 Token，并显示明确预算诊断。
+
+四、已通过验证
+--------------
+
+- Ruff：通过。
+- MyPy：103 个源文件 0 error。
+- 全量 Pytest：通过。
+- PostgreSQL Integration：4/4 通过，不跳过。
+- PostgreSQL Recovery Smoke：通过。
+- Web test/typecheck/build：通过。
+- Strict Release Gate：`passed=true`。
+- 本地报告：`artifacts/release_gate_budget_guard.json`。
+
+五、下一次继续入口
+------------------
+
+1. 检查 `git diff`，确认只提交本次预算、诊断、测试和记录文件。
+2. 重建并重启 API、Worker、Web，使运行环境加载新代码。
+3. 先确认没有过期 `running` Run。
+4. 使用真实 Provider 再运行一个 Standard 端到端 Smoke。
+5. 验收：不出现 UNKNOWN；模型 Token 实时非零；预算临界时进入带限制报告；Report/Citation/Verification 成功落库。
+6. 通过后提交并推送 `codex/v1.1-budget-guard`，创建修复 PR，等待 GitHub CI 全绿后合并。
+7. 合并后再创建并发布 `v1.1.0` Tag/Release。
+
+六、最终恢复复验（2026-09-07 22:04:28，Asia/Shanghai）
+--------------------------------------------------------
+
+- 旧失败 Run `01a07b4d-4736-7da5-a5d2-b03197469e50` 已恢复成功，终态为 `completed_with_limitations / terminal`，不再出现 `WORKER_EXECUTION_FAILED / UNKNOWN`。
+- 实际模型 Token 为 146,767，`model_budget_guarded=true`；系统保留真实超额用量并停止新的模型调用。
+- 恢复前后该 Run 的 `llm_calls` 均为 17，最新调用时间仍为原失败时间，证明恢复过程没有产生新的 Provider 费用。
+- 已生成 1 份 `verified` 报告和 5 条 Citation；引用完整率、数字引用率、语义支持率均为 1.0。
+- 恢复路径新增 `BudgetUsage.model_budget_guarded`，Worker 获取租约时会为历史超额任务原子写入保护标记，使其跳过新增研究并进入确定性受限报告。
+- 完整 Pytest 通过；Ruff 通过；MyPy 103 个源文件 0 error；Web typecheck/build 通过。
+- 严格 Release Gate 最终报告：`artifacts/release_gate_budget_guard_final.json`，`passed=true`；PostgreSQL Integration 4/4，不跳过；Golden Eval 与 Secret Scan 通过。
+
+七、下次直接继续
+----------------
+
+1. 当前分支：`codex/v1.1-budget-guard`。
+2. 先审阅 `git diff`；工作区包含本轮功能修改、测试、记录，以及此前 Ruff 格式化产生的部分非核心差异，禁止未经确认批量丢弃。
+3. 提交并推送该分支，创建修复 PR。
+4. 等待 GitHub 的 PostgreSQL integration、api、web、compose、Strict V1 release gate 全绿后合并到 `main`。
+5. 合并后确认过期 `running` 为 0，再发布 `v1.1.0` Tag/Release。
+
+运行态补充（2026-09-07 22:07:20）：过期 `running` 数量为 0；当前有 4 条未过期 active running，未擅自取消或修改。
+
+后续方向更新（2026-09-07 22:22:01，Asia/Shanghai）
+- 新研究任务虽已完成报告，但覆盖仅 14.29%。旧预算异常修复成立，研究质量仍待提升。
+- 下一次续接优先读取《研究完成度提升方案与续接记录.txt》，按 COV-1 至 COV-5 推进，保留本轮未提交预算修复。
+- 发布前增加健康来源案例的覆盖率与质量达标验证；不再仅凭本文件中的恢复成功和 CI 全绿直接推进最终发布。

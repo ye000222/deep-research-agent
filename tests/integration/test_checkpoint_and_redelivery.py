@@ -19,9 +19,7 @@ async def test_async_postgres_saver_pending_writes_time_travel_and_delete() -> N
     uri = os.environ["CHECKPOINT_DATABASE_URI"]
     runtime = CheckpointRuntime(uri, min_size=1, max_size=2)
     thread_id = f"integration-{uuid4()}"
-    config: RunnableConfig = {
-        "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
-    }
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
     try:
         saver = await runtime.open()
         first = empty_checkpoint()

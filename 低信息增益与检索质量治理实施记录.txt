@@ -1,0 +1,178 @@
+# 低信息增益与检索质量治理实施记录
+
+## 2026-09-11：第一批改进
+
+### 触发问题
+
+最近一次研究运行出现 `completed_with_limitations`。审计发现：30 个页面中有 18 个页面没有产生任何有效 Evidence Card；其中 q2/q3 连续消耗 8 个页面、约 2.1 万模型 Token，却没有一条 accepted evidence。低信息增益本身是症状，真正的预算浪费来自同一检索结果集被连续读取、跑题页面通过通用词重叠、以及低增益计数跨问题累积。
+
+### 已实施的代码改动
+
+1. **单检索词低产出上限收紧为 2 页**
+   - `apps/api/app/services/research_loop.py`
+   - 首轮仍只读 1 页；重试保留最多 3 个预留槽，但连续 2 页没有 accepted evidence 就立即轮换查询。
+   - 读取失败或已有有效产出的页面仍可使用第三个槽，避免把瞬时网页/模型失败误判成跑题。
+   - 释放未使用的页面预留，预算优先留给后续查询变体。
+
+2. **零产出快速换检索词**
+   - 当前页面没有任何候选 Evidence Card 时立即停止本轮，下一轮沿用已有的查询轮换策略。
+   - 页面有候选但全部未通过时最多允许连续 2 页，随后停止本轮，避免低质量页面批量消耗预算。
+
+3. **按问题隔离低信息增益计数**
+   - `apps/api/app/infrastructure/db/research_tools.py`
+   - 新增 `quality_snapshot.low_information_gain_streak_by_question`。
+   - `low_information_gain_streak` 仍保留为当前问题的兼容字段；跨问题的零增益不再直接触发当前问题的提前重规划。
+
+4. **为 P1 与质量门预留页面尾部预算**
+   - 根据未解决 P1 缺口、来源质量门、交叉验证门计算 `page_reserve`。
+   - 页面接近保留区时，调度优先选择 P1/未覆盖问题；若没有可保护项，仍允许普通问题作为兜底，不会假装研究完成。
+
+5. **增加领域锚点过滤**
+   - `apps/api/app/tools/web_search.py` 与 `research_loop.py`
+   - 对包含工业视觉/缺陷/机器视觉等领域锚点的查询，候选标题或摘要必须共享至少一个领域锚点。
+   - 这会在抽取前淘汰“深度学习、阈值、检测”等通用词相似但实际属于遥感、SAR、行人跟踪等跑题页面。
+
+### 预期效果
+
+- q2/q3 这类结果集连续两页没有有效证据时，会更快进入下一组查询，而不是把 3 页固定配额读完。
+- 低信息增益只在同一问题内连续发生时才触发停滞/重规划判断。
+- 页面预算末段优先用于 P1、来源质量和交叉验证补强，降低 74% 来源质量长期卡住的概率。
+- 运行页面和 Evidence 列表将只接受当前容器启动时计算出的最新源码指纹；本批改动完成后必须执行强制重启与版本校验。
+
+## 2026-09-11：第二批质量门改进
+
+在继续审计后又发现两个会让质量门长期偏低的问题：
+
+1. 来源质量虽然语义上是“独立来源”指标，实际却按 `source_id`（URL/快照）平均；同一发布者的多个页面会重复投票，低质量域名因此可能把来源质量压在 74% 附近。
+2. 页面预算保护只改变了候选的 priority，但调度键仍先比较“是否已经尝试过”；一个未尝试的 P2 问题仍可能抢在已重试但未解决的 P1 缺口之前，导致保留区没有真正保护到关键缺口。
+
+已完成修复：
+
+- 来源质量改为按 `source_owner_key` 聚合，每个独立发布者只贡献一个可靠性票；同一发布者的 URL 数量不再稀释或重复放大质量。
+- 页面保留区调度改为显式把 P1/未覆盖候选放到轮次和尝试次数之前排序；没有可保护候选时仍保留普通候选兜底。
+- 来源排序进一步提高可信学术、政府、协会和厂商来源的质量权重，同时保持标题/摘要主题相关性优先。
+- 将已确认的一方工业视觉厂商与行业研究发布者加入显式可靠性目录（仍低于学术/政府来源），避免真实可追溯页面全部落入未知 `.com` 的 0.68 默认分。
+
+第二批验证：研究循环、搜索、报告 Writer 相关单元测试通过；Ruff 与 Mypy 通过。该批代码完成后需再次执行强制重启和 revision 一致性校验。
+
+同时清理了全量 Mypy 暴露的两个类型安全问题（研究预算 priority 解析、Writer quality snapshot 的 critical_gaps 解析），当前 `apps/api/app` 114 个源文件全部通过 Mypy。
+
+## 运行环境检查
+
+第二轮发布后已直接探测本地 SearXNG：容器健康，但当前外部引擎返回 timeout/CAPTCHA/Suspended，两个工业视觉查询返回 0 条结果。这属于搜索上游网络/引擎状态，不是本轮质量门代码错误；应用现有的通用、Sogou、学术索引回退和可重试错误路径会保留检查点，不会把空结果伪装成有效证据。真实研究复测仍需在搜索引擎可返回结果时进行。
+
+随后发现 Docker Desktop 重启后 `start.ps1` 只重建 API/Worker/Web，SearXNG 可能停留在退出状态，导致“服务页面可用但研究无法搜索”。已修复：启动脚本显式包含 `searxng`，且 API/Worker 通过 Compose 依赖声明自动拉起搜索服务；当前 SearXNG 容器已稳定运行。上游引擎仍有 timeout/CAPTCHA 时，系统会按既有降级路径记录真实限制。
+
+最终又扩大了源码指纹覆盖范围：`scripts/start.ps1` 自身和 `infra/searxng` 配置也纳入 revision manifest，避免只改启动逻辑/搜索配置却继续显示旧版本。
+
+对历史 Run `01a090f9-5ef4-7b8a-8582-40071fac4ff3` 做了只读回放：按旧评级、按独立 owner 聚合为 `0.7109`；按本次新增来源目录重新评级的预计值为 `0.8145`。该数值只是验证评级规则的影响，旧 Run 不回写，必须新建 Run 才会使用新评级。
+
+### 验证计划
+
+- 运行搜索过滤、证据抽取、研究预算与质量端点相关的单元/集成测试。
+- 执行 `scripts/start.ps1 -NoBrowser -NoBuild`，强制重建 API/Worker/Dispatcher/Beat/Web。
+- 校验 `/health`、前端 HTTP 200、全部服务源码 revision 一致，并把实际 revision 写入运行态记录。
+
+## 2026-09-12 报告 Writer 空 Evidence Cards 防护
+
+### 新发现
+
+报告 Writer 在上下文预算过小、导致 ContextBudgetManager 裁掉全部 Evidence Cards 时，仍会把空的 `evidence_cards` 发给模型。模型可能据此返回“无法生成研究报告：未提供 Evidence Cards”，即使数据库中已有 accepted Evidence Cards；这正是此前截图中最容易误判的失败表现。
+
+### 修复
+
+- `ReportWriterService._generate_draft()` 现在要求上下文预算后至少保留一张 Evidence Card。
+- 若卡片全部被裁掉，抛出 `REPORT_EVIDENCE_CARDS_PRUNED`，由现有确定性模板回退路径使用完整的 bounded evidence 列表生成报告，并保留稳定引用。
+- 新增回归测试，覆盖“accepted cards 存在但 context selected 为空”的情况。
+
+### 验证与发布
+
+- Writer/Context 专项测试通过；全量 unit、API、Ruff、compileall、Web typecheck/build 通过。
+- Release Gate 通过，报告：[current_release_gate_quality_20260912_writer_guard.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_writer_guard.json)。
+- 已执行 `scripts/start.ps1 -NoBrowser -NoBuild` 强制重建；API、Worker、Dispatcher、Beat、Web、SearXNG 全部 running，API/Web/SearXNG HTTP 200。
+- 运行态 revision：`e51c93ff4c5e`，API 元数据与全部服务一致。
+
+## 2026-09-12 第三批检索预算与信息增益可观测性修复
+
+针对复测中仍可能出现的“页面先耗尽、搜索变体未用完、信息增益看起来长期为 0”继续收紧：
+
+- `apps/api/app/services/research_loop.py` 将单次查询硬上限从 3 页改为 2 页；即使仓储错误授予更多页面槽位，循环也会再次限制为 2 页。首轮仍保持 1 页，让多个问题先获得机会。
+- 工业缺陷问题的候选预检改为核心主题组合约束：同时要求候选命中工业/制造/产线语义和缺陷/检测/质检/异常语义；“视觉、算法、深度学习”单独重合的遥感、SAR、光流、行人跟踪页面会在 Evidence Extractor 之前被丢弃。
+- `apps/api/app/tools/web_search.py` 同步执行同一组合过滤，避免无关页面进入读取预算；新增回归测试覆盖通用视觉方法页面拒绝和直接工业缺陷页面接受。
+- Web 仪表盘的趋势窗口改为最近 8 轮，并增加最近 8 轮平均信息增益、零产出页面比例、每条有效证据平均页面成本，避免最后一轮 0% 覆盖此前有效增益，也能直接观察预算是否被无效页面消耗。
+
+本批验证：研究循环/搜索专项测试通过；全部 unit、API、Ruff、Mypy、Web typecheck/build、Release Gate 均通过。门禁报告：[current_release_gate_quality_20260912_budget_dashboard.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_budget_dashboard.json)。
+
+已执行 `scripts/start.ps1 -NoBrowser -NoBuild` 强制重建。源码指纹 `ae972666351f`；API 元信息、API、Worker、Dispatcher、Beat、Web 的版本环境变量全部一致，SearXNG、API、Web HTTP 200，全部服务 running。
+
+## 2026-09-12 并行预读硬上限复核
+
+复核并行读取旁路后发现批量预取仍使用仓储授予槽位数，而不是单查询硬上限；已改为使用同一 `page_limit`，避免错误授予时并行预取绕过两页限制。专项回归测试新增并行失败隔离覆盖。
+
+修复后再次通过 Release Gate，并强制重启到源码指纹 `a47e7cab9b18`。API、Worker、Dispatcher、Beat、Web、SearXNG 全部 running，API/Web/SearXNG HTTP 200，所有版本核对一致。
+
+## 2026-09-12 逐项验收补强
+
+重新逐条核对建议方案后，补齐此前仍属“部分完成”的边界：
+
+- `record_page()` 返回候选数为 0 时，本轮立即结束，不再读取第二页，下一次由问题级查询轮换接管。
+- 页面保护区现在严格跳过已覆盖的普通 P2/P3；只保留 P1、未覆盖维度、partial/blocked/technical_retry 以及质量补强候选。
+- 来源质量或交叉验证门打开时，页面保护区至少预留 6 个页面槽位（预算小于 6 页时保留全部剩余页）。
+- 未完成 P1 且检索尝试少于 3 次时进入 P1 变体模式，先以轮询方式让所有未完成 P1 获得至少 3 个不同查询机会，普通 P2/P3 不再提前挤占。
+
+新增首个零候选页面立即轮换和严格预算调度回归测试。Release Gate、全量测试、Ruff、Mypy、Web 构建均通过。
+
+已再次强制重启到源码指纹 `1e90dbcabd87`；API、Worker、Dispatcher、Beat、Web、SearXNG 全部 running，API/Web/SearXNG HTTP 200，版本全部一致。
+
+## 2026-09-12 REPLAN 计划版本状态污染修复
+
+### 根因
+
+- `question_budget_exhausted_by_question` 是按问题 ID 保存的旧计划状态，但之前没有绑定 `plan_version`。
+- REPLAN 创建新计划后，q2/q3/q5 已被重置为 `pending`，却仍被旧计划的耗尽地图跳过；调度器因此错误地认为没有候选，提前写入 `sources_exhausted`。
+- 这解释了“预算尚未用完但质量门仍未通过”的截图：不是搜索器主动停止，而是跨计划版本的持久化状态污染。
+
+### 修复
+
+- `save_gap_resolution_plan()` 创建新计划时清除旧的 `question_budget_exhausted_by_question`。
+- `save_replanned_questions()` 完成新计划落库时再次清除该旧状态，覆盖恢复/重试路径。
+- 新计划的 pending 问题现在重新获得检索机会；旧计划的预算耗尽结果不会跨版本传播。
+
+### 验证
+
+- Ruff、全量 pytest、Postgres 集成、Mypy、Golden Eval、前端类型检查和构建全部通过。
+- Release Gate 报告：[current_release_gate_quality_20260912_replan_state_fix.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_replan_state_fix.json)。
+- 已强制重建并重启全部服务，源码指纹 `81f2daf638a9`；API、Worker、Dispatcher、Beat、Web、SearXNG 全部运行且版本一致，API/Web/SearXNG HTTP 200。
+
+### 回归保护补充
+
+- 抽取 `_reset_plan_scoped_question_budget()` 并新增单元测试，验证清理旧计划状态且不修改原始快照。
+- 修正重规划计数的类型收窄后，最终 Release Gate 再次全部通过。
+- 最终强制重建源码指纹为 `897c14d3af96`，运行态服务版本已全部核对一致。
+
+## 2026-09-12 搜索预算与页面预算联动发布
+
+最后一项验收边界已补齐：页面槽位预留现在与搜索账本联动。每次新搜索完成后，仓储会为剩余的新搜索至少保留一个页面槽位；当页面不足以支撑当前两页批次时自动降为 1 页或让出当前页，避免页面预算先耗尽而搜索预算仍显示剩余。复用已缓存候选的搜索不占用该新搜索预留，避免影响断点恢复。
+
+专项测试、全量 Release Gate、Ruff、Mypy、Web 构建均通过。已强制重启到源码指纹 `8680077b58c2`；全部服务 running，API/Web/SearXNG HTTP 200，版本全部一致。
+
+## 2026-09-12 研究任务长时间停滞根因与修复
+
+### 根因
+
+- `allocate_research_call()` 在已尝试问题且仍有未尝试问题时返回 `yield_question`，这是正确的局部公平调度信号。
+- 但 P1 变体模式无条件过滤普通候选，q2/q3 一直被保留在首位；`finish_iteration()` 对 `yield_question` 直接返回且不推进该问题状态，导致同一个 q2 每隔约 6 秒重复写入 `budget.question_yielded`，页面、搜索和证据不再增长。
+- 因此界面“运行中但长时间不动”不是网页读取慢，而是研究图在非消耗让出分支中空转。
+
+### 修复
+
+- P1 变体模式现在只在所有问题都完成首轮后启用；存在未尝试问题时遵守预算分配器的公平让出决定。
+- `yield_question` 在研究循环入口被显式转换为 `question_budget_exhausted`；仓储记录 `question_budget_exhausted_by_question`，将该问题标记为 blocked/partial 并跳过，禁止重复进入同一问题。
+- 新增 `budget.question_exhausted` 事件和回归测试，保证本题预算保护不会重新触发同一搜索循环。
+
+### 验证与发布
+
+- 研究循环、预算专项和全量 pytest 均通过；Ruff 检查通过。
+- Release Gate 已在 `RUN_POSTGRES_INTEGRATION=1`、项目 Postgres/Checkpoint 数据库连接下通过，报告：[current_release_gate_quality_20260912_yield_loop_fix.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_yield_loop_fix.json)。
+- 强制重新构建镜像并执行 `scripts/start.ps1 -NoBrowser`；源码指纹 `58ff58eb5726`，API/Worker/Dispatcher/Beat/Web 版本核对一致，API/Web/SearXNG HTTP 200。
+- 发布后活动运行从原先每 6 秒重复让出改为继续处理 q3 等后续问题；数据库中搜索数、页面数和覆盖率继续增长，未再出现新的快速 `budget.question_yielded` 空转序列。

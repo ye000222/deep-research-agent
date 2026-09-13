@@ -23,4 +23,5 @@ async def meta(request: Request) -> dict[str, str]:
         "name": settings.app_name,
         "environment": settings.app_env,
         "version": settings.app_version,
+        "source_revision": settings.source_revision,
     }

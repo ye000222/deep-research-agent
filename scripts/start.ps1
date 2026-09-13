@@ -17,6 +17,13 @@
 .PARAMETER NoBuild
     跳过镜像构建，仅使用已有镜像启动（docker compose up -d）
 
+.PARAMETER DockerContext
+    可选的 Docker context 名称。用于连接 WSL2、远程 Linux 或其他独立 Docker 引擎，
+    不需要 Docker Desktop；等价于设置 DOCKER_CONTEXT。
+
+.PARAMETER NoAutoStartDockerDesktop
+    Docker 引擎不可用时不尝试启动 Docker Desktop，而是直接输出替代引擎诊断。
+
 .EXAMPLE
     .\scripts\start.ps1
     .\scripts\start.ps1 -NoBrowser -NoBuild
@@ -25,7 +32,9 @@
 [CmdletBinding()]
 param(
     [switch]$NoBrowser,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [string]$DockerContext,
+    [switch]$NoAutoStartDockerDesktop
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,12 +79,49 @@ function Invoke-DockerCompose {
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & docker compose @Arguments 2>&1
+        & docker compose @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
         $code = $LASTEXITCODE
-        $output | ForEach-Object { Write-Host $_ }
         return $code
     } finally {
         $ErrorActionPreference = $previous
+    }
+}
+
+function Get-SourceRevision {
+    $sourcePaths = @(
+        (Join-Path $Root "apps/api"),
+        (Join-Path $Root "apps/web/src"),
+        (Join-Path $Root "infra/docker"),
+        (Join-Path $Root "infra/searxng"),
+        (Join-Path $Root "docker-compose.yml"),
+        (Join-Path $Root "scripts/start.ps1"),
+        (Join-Path $Root "pyproject.toml"),
+        (Join-Path $Root "package.json"),
+        (Join-Path $Root "pnpm-lock.yaml")
+    )
+    $files = foreach ($path in $sourcePaths) {
+        if (Test-Path $path -PathType Container) {
+            Get-ChildItem $path -Recurse -File | Where-Object {
+                $_.FullName -notmatch "[\\/](__pycache__|dist)[\\/]"
+            }
+        } elseif (Test-Path $path -PathType Leaf) {
+            Get-Item $path
+        }
+    }
+    $manifest = $files |
+        Sort-Object FullName |
+        ForEach-Object {
+            $relative = $_.FullName.Substring($Root.Length).TrimStart([char[]]"\/")
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$relative=$hash"
+        }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($manifest -join "`n"))
+        $digest = $sha.ComputeHash($bytes)
+        return (-join ($digest | ForEach-Object { $_.ToString("x2") })).Substring(0, 12)
+    } finally {
+        $sha.Dispose()
     }
 }
 
@@ -97,6 +143,14 @@ if (-not (Test-Path $Root)) {
 }
 Set-Location $Root
 
+# Compose 会读取 DOCKER_CONTEXT/DOCKER_HOST。显式参数优先，但不覆盖用户已经
+# 配置好的远程引擎连接；这样命令行 Docker、WSL2 和远程 Docker 均可使用。
+if ($DockerContext) {
+    $env:DOCKER_CONTEXT = $DockerContext
+}
+$env:SOURCE_REVISION = Get-SourceRevision
+Write-Host "Source revision: $env:SOURCE_REVISION" -ForegroundColor DarkGray
+
 # ---------------------------------------------------------------- 1. .env
 Write-Step "检查环境变量文件 (.env)"
 $envFile = Join-Path $Root ".env"
@@ -116,6 +170,16 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 
 if (-not (Test-DockerEngine)) {
+    $hasExplicitEngine = [bool]($env:DOCKER_HOST -or $env:DOCKER_CONTEXT -or $NoAutoStartDockerDesktop)
+    if ($hasExplicitEngine) {
+        Write-Host "Docker CLI 未连接到可用引擎。当前连接：" -ForegroundColor Red
+        if ($env:DOCKER_CONTEXT) { Write-Host "  context: $($env:DOCKER_CONTEXT)" -ForegroundColor Red }
+        if ($env:DOCKER_HOST) { Write-Host "  DOCKER_HOST: $($env:DOCKER_HOST)" -ForegroundColor Red }
+        Write-Host "请先启动该 context 对应的 Docker 引擎，或运行 docker context ls 选择可用 context。" -ForegroundColor Yellow
+        Write-Host "示例：.\scripts\start.ps1 -DockerContext my-linux-engine -NoBrowser" -ForegroundColor Yellow
+        exit 1
+    }
+
     Write-Host "Docker 引擎未运行，尝试自动启动 Docker Desktop ..." -ForegroundColor Yellow
     $dockerDesktop = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
     if (Test-Path $dockerDesktop) {
@@ -136,9 +200,13 @@ if (-not (Test-DockerEngine)) {
 # ---------------------------------------------------------------- 3. Compose
 Write-Step "构建并启动全部服务（首次构建可能需要数分钟）"
 if ($NoBuild) {
-    $code = Invoke-DockerCompose up -d
+    $code = Invoke-DockerCompose -Arguments @(
+        "up", "-d", "--force-recreate", "searxng", "api", "worker", "dispatcher", "beat", "web"
+    )
 } else {
-    $code = Invoke-DockerCompose up -d --build
+    $code = Invoke-DockerCompose -Arguments @(
+        "up", "-d", "--build", "--force-recreate", "searxng", "api", "worker", "dispatcher", "beat", "web"
+    )
 }
 if ($code -ne 0) {
     Write-Host "docker compose 启动失败，可查看日志：docker compose logs -f api" -ForegroundColor Red
@@ -160,7 +228,9 @@ if ($apiReady) {
 
 # ---------------------------------------------------------------- 5. Checkpoint
 Write-Step "初始化 LangGraph Checkpoint（幂等操作）"
-$code = Invoke-DockerCompose run --rm api python -m app.cli.setup_checkpoints
+$code = Invoke-DockerCompose -Arguments @(
+    "run", "--rm", "api", "python", "-m", "app.cli.setup_checkpoints"
+)
 if ($code -ne 0) {
     Write-Host "Checkpoint 初始化未完成，可稍后手动执行：" -ForegroundColor Yellow
     Write-Host "  docker compose run --rm api python -m app.cli.setup_checkpoints" -ForegroundColor Yellow
@@ -178,6 +248,29 @@ if ($webReady) {
 } else {
     Write-Host "Web 未在预期时间内就绪，可查看日志：docker compose logs -f web" -ForegroundColor Yellow
 }
+
+# ---------------------------------------------------------------- 7. Revision
+Write-Step "核对 API、Worker 与 Web 源码版本"
+$revisionOk = $apiReady -and $webReady
+if ($revisionOk) {
+    try {
+        $meta = Invoke-RestMethod -Uri "http://localhost:8000/api/v1/meta" -TimeoutSec 5
+        $revisionOk = $meta.source_revision -eq $env:SOURCE_REVISION
+        foreach ($service in @("worker", "dispatcher", "beat")) {
+            $serviceRevision = (& docker compose exec -T $service printenv SOURCE_REVISION 2>$null).Trim()
+            $revisionOk = $revisionOk -and ($serviceRevision -eq $env:SOURCE_REVISION)
+        }
+        $webRevision = (& docker compose exec -T web printenv VITE_SOURCE_REVISION 2>$null).Trim()
+        $revisionOk = $revisionOk -and ($webRevision -eq $env:SOURCE_REVISION)
+    } catch {
+        $revisionOk = $false
+    }
+}
+if (-not $revisionOk) {
+    Write-Host "运行态版本核对失败；拒绝把当前服务视为最新版本。" -ForegroundColor Red
+    exit 1
+}
+Write-Host "运行态版本一致：$env:SOURCE_REVISION" -ForegroundColor Green
 
 # ---------------------------------------------------------------- 汇总
 Write-Step "启动完成"

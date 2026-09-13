@@ -101,7 +101,16 @@ class ApplicationRuntime:
         response.raise_for_status()
 
     async def close(self) -> None:
-        await self.http.aclose()
-        await self.redis.aclose()
-        await self.checkpoint_db.close()
-        await self.business_db.close()
+        # Do not let one backend's shutdown failure prevent the remaining
+        # pools from closing; leaked connections make a subsequent app restart
+        # appear unhealthy and can exhaust the database under test reruns.
+        try:
+            await self.http.aclose()
+        finally:
+            try:
+                await self.redis.aclose()
+            finally:
+                try:
+                    await self.checkpoint_db.close()
+                finally:
+                    await self.business_db.close()

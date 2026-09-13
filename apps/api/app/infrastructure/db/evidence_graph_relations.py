@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import combinations
@@ -37,9 +38,18 @@ async def refresh_question_relations(
     *,
     run_id: UUID,
     question_id: str,
+    touched_claim_ids: Iterable[UUID] | None = None,
     persist: bool = True,
 ) -> RelationRefreshStats:
-    """Infer conservative Claim relations and persist idempotent graph records."""
+    """Infer conservative Claim relations and persist idempotent graph records.
+
+    ``touched_claim_ids`` enables incremental refreshes: when provided, only
+    claim pairs that include at least one newly-affected claim are re-inferred
+    and only those claims' statuses are recomputed. Unaffected claims have no
+    new evidence this turn, so their relations and status cannot change, and
+    skipping them preserves the same final graph with far less work. When it is
+    ``None`` the whole question is refreshed (legacy full refresh).
+    """
 
     claims = (
         await session.scalars(
@@ -94,7 +104,11 @@ async def refresh_question_relations(
     desired_conflict_pairs: set[tuple[UUID, UUID]] = set()
     disputed_claim_ids: set[UUID] = set()
     now = datetime.now(UTC)
-    for left, right in combinations(claims, 2):
+    touched: set[UUID] | None = set(touched_claim_ids) if touched_claim_ids is not None else None
+    all_pairs = list(combinations(claims, 2))
+    if touched is not None:
+        all_pairs = [(p, q) for p, q in all_pairs if p.id in touched or q.id in touched]
+    for left, right in all_pairs:
         examined_pairs += 1
         decision = infer_claim_relation(left.atomic_claim, right.atomic_claim)
         if decision is None:
@@ -179,13 +193,17 @@ async def refresh_question_relations(
 
     if persist:
         claim_ids = {claim.id for claim in claims}
-        if claim_ids:
+        edge_claim_ids = touched if touched is not None else claim_ids
+
+        if edge_claim_ids:
             existing_edges = (
                 await session.scalars(
                     select(ResearchClaimEdgeRow).where(
                         ResearchClaimEdgeRow.run_id == run_id,
-                        ResearchClaimEdgeRow.from_claim_id.in_(claim_ids),
-                        ResearchClaimEdgeRow.to_claim_id.in_(claim_ids),
+                        (
+                            ResearchClaimEdgeRow.from_claim_id.in_(edge_claim_ids)
+                            | ResearchClaimEdgeRow.to_claim_id.in_(edge_claim_ids)
+                        ),
                     )
                 )
             ).all()
@@ -195,15 +213,35 @@ async def refresh_question_relations(
                     await session.delete(edge)
                     deleted_edges += 1
 
-        existing_conflicts = (
-            await session.scalars(
-                select(ResearchConflictRow).where(
-                    ResearchConflictRow.run_id == run_id,
-                    ResearchConflictRow.question_id == question_id,
-                    ResearchConflictRow.definition_scope.like("deterministic_relation_v%"),
+        if touched is not None:
+            touched_evidence_ids: set[UUID] = set()
+            for claim_id in touched:
+                item = best_evidence.get(claim_id)
+                if item is not None:
+                    touched_evidence_ids.add(item[0].id)
+            existing_conflicts = (
+                await session.scalars(
+                    select(ResearchConflictRow).where(
+                        ResearchConflictRow.run_id == run_id,
+                        ResearchConflictRow.question_id == question_id,
+                        ResearchConflictRow.definition_scope.like("deterministic_relation_v%"),
+                        (
+                            ResearchConflictRow.left_evidence_id.in_(touched_evidence_ids)
+                            | ResearchConflictRow.right_evidence_id.in_(touched_evidence_ids)
+                        ),
+                    )
                 )
-            )
-        ).all()
+            ).all()
+        else:
+            existing_conflicts = (
+                await session.scalars(
+                    select(ResearchConflictRow).where(
+                        ResearchConflictRow.run_id == run_id,
+                        ResearchConflictRow.question_id == question_id,
+                        ResearchConflictRow.definition_scope.like("deterministic_relation_v%"),
+                    )
+                )
+            ).all()
         for conflict in existing_conflicts:
             conflict_key = (conflict.left_evidence_id, conflict.right_evidence_id)
             if conflict_key not in desired_conflict_pairs and conflict.status == "open":
@@ -214,7 +252,10 @@ async def refresh_question_relations(
                 conflict.updated_at = now
                 dismissed_conflicts += 1
 
+        status_claim_ids = (touched if touched is not None else set(claim_ids)) | disputed_claim_ids
         for claim in claims:
+            if claim.id not in status_claim_ids:
+                continue
             expected_status = derive_claim_status(
                 has_accepted_evidence=claim.id in source_owners_by_claim,
                 has_refuting_evidence=claim.id in refuting_claim_ids,

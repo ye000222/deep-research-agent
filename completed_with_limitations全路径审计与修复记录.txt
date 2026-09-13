@@ -1,0 +1,36 @@
+# `completed_with_limitations` 全路径审计与修复记录
+
+## 审计结论（2026-09-11）
+
+已检查研究状态、研究循环、预算守卫、Replan、Writer 和报告持久化路径。
+
+### 已确认的可能来源
+
+1. 真实研究预算耗尽：`_budget_exhausted()` 检查研究轮次、搜索、页面、模型 Token 或模型预算守卫。
+2. 质量门未满足且没有可执行候选：`prepare_target()` 进入 `sources_exhausted`。
+3. 质量达标：进入 `quality_met`，应生成普通 `completed`。
+4. Writer 生成失败或 Schema 降级：此前会因为 `assembled.limitations` 非空而额外把 Run 降级为 `completed_with_limitations`。
+
+## 本次修复
+
+- 缺口最大重试次数由 3 提高到 8；单个缺口不能在仍有真实搜索/页面/Token 预算时过早耗尽。
+- Replan 上限由固定的计划版本 `< 3` 改为最多 8 次，以真实预算为最终停止控制。
+- Writer 状态判定改为依据研究停止原因和质量门；Writer Schema 降级、缓存说明等实现级信息不再单独把质量达标 Run 标成 `completed_with_limitations`。
+- 仅当研究停止原因不是 `quality_met`，或质量门实际未满足时，才将最终 Run 标记为 `completed_with_limitations`。
+- 移除“缺口重试次数达到上限即没有候选”的隐式终止；缺口可继续调度，直到真实预算守卫触发。
+- 增加 8 组确定性查询变体，避免重试在最后一个搜索提示后归一化为同一个查询。
+- 当所有计划项暂时为 blocked/partial 但仍有未解决缺口时，评估器继续研究，不再直接写 `sources_exhausted`。
+
+## 验证
+
+- API 单元测试：206 项通过。
+- Ruff：通过。
+- Python compileall：通过。
+- 运行态更新：已执行 `docker compose up -d --force-recreate api worker dispatcher beat web`。
+- 容器检查：API、Worker、Dispatcher、Beat、Web 均为 `Up`；数据库 healthy。
+- Worker 检查：实际并发 2，日志已进入 `ready`。
+- Web/API 检查：分别返回 HTTP 200。
+- Web 容器源码检查：已确认加载最新 `App.tsx`。
+- API 容器配置检查：`max_gap_attempts=8`、`max_replans=8`。
+- 最终边界修复：Replan 同时受持久化计数和 `plan_version <= 8` 双重限制，兼容旧 Run。
+- 最终测试：API 单元测试 206 项通过；ruff、compileall、Web typecheck/build 均通过。

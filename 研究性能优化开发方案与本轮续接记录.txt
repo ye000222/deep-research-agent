@@ -1,0 +1,227 @@
+实施进度追加：2026-09-09 17:54:54（Asia/Shanghai）
+本轮已开始执行：预算可支付席位、首轮轮转、局部 yield、重试 Token 记账、性能 API/离线对照、原文窗口实验、调度 N+1 优化已落地。
+真实 PostgreSQL 回归与完整 Gate 通过，报告 performance_first_pass_gate.json。
+整体方案尚未全部完成，尤其原子 Token Ledger、真实对照、缓存、并发和增量评估仍待推进。
+准确的代码清单、测试与剩余任务见《研究性能优化实施记录.txt》；本文件开头的“本轮未实施”指方案编写时状态。
+
+研究性能优化开发方案与本轮续接记录
+================================
+记录时间：2026-09-09 17:08:19（Asia/Shanghai，精确到秒）
+状态：方案已形成；本轮未实施以下业务功能，未提交或推送。
+适用目录：D:/agentProject
+查阅基线：HEAD ddf5df1；工作区有大量未提交修复，HEAD 不代表运行代码全貌。
+
+一、目标与判断口径
+------------------
+用户要求：提高研究覆盖率、降低耗时和 Token，同时保持准确率和研究成功率。本方案按当前代码设计，可逐项实施。
+100% 执行进度表示流程已结束，不表示全部研究问题已满足；completed_with_limitations 必须单独统计。
+外部来源和模型响应有不确定性，不能从几次通过推导“永不下降”。以版本化对照实验、明确质量门和可回滚开关控制风险；证据不足照实披露。
+
+不可降低的验收要求：
+1. Exact Quote 可定位到实际 Snapshot/Chunk；Snippet、历史报告、压缩摘要不能直接充当原文证据。
+2. 保持现有事实支持、来源独立性、冲突披露、时效性和关键事实引用门槛。
+3. 原始研究目标、验收维度和优先级不可为提高覆盖率而被静默删改。动态新增问题单独标识。
+4. 预算预留、取消、任务重投、Secret、SSRF 和 Checkpoint 不变量继续通过。
+5. 固定硬预算不自动增加；失败和重试消耗计入总成本；无法获取 Usage 标记 estimated，不能计成零。
+
+拟定性能目标（实验目标，不是当前成果；全部相对冻结基线）：
+- 同题同预算：Token 中位数减少 >=20%，端到端耗时中位数减少 >=20%，p95 不恶化。
+- 加权覆盖率中位数提高 >=10 个百分点；基线已有高覆盖的任务不允许明显退步。
+- 未尝试研究问题数下降；可执行且有预算的原始问题首轮触达率 100%。
+- 引用支持精度不得低于基线，且不得低于现有发布门；关键事实缺引/错引不得新增。
+- 技术完成率、质量达标率分别不得退步，禁止用更多带限制完成替代质量成功。
+- 若某项优化只降低耗时而 Token 不变，可单独验收，不能宣称达到全部目标。
+
+二、当前核查结果与上轮结论修正
+----------------------------
+已直接检查文件：
+- apps/api/app/infrastructure/db/research_tools.py
+- apps/api/app/services/research_loop.py
+- apps/api/app/services/evidence_extractor.py
+- apps/api/app/services/report_writer.py
+- Token预算末段研究保护修复记录.txt
+
+观察到的事实：
+1. evidence_model_budget 使用剩余 Token 减 Writer 预留，再减 (pending_questions-1)*3000；不足时仍设置全局 model_budget_guarded。
+2. pending 统计包含 blocked/partial/technical_retry，未按已耗尽尝试次数过滤；方法没有当前 question_id 参数。
+3. 因而这只是算术预留，没有“本题让出预算→切换下一题”的调度闭环。未完成数不减少时，预留可以导致更早全局结束。
+   示例：剩余 22,000，Writer 预留 10,000，未完成 5 题，available=0；仍有 12,000 研究额度，却会全局停止。
+4. 3,000 调用额度在 Extractor 中会使 output_tokens 至多约 1,000，并压缩 input cap；上轮“只改门槛、不影响输出”表述不充分，需按真实请求预算验证。
+5. Extractor 按每 3,000 字符分块，rank_score 按网页位置递减；无 Context Manager 时只取前 14,000 字符。后部相关证据可能遗漏。
+6. research_loop 当前逐网页读取、抽取，一轮申请最多 3 个页面槽位。存在网络等待优化空间，但并发必须建立在原子预算和幂等上。
+7. Writer 有自己的预算判断；研究侧与写作侧应统一消费账本和调用预算定义，避免预留口径分歧。
+
+不能从现有证据确认的事项：
+- 最近几次实测的具体 Token 分布、失败重试占比、网页选择损失，需要读取脱敏 Run 指标后测量。
+- 上轮 Strict Gate 未全过：缺少测试数据库环境；不能将通过的单元测试等同于真实数据库/Provider 验证。
+- 本轮未执行性能实验；下文数值均为初始参数或验收目标。
+
+三、P0：先建立可比较的基线（预计 1～2 工作日）
+------------------------------------------
+改动位置：domain/providers.py、llm/adapters.py、db/research_runs.py、worker/tasks.py、evals/、scripts/release_gate.py。
+新增拟定文件：scripts/benchmark_research.py、evals/datasets/performance_cases.json、evals/graders/performance_grader.py。
+
+每个调用记录：run_id、question_id、gap_id、action_id、logical_call_id、attempt_id、node、模型/协议版本、配置快照哈希、开始/结束、queue/network/processing 时间、input/output/reasoning/cached Token（Provider 不提供则为空）、total、estimated 标记、重试原因、失败类型、Context Manifest、新增有效证据数与覆盖变化。
+total 使用 Adapter 规范化后的口径；reasoning 若已包含在 output，不能再次相加。缓存 Token 仍计输入上下文额度，费用单独计算。
+一次逻辑操作可有多个 attempt；每个 attempt 独立计费，避免重试汇总再逐条累计两次。
+敏感请求体、API Key 和完整 Prompt 不入公开事件；诊断只保存必要结构与哈希。
+
+实验分两层：
+A. 固定网页+固定 Provider 响应回放：至少 30 个案例，验证确定性调度、引用、预算和恢复；不能称为真实互联网成功率。
+B. 同一 Provider 配置的真实运行：先 3 例冒烟，再至少 30 题各版本重复 3 次，交替运行旧/新版本，记录服务错误率和时间窗口。首次批量真实调用须确认成本上限。
+题目覆盖：中英、长网页后部证据、市场/数字/日期、多个厂商、技术比较、低相关来源、搜索超时、JSON 截断、恢复、预算紧张。
+固定原始问题权重分母，原始与动态 Coverage 分开；统计每题触达/有效证据/未解决原因。
+输出按样本成对比较的 JSON 和可读摘要；按研究题目聚类计算 95% 区间，不能把同一题重复运行当独立题目。
+零退步门：准确率和两种成功率的差值区间下界需 >=0 才可严格声称不退步；样本不足以判定则扩大样本或保持实验开关关闭，不能以“未显著变差”等同“证明相同”。
+现有 Golden 绝对门槛同时保留；人工盲评固定抽样报告的全部关键事实，至少抽查 100 条事实。
+失败任务也进入耗时/成本统计，另报成功任务性能，防止快速失败制造提速。
+
+四、P1：预算与问题调度闭环（最高优先级，预计 2～3 日）
+-------------------------------------------------
+改动：db/research_tools.py 的 evidence_model_budget/prepare_target/finish_iteration、services/research_loop.py、domain/research_management.py、report_writer.py。
+新增纯领域策略模块：domain/research_budget.py。预算判定独立于网络，可直接测试。
+
+接口草案：
+BudgetDecision { outcome: execute|yield_question|stop_run,
+  question_id, input_limit, output_limit, repair_reserve,
+  writer_reserve, future_question_reserve, reason }
+evidence_model_budget 必须接收当前 question_id/action_id；调用者按 outcome 分支，不能用 allowed=False 统一终止。
+
+预算定义：
+research_available = hard_limit - actual_spent - active_reservations - writer_reserve
+最低调用成本 = 实际装配的 instructions + task + schema + 至少一个可用原文片段 Token + 输出预留 + 估算安全余量。
+按实际 Provider tokenizer/保守估算计算，不再假定 3,000 对所有模型和任务都够。
+Writer reserve 来自拟写章节、待引用证据和输出预算；必须有上限且保持与 Writer 实际请求一致。小预算时先完成可行性检查。
+
+实施顺序：
+1. 引入未研究、已尝试、部分支持、已完成、依赖暂不可用、尝试耗尽的调度属性；依赖失败不算无证据。
+2. 尚未尝试的原始问题先获得一次可执行机会；同组按用户优先级与等待时间排序。第一轮每题最多一个有效页面抽取，然后轮转。
+3. 首轮覆盖之后按预期“新增被支持的验收维度/预计 Token 与耗时”分配追加调用，同时用等待轮次防饿死。
+4. 当前问题不能动用其他问题保留额度时返回 yield_question；不设置 model_budget_guarded，不增加质量失败次数，不把问题标红为证据失败。
+5. 下一次 prepare_target 跳过本轮已让出的相同候选，避免忙循环；扫描一圈无人能执行才 stop_run，并列出未尝试原因。
+6. 仅当任一合法研究调用都不可支付或硬期限触发时设置全局 stop。预留不足可按优先级显式分配可支付席位，不能虚构所有题都有 3,000 可花。
+7. 已耗尽尝试、已完成与长期等待依赖的问题不持续锁死可用预算；等待恢复保留状态但释放未实际执行的调用预留。
+8. 一轮完成后基于实际消耗重算；新问题进入前验证预算，不静默替换原始问题。
+
+持久化拟定：model_budget_reservations 表，UUID id、run/action/logical_call/attempt、estimated_input、max_output、reserved_total、actual_total、status、lease_until、created_at/settled_at。
+唯一键 (run_id, attempt_id)；状态 reserved→settled/released/uncertain。锁 Run 并检查总额度后预留，网络调用在事务外，结果回写幂等结算。
+Provider 超时且可能已处理：预留转 uncertain，不能直接退还成零；按保守上界占用，后续对账。Worker 崩溃后同理。
+业务结算与事件原子落库；Checkpoint 重放不能再次扣同一个 attempt；新一次 Provider 请求必须有新 attempt。
+Migration 从运行时 head 派生，新文件序号先读取实际 Alembic head，禁止写死本文件猜测版本。
+
+必须补测：22k/5题反例；当前题让出后下一题执行；blocked 尝试耗尽释放额度；两 Worker 争抢不得越界；重复结算；超时未知 Usage；恢复不重复扣款；全部题不可支付正确终止；首轮轮转不丢高优先级。
+完成条件：预算可行的回放案例不存在最后若干题从未尝试；引用规则不变；真实总花费在硬预算及明确估算误差策略内。
+
+五、P2：按证据相关性装配上下文（预计 2～3 日）
+-------------------------------------------
+改动：evidence_extractor.py、context/manager.py；新增 context/source_selector.py 和后部证据 Fixture。
+1. 正文按段落/标题/表格边界切块，保留 snapshot_id、chunk_id、原文字符偏移、content_hash。
+2. 以当前问题和未满足 acceptance dimensions 检索全文块；使用既有中英分词与词项检索，数值、型号、实体保留精确匹配。
+3. 按相关度和维度缺口排序，再做 MMR 去重；每个尚未满足维度尽量分到原文空间，保留邻接段落和表头，最后按原文顺序呈现选中块。
+4. 第一遍小上下文；候选没有证据、维度遗漏或来源截断时，扩大相关块/邻接块继续抽取；不能将“未选中”解释成“网页不存在”。
+5. 仅发送新块与必要任务指令，不重复装入整个历史。扩展次数最多一次作为初值，后续不足返回明确 Gap。
+6. exact_quote 必须从原始正文定位。摘要只服务导航，不可作为引文来源；不拼接不连续文本制造支持。
+7. 输入压缩优先于砍输出。根据拟返回 1/3/5 条 Evidence 选择独立 Schema 上限；预算不足时明确使用小批次 contract，禁止保持五条大输出要求却任意压到 1,000 Token。
+8. 动态 Schema、输入加输出、repair 都由 P1 预算支付；格式失败按错误类型修复，避免重复整页。
+
+初始可调参数：上下文 3k→6k 两档，MMR lambda=0.7；这些参数需 Golden 调优，不能直接替换生产默认。
+验收：前部/后部/中英/跨段否定/日期条件/表格均可召回原文；关键证据 Recall 不低于全文基线；扩展费用计入净节省；模型错误率不增加。
+
+六、P3：减少重复工作，提高有效覆盖（预计 2～3 日）
+--------------------------------------------
+改动：research_loop.py、db/research_tools.py、artifacts.py、memory/manager.py；按需要新增 extraction_cache 表。
+
+三层缓存必须分开：
+A. 网页 Snapshot：同 Run、相同 URL/正文哈希可复用已读正文；跨任务要检查新鲜度并重验证。建议普通网页 TTL 初值 24h、时效性事实强制重取，参数需按任务时间约束覆盖。
+B. 抽取结果：键包含 scope、snapshot_hash、question/维度哈希、model/adapter/config、prompt/schema/extractor 版本。只缓存成功且原文校验通过的结果；空结果不等价于网络/格式失败。
+C. 证据到维度的映射：同一事实支持多个维度时分别建立支持关系、验证语义；相同来源不增加独立 Owner 数。不把某题 cache hit 当作其他问题已完成。
+
+缓存命中重新运行当前证据接纳规则；跨任务 Memory 仍只提供线索和研究经验。API Key 不参与明文缓存键，隔离依据 owner/scope/credential handle 版本。
+来源筛选按相关性、可读性、原始出处、缺失维度、独立 Owner 排序。近重复转载降低选择优先级；唯一来源不能因去重算法误删。
+搜索按 Gap 缺失内容生成中英文/实体/官方出处候选；保留搜索新配额给尚未触达问题，避免重复同义搜索。
+完成条件：相同 Snapshot+问题不重复模型抽取；不同问题仍正常搜索；过期/版本变化缓存失效；多维证据 Coverage 无虚增。
+
+七、P4：有限并发降低等待（P1 通过后，预计 2～3 日）
+------------------------------------------------
+改动：research_loop.py、HTTP client 生命周期、worker/tasks.py、Budget Reservation；新增并发/取消/崩溃 Fixture。
+先复用 HTTP 连接，再并发网页读取，最后考虑模型调用；每一步独立开关验证。
+HTTP client 按进程和事件循环创建关闭；不跨 Celery fork 复用；按连接隔离认证 Header、代理和 TLS 配置，不共享可泄漏的 Cookie/认证。
+初始网页并发 2、同 Host 1、模型并发 1；模型并发 2 仅在预算、限流和质量对照通过后开启。
+并发前原子申请 Token/页面/请求配额，取消后停止新增请求；已发出且不可取消的调用仍计费并收敛结果。
+读取可以并行；写入 State/Patch、质量评估和事件仍串行归并。归并使用稳定 candidate rank/action_id，保证回放顺序可解释。
+单网页故障隔离，不能取消已成功结果；不得在 HTTP/LLM 等待时持有数据库事务。
+若预取带来无效页面消耗，降低并发或仅预取确定将使用的页面；目标看全流程成本，不只网络时间。
+验收：取消/重投/部分超时不丢证据不重复消费；p95 改善且 429/超时率不增加。
+
+八、P5：增量评估、报告与查询开销（预计 2 日）
+------------------------------------------
+每轮只重算新增 Evidence 影响的 Claim/Dimension/Source；发生更正、撤销、冲突时主动失效关联缓存。
+写报告前再做完整一致性验证，不能只依赖增量缓存；无证据内容禁止补写。
+Writer 输入用已验证 Claim + Citation ID + 必要原文窗口 + 冲突/限制，避免发送所有网页与重复 quote。
+报告章节以 evidence/config/template hash 缓存，仅同 Run 恢复使用；证据变化后失效，最终全报告 Citation Verifier 必跑。
+对真实热查询先 EXPLAIN (ANALYZE, BUFFERS)，检查逐问题查询与重复关系扫描，合并聚合读取；只为已确认查询路径加索引。
+前端 SSE 批量合并渲染、限制历史列表 DOM；终态质量面板展示最终验证快照。指标正确性优先，前端提速不能改变后端统计。
+
+九、配置、事件和前端诊断
+----------------------
+所有优化配置按 Run 固化，恢复使用原版本；建议统一 performance_policy_version。
+实验开关：fair_budget_enabled、relevant_chunks_enabled、extraction_cache_enabled、parallel_reads_enabled、incremental_eval_enabled；初始 false，逐项验收后开启新 Run。
+GET /research-runs/{id}/performance（拟定，遵循现有 owner 权限）：
+elapsed_ms、active_ms、dependency_wait_ms、input/output/estimated_tokens、retry_tokens、cache_hits、original_question_touch_rate、quality_success、coverage、policy_version、stop_reason。
+进度面板增加“剩余研究额度/报告预留”“本题让出额度”“尚未研究问题数”“预算停止具体原因”。
+公开事件建议：budget.question_yielded、budget.reserved/settled、context.expanded、extraction.cache_hit；只含结构化摘要。
+让出不是 failed；执行完成、带限制完成、质量达标保持分开显示。
+
+十、发布与开发拆分
+----------------
+PR-A：P0 指标和基线（先冻结当前未提交代码的可追溯快照，保存 git diff + 文件哈希；不要覆盖现有修复）。
+PR-B：P1 预算和公平轮转，含数据库迁移/恢复/幂等测试。
+PR-C：P2 相关块选择和扩展，跑准确率对照。
+PR-D：P3 缓存与多维支持复用，跑隔离/时效/独立来源回归。
+PR-E：P4 连接复用和有限并发。
+PR-F：P5 增量优化、诊断、综合验收。
+预计 11～16 工作日，不含真实批量评测的等待和不确定调试时间。
+
+每 PR 需要：变更目的、代码入口、对应 Fixture、前后指标、未解决问题、开关回滚方法。
+检查命令（仓库根目录 PowerShell）：
+  .\.venv\Scripts\python.exe -m pytest tests/unit tests/api
+  .\.venv\Scripts\ruff.exe check apps/api tests scripts
+  .\.venv\Scripts\mypy.exe apps/api/app --config-file pyproject.toml
+  .\.venv\Scripts\python.exe scripts/release_gate.py --help
+Strict Gate 运行前按现有 CI 配置设置 RUN_POSTGRES_INTEGRATION、TEST_DATABASE_URL 及 Checkpoint/迁移测试所需变量，必须指向隔离测试库。
+不得对业务库运行清库/迁移回滚测试。缺少变量、跳过集成、Provider 冒烟缺失时均保持“未验证”。
+新增 benchmark 命令由 PR-A 实现后才可运行，勿把拟定脚本当已存在工具。
+回滚先停用新 Run 开关；在途 Run 保持快照兼容；数据库先做向后兼容的增量表，不用删表回滚影响在途任务。
+
+十一、重点反例清单（可直接转为测试用例）
+------------------------------------
+T01：22k 剩余额度/5题，不能因算术预留使整个 Run 立即终止。
+T02：首题连续多页低收益，后续问题仍获得首轮机会。
+T03：原文唯一答案在末尾，片段选择+扩展找到且引用定位正确。
+T04：两转载网页同一原始 Owner，不产生双来源验证。
+T05：一句事实可支持两维；错误关联维度被拒绝。
+T06：相同网页回答不同问题，缓存不压制第二题检索。
+T07：超时发生在 Provider 已计费后，不释放为零并越预算重试。
+T08：结算成功但 Checkpoint 未写，重放不重复消费和 Evidence。
+T09：两个请求同时申请最后额度，仅可支付的请求获批。
+T10：压缩上下文丢失否定/单位/表头，校验触发扩展且不接受误引。
+T11：全部来源不可用，依赖恢复而非标记所有题无证据。
+T12：取消发生在并发读取中，没有新增调用，已发出成本正确结算。
+T13：只有 3k 可用但 Schema+原文+输出不可容纳，明确 yield/stop，不能强行发出必截断请求。
+T14：撤销 Evidence 后，增量缓存和最终报告同时失效。
+T15：性能统计包含失败、Repair 和依赖等待，不虚报 Token/耗时节省。
+
+十二、本轮对话与续接记录
+----------------------
+用户请求：形成不降低准确率与成功率的详细性能开发方案，并记录以便续接。
+本轮完成：读取当前预算/循环/抽取/Writer 代码；发现上轮预留策略仍会全局提前停止的缺口；形成 P0～P5 实施顺序、接口/数据/测试/发布要求；更新总进度文档。
+本轮未做：没有修改业务实现，没有启动批量 Provider 调用，没有新跑测试，没有 commit/push 或重启服务。
+下次第一件事：复核工作区和现有进程状态，实施 PR-A 基线与 PR-B 的 yield_question 闭环；保留所有已有改动。
+不能直接沿用上轮“末段预算已彻底修复”的结论。本方案记录的是待开发事项；真实质量改善尚待实验。
+完成每个 P 项后追加当前日期时分秒、文件、测试报告路径、基线与结果、未完成内容；同时同步 DeepResearch_Agent_V1_功能审查结果.txt。
+
+参考资料（2026-09-09 查阅）：
+HTTPX Clients：https://www.python-httpx.org/advanced/clients/
+用于确认连接池可复用 TCP 连接，减少重复握手；具体收益仍需项目测量。
+PostgreSQL 18 EXPLAIN：https://www.postgresql.org/docs/18/using-explain.html
+用于按真实执行计划定位查询成本；在隔离环境使用 ANALYZE，注意其会实际执行语句。

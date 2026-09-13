@@ -19,6 +19,20 @@ class SearchResult(BaseModel):
     rank: int = Field(ge=1)
 
 
+class ReusablePageRef(BaseModel):
+    """A previously fetched page that may be re-extracted without HTTP."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: UUID
+    final_url: str = Field(min_length=1, max_length=4000)
+    title: str = Field(min_length=1, max_length=1000)
+    artifact_uri: str = Field(min_length=1, max_length=1000)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fetched_at: datetime
+    published_at: datetime | None = None
+
+
 class ReadPage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -27,6 +41,7 @@ class ReadPage(BaseModel):
     clean_text: str = Field(min_length=100)
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     fetched_at: datetime
+    published_at: datetime | None = None
     truncated: bool = False
 
 
@@ -76,6 +91,8 @@ class EvidenceView(BaseModel):
     source_url: str
     source_domain: str
     source_reliability: float
+    relevance: float = 0.0
+    confidence: float = 0.0
     evidence_score: float
     accepted: bool
     rejection_reason: str | None = None

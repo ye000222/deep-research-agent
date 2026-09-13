@@ -1,0 +1,63 @@
+Planner 截断修复与续接记录
+=========================
+记录时间：2026-09-08 09:25:07（Asia/Shanghai，精确到秒）
+
+一、本次用户反馈与目标
+用户报告 Planner 在 9% 失败：Compact Planner，进入原因 compact_invalid_or_schema，
+json_mode，finish_reason=length，1200/1200 Token。要求延续可靠性修复并保留续接记录。
+约束：不靠扩大 Token 或无限重试；不放松 Schema；不输出/保存密钥或隐藏思考正文；
+保留工作区既有修改，不提交、推送、发布或重写失败任务。
+
+二、实际证据及结论边界
+只读检查 llm_calls，最近失败 Run：01a07e8c-294d-711b-ab1d-425da950f6d0。
+普通 Planner：finish_reason=length，output_tokens=4000；此前解析成功后进入 Schema 错误路径。
+Compact：finish_reason=length，output_tokens=1200，response_length=0。
+相邻旧 Run 也有“输出预算耗尽但正文为空”。因此不是只有 JSON 字段过长一种可能。
+官方 DeepSeek V4 文档说明默认开启 thinking，推理内容与最终 content 分离。
+现有适配器未发送 thinking 开关；与推理占用输出预算的解释高度一致。
+旧记录没有 reasoning_tokens，尚不能追溯证明当时 1200 Token 全部用于推理。
+参考：https://api-docs.deepseek.com/guides/thinking_mode/
+参考：https://api-docs.deepseek.com/api/create-chat-completion/
+
+三、本次已实现
+1. 普通/Compact Planner 发出 canonical reasoning_enabled=False 意图。
+2. 仅官方 api.deepseek.com 的 deepseek-v4-flash / deepseek-v4-pro 翻译为
+   HTTP 顶层 thinking={type:disabled}。其他模型/兼容地址不注入专有参数。
+3. 保持普通 4000、Compact 1200 输出上限，保持最多两次结构化尝试和原 Schema。
+4. 显式 length 停止即拒绝，即便截断处恰好是可解析 JSON，也不能误记成功计划。
+5. CanonicalModelResult 和 llm_calls diagnostics 保存正文长度、思考存在标记、
+   Provider 提供时的 reasoning_tokens；不读取 reasoning_content 作为 JSON，不保存正文。
+6. Compact 失败保留 first_error_code / first_finish_reason，修正“两次均截断”的误导提示。
+7. 修正 Compact Schema 失败时首轮 Usage 被重复累加的计费诊断错误。
+8. 前端错误区补充正文字符数、推理 Token（如可用）或思考内容存在提示。
+
+四、验证和部署状态
+pytest tests/unit tests/api：145 passed，2 项已有 Starlette 弃用警告，无失败。
+Ruff 通过；MyPy apps/api/app：103 source files，无错误。
+Docker Web pnpm typecheck 通过；git diff --check 无错误（有既有换行警告）。
+重启前数据库 status 统计无 running/queued 任务，仅 failed/completed_with_limitations/interrupted。
+已 docker compose restart api worker；API /readyz 返回 200。
+本轮没有重跑数据库升级集成测试或完整 Release Gate；旧 full gate 报告早于本轮修改。
+
+五、待用户确认的真实验证（尚未执行）
+曾申请最多两次真实 Planner 调用：复用上述失败 Run 的加密连接和研究目标，
+普通/Compact 各验证一次；安全检查拒绝，理由是该具体任务目标向 Provider 外发未明确授权。
+请求未执行；没有真实 Smoke 成功结果，禁止把离线测试称为真实 Provider 验收。
+下次先向用户确认：是否允许使用已保存的 DeepSeek 连接，发送该失败任务的原研究目标，
+最多进行两次 Planner 测试，产生正常 API 费用？不可绕过拒绝或换途径偷偷执行。
+获准后：只读 binding，凭据临时解密；只输出安全计数和 Schema 是否通过；不更新旧 Run。
+核对 normal/compact finish_reason=stop、非空正文、Schema 合法、输出不超原上限。
+如仍失败，按正文长度、reasoning_tokens 和 Schema error 类型继续诊断，而非宣称修复彻底成功。
+用户也可刷新网页后新建一次研究；旧失败任务记录不会自动转成成功。
+
+六、代码位置与续接顺序
+apps/api/app/services/planner.py
+apps/api/app/llm/adapters.py
+apps/api/app/domain/providers.py
+apps/web/src/App.tsx
+tests/unit/test_llm_adapters.py
+tests/unit/test_planner_service.py
+当前分支 codex/v1.1-budget-guard；HEAD ddf5df1；大量既有未提交改动必须保留。
+下次先 git status --short / git log -1，再读本文件及研究完成度提升方案与续接记录.txt。
+本次是 Planner 可靠性修复，不意味着研究覆盖率达标。
+后续仍有实际预算扣减绑定、范围语义完善、30 案例生产 Graph 评测、真实研究验收及 CI/发布。

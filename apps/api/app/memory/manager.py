@@ -173,10 +173,7 @@ class ResearchMemoryManager:
             lexical_ids = tuple(str(row.id) for row, _rank in lexical_rows)
             fuzzy_ids = tuple(str(row.id) for row, _rank in fuzzy_rows)
             fused = reciprocal_rank_fusion(lexical_ids, fuzzy_ids)
-            rows_by_id = {
-                str(row.id): row
-                for row, _rank in [*lexical_rows, *fuzzy_rows]
-            }
+            rows_by_id = {str(row.id): row for row, _rank in [*lexical_rows, *fuzzy_rows]}
             maximum_rrf = 2.0 / 61.0
             scored = [
                 (
@@ -186,11 +183,7 @@ class ResearchMemoryManager:
                         0.65 * min(1.0, rrf_score / maximum_rrf)
                         + 0.20 * rows_by_id[memory_id].confidence
                         + 0.10 * rows_by_id[memory_id].importance
-                        + (
-                            0.05
-                            if rows_by_id[memory_id].origin_run_id == run_id
-                            else 0.0
-                        ),
+                        + (0.05 if rows_by_id[memory_id].origin_run_id == run_id else 0.0),
                     ),
                 )
                 for memory_id, rrf_score in fused.items()
@@ -218,10 +211,7 @@ class ResearchMemoryManager:
                 row.last_accessed_at = now
                 row.access_count += 1
                 row.updated_at = now
-            views = tuple(
-                self._item_view(row, current_run_id=run_id)
-                for row, _score in selected
-            )
+            views = tuple(self._item_view(row, current_run_id=run_id) for row, _score in selected)
             return MemoryRetrievalResult(access_id=access_id, items=views, result=result)
 
     async def apply_lifecycle(self, *, now: datetime | None = None) -> dict[str, int]:
@@ -377,6 +367,7 @@ def _expires_at(memory_type: MemoryType, now: datetime) -> datetime | None:
         MemoryType.SEMANTIC: timedelta(days=90),
     }
     return now + windows[memory_type]
+
 
 def _working_summary(state: ResearchState) -> str:
     next_action = state.next_action.action_type.value if state.next_action else "none"

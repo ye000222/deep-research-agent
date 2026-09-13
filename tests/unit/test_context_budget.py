@@ -32,6 +32,17 @@ def test_budget_rejects_window_that_cannot_protect_minimum_context() -> None:
         )
 
 
+def test_budget_can_apply_a_run_level_input_cap() -> None:
+    budget = allocate_budget(
+        context_window=32_000,
+        requested_output_tokens=3_500,
+        provider_max_output_tokens=8_000,
+        max_input_tokens=6_000,
+    )
+
+    assert budget.input_budget == 6_000
+
+
 def test_token_estimate_is_deterministic_and_nonzero() -> None:
     assert estimate_tokens("工业视觉 defect 2026") == estimate_tokens("工业视觉 defect 2026")
     assert estimate_tokens("x") == 1

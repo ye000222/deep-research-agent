@@ -30,6 +30,8 @@ class RunProviderBinding:
     encrypted_secret: EncryptedSecret
     context_window: int = 16_000
     max_output_tokens: int | None = None
+    relevant_chunks_enabled: bool = False
+    extraction_cache_enabled: bool = False
 
 
 class RunProviderBindingRepository:
@@ -71,6 +73,10 @@ class RunProviderBindingRepository:
             )
             return RunProviderBinding(
                 run_id=run.id,
+                relevant_chunks_enabled=run.budget_snapshot.get("relevant_chunks_enabled") is True,
+                extraction_cache_enabled=(
+                    run.budget_snapshot.get("extraction_cache_enabled") is True
+                ),
                 goal=run.normalized_goal,
                 adapter_type=adapter_type,
                 base_url=base_url,

@@ -267,8 +267,32 @@ def _budget_limits(run: ResearchRunRow) -> BudgetLimits:
     return BudgetLimits(
         max_iterations=max(1, int(budget.get("max_iterations", 8) or 8)),
         max_searches=max(0, int(budget.get("max_searches", 15) or 0)),
+        max_logical_queries=max(
+            0, int(budget.get("max_logical_queries", budget.get("max_searches", 15)) or 0)
+        ),
+        max_provider_requests=max(
+            0, int(budget.get("max_provider_requests", 30) or 0)
+        ),
         max_pages=max(0, int(budget.get("max_pages", 30) or 0)),
+        max_pages_fetched=max(
+            0, int(budget.get("max_pages_fetched", budget.get("max_pages", 30)) or 0)
+        ),
+        max_pages_extracted=max(
+            0, int(budget.get("max_pages_extracted", budget.get("max_pages", 30)) or 0)
+        ),
+        max_extraction_calls=max(
+            0, int(budget.get("max_extraction_calls", budget.get("max_pages", 30)) or 0)
+        ),
+        max_verification_calls=max(
+            0, int(budget.get("max_verification_calls", 5) or 0)
+        ),
+        max_scheduler_actions=max(
+            0, int(budget.get("max_scheduler_actions", 60) or 0)
+        ),
         max_model_tokens=max(1, int(budget.get("max_tokens", 100_000) or 100_000)),
+        max_wall_clock_seconds=max(
+            1, int(budget.get("max_wall_clock_seconds", 720) or 720)
+        ),
     )
 
 
@@ -281,11 +305,31 @@ def _budget_usage(run: ResearchRunRow) -> BudgetUsage:
     return BudgetUsage(
         iterations=max(0, int(usage.get("iterations", 0) or 0)),
         searches=max(0, int(usage.get("searches", 0) or 0)),
+        logical_queries=max(
+            0, int(usage.get("logical_queries", usage.get("searches", 0)) or 0)
+        ),
+        search_provider_requests=max(
+            0, int(usage.get("search_provider_requests", 0) or 0)
+        ),
         pages=max(0, int(usage.get("pages", 0) or 0)),
+        pages_fetched=max(
+            0, int(usage.get("pages_fetched", usage.get("pages", 0)) or 0)
+        ),
+        pages_extracted=max(
+            0, int(usage.get("pages_extracted", usage.get("pages", 0)) or 0)
+        ),
+        extraction_calls=max(0, int(usage.get("extraction_calls", 0) or 0)),
+        verification_calls=max(0, int(usage.get("verification_calls", 0) or 0)),
+        scheduler_actions=max(0, int(usage.get("scheduler_actions", 0) or 0)),
+        productive_iterations=max(
+            0, int(usage.get("productive_iterations", usage.get("iterations", 0)) or 0)
+        ),
+        technical_retries=max(0, int(usage.get("technical_retries", 0) or 0)),
         model_tokens=max(
             0,
             planner_tokens + writer_tokens + int(usage.get("evidence_total_tokens", 0) or 0),
         ),
+        model_budget_guarded=bool(usage.get("model_budget_guarded")),
     )
 
 
@@ -349,13 +393,29 @@ def _state_phase(phase: str) -> ResearchPhase:
 
 
 def _stop_reason(reason: str | None) -> StopReason | None:
-    if reason is None:
+    if reason is None or reason in {
+        "model_transport_retry_pending",
+        "search_transport_retry_pending",
+    }:
         return None
     if reason in {"quality_met", "completed"}:
         return StopReason.QUALITY_MET
     if reason == "completed_with_limitations":
         return StopReason.COMPLETED_WITH_LIMITATIONS
-    if reason == "research_budget_exhausted":
+    if reason in {
+        "research_budget_exhausted",
+        "RESEARCH_BUDGET_EXHAUSTED",
+        "page_budget_exhausted",
+        "search_budget_exhausted",
+        "token_budget_exhausted",
+        "iteration_budget_exhausted",
+        "deadline_exhausted",
+        "logical_query_budget_exhausted",
+        "provider_request_budget_exhausted",
+        "fetched_page_budget_exhausted",
+        "extracted_page_budget_exhausted",
+        "action_budget_exhausted",
+    }:
         return StopReason.BUDGET_EXHAUSTED
     if reason == "stagnation":
         return StopReason.STAGNATION

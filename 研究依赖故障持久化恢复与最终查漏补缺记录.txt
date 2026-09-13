@@ -1,0 +1,61 @@
+研究依赖故障持久化恢复与最终查漏补缺记录
+==========================================
+
+记录时间：2026-09-08 22:14:17（Asia/Shanghai）
+当前分支：codex/v1.1-budget-guard
+起始 HEAD：ddf5df1 docs: record V1.1 merge gate audit
+状态：修复与本地完整验证已完成，尚未 git commit / git push
+
+一、本轮复核出的剩余根因
+------------------------
+
+1. Evidence Extractor 的 MODEL_TIMEOUT、MODEL_NETWORK_ERROR、MODEL_RATE_LIMITED、MODEL_PROVIDER_UNAVAILABLE 原先被当成单页抽取失败吞掉。
+2. 如果同一外部故障窗口覆盖多个页面，研究循环会继续消耗问题和页面预算，最终把依赖故障错误表现为 REPORT_NO_ACCEPTED_EVIDENCE。
+3. SearXNG 在内部回退和熔断后返回的 retryable 全局故障，原先仍可能在同一个 Worker 故障窗口内快速消耗后续问题。
+4. 旧 Master Key、AAD 不匹配或密文损坏会抛出 cryptography InvalidTag，最终只能显示 WORKER_EXECUTION_FAILED/INVALIDTAG。
+5. 失败记录虽然有终止码，但通用失败缺少发生前的实际 phase，网页无法稳定说明是 planning、researching、writing 还是 verifying 出错。
+
+二、已完成的修复
+----------------
+
+1. Evidence Extractor 遇到暂时性 Provider 故障时，先持久化已读取 Source Snapshot/Artifact 和安全失败事件，再结算当前页面、释放未用页面预留并把异常交给 Worker。
+2. Worker 使用既有模型持久化恢复路径：Run/Checkpoint/phase 保留，任务进入 queued，30/120/600/1800 秒后由事务型 Outbox 自动恢复。
+3. SearXNG 的 retryable 全局故障不再伪装成某个问题的“无证据”；Worker 使用独立的 search_transport_retry_pending、独立阶段计数和延迟 resume Outbox。
+4. 搜索恢复与模型恢复的重试预算相互独立；同一 phase 最多四次持久化恢复，确定性错误不无限重试。
+5. ResearchState 将 model_transport_retry_pending 和 search_transport_retry_pending 都投影为 queued、stop_reason=None。
+6. 每次延迟恢复均清理 page_slots_reserved，避免新 Worker 继承崩溃前的批次预留；已经提交的页面和 Token 使用量不回退。
+7. SecretCipher 把 Key 版本不可用、AES-GCM 认证失败、明文编码损坏分类为 KEY_VERSION_UNAVAILABLE、CREDENTIAL_AUTHENTICATION_FAILED、CREDENTIAL_PLAINTEXT_INVALID，不再暴露 InvalidTag 或敏感材料。
+8. 通用失败默认记录发生前的 failure_node；页面预算错误继续记录实际限制、用量和越界量。
+9. 前端增加 Search Recovery、搜索延迟恢复次数/倒计时、failure_node 和凭据/搜索错误的明确提示。
+10. 模型与搜索延迟恢复分别使用 model_retry_boundary 和 search_retry_boundary 状态节点名，避免审计语义混淆。
+
+三、回归与完整验证
+------------------
+
+- 新增/更新单元回归：抽取网络错误不会完成迭代；未用页面槽位被释放；retryable 搜索错误不会被吞掉；两种 retry pending 均不成为终止原因；Secret Key 版本和 AAD 错误有明确分类。
+- 新增真实 PostgreSQL 集成：搜索故障会原子写入 queued Run、保留 phase、释放 Lease、写入延迟 resume Outbox 和 search.retry_deferred 事件，State stop_reason 为空。
+- 单元/API：154 项通过。
+- 真实 PostgreSQL Integration：4/4 通过，无跳过。
+- Ruff：通过。
+- MyPy：103 个后端源文件 0 error。
+- Web：TypeScript typecheck 与 Vite production build 通过。
+- Strict V1 Release Gate：全量 pytest 158 项（含上述 4 项集成）通过；Migration Head 20260906_0019、Golden Eval、Secret Scan、MySQL 禁用检查全部通过。
+- 机器可读报告：evals/reports/current_release_gate_dependency_recovery.json。
+- 运行服务：API、Worker、Dispatcher、Beat 已重启；/readyz 的 PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+- 过期 running 任务：0。
+
+四、保证范围
+------------
+
+本轮修复保证暂时性模型/搜索依赖故障不会继续消耗整批研究预算后再被误报为“无证据”，也不会立即成为不可恢复的 UNKNOWN。状态、Checkpoint、Artifact、预算与幂等约束会保留并自动延迟恢复。
+
+不能承诺外部 Provider、搜索网络、目标网页或用户凭据永远可用，也不能保证每次研究都达到质量门。四级恢复全部耗尽、凭据不可解密、确定性 Schema/能力错误或来源确实不足时，任务仍会以明确诊断终止或 completed_with_limitations；系统不会伪造 100% 质量成功。
+
+五、下一次安全续接
+------------------
+
+1. 禁止 reset/restore 当前工作区；当前包含本轮及之前尚未提交的 V1.1 稳定性、Coverage、Evidence、预算和前端诊断改动。
+2. 先检查 git status --short、git diff --check 和本文件。
+3. 如果用户要求发布，再提交当前最新工作树并推送新分支，等待 GitHub 的 PostgreSQL integration、api、web、compose、Strict V1 release gate 全绿。
+4. 真实 Provider Smoke 需由用户明确允许发送具体研究主题并确认可能产生的 API 成本；本轮没有擅自调用付费模型。
+5. 仍待产品质量工作：30 个真实生产 Graph 端到端案例、真实健康来源质量指标、时间/地区/单位完整范围模型、Tool allocation 逐项绑定。

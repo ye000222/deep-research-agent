@@ -74,9 +74,7 @@ async def test_planner_retries_transient_failures(monkeypatch: pytest.MonkeyPatc
 async def test_planner_does_not_retry_permanent_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    planner = FakePlanner(
-        [ModelGatewayError("MODEL_AUTHENTICATION_FAILED", retryable=False)]
-    )
+    planner = FakePlanner([ModelGatewayError("MODEL_AUTHENTICATION_FAILED", retryable=False)])
     repository = FakeRepository()
 
     async def fail_if_called(delay: float) -> None:
