@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     app_name: str = "DeepResearch Agent"
     app_env: str = "development"
     app_version: str = "0.1.0"
+    source_revision: str = "development"
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
 
@@ -69,6 +70,8 @@ class Settings(BaseSettings):
             )
         if self.app_env.lower() != "test" and not self.langgraph_strict_msgpack:
             raise ValueError("LANGGRAPH_STRICT_MSGPACK must remain enabled outside tests")
+        if "*" in self.cors_origin_list:
+            raise ValueError("CORS_ORIGINS must list explicit origins when credentials are enabled")
         return self
 
     def public_snapshot(self) -> dict[str, str | bool]:
@@ -78,6 +81,7 @@ class Settings(BaseSettings):
             "app_name": self.app_name,
             "app_env": self.app_env,
             "app_version": self.app_version,
+            "source_revision": self.source_revision,
             "strict_checkpoint_serialization": self.langgraph_strict_msgpack,
             "external_probes_enabled": self.external_probes_enabled,
             "persist_provider_credentials": self.persist_provider_credentials,

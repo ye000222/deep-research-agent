@@ -1,0 +1,301 @@
+研究性能优化实施记录
+====================
+会话整体状态（2026-09-10 收尾，最新结论，各分节见下方按阶段记录）：
+- P0（基线/工具）：部分——performance API、benchmark/grader 已有，尚缺 30 题 Provider 对照、
+  按题聚类置信区间、人工盲评。
+- P1（预算闭环）：调度核心完成并经真实 PostgreSQL 验证（账本/最小调用成本/Writer 口径）。
+- P2（相关块选择）：select_relevant_blocks 实现并接入，默认关；Recall 对照待真实测量。
+- P3（抽取缓存）：extraction_cache 表/迁移 0021/repo/命中接入，默认关；跨题 Evidence→维度复用未做。
+- P4（网页有限并发）：read_pages_concurrently 实现并接入，默认关；真实网络收益待测。
+- P5（增量评估/报告/前端诊断）：报告草稿缓存 + 增量关系评估 + 前端预算诊断面板均已实现（默认关/
+  展示用）；下一步见文末"下一步续接"。
+- 收尾验证（2026-09-10）：Release Gate 通过（ruff/mypy/pytest/PostgreSQL 集成/golden/secret scan，
+  web 用 vite build 单独通过，compose 因本机未跑 docker 组合而跳过）；迁移 head=20260910_0022。
+- Windows 两个旧集成失败已修复：根因是环境初始化（缺 deep_research_test_checkpoint 库与 langgraph
+  checkpoint 表 + 缺 DATABASE_URL），非事件循环；tests/conftest.py 已用 contextlib.suppress 设置
+  Selector 策略消除 ProactorEventLoop 警告，隔离 checkpoint 库已建表，集成 7 项全绿。
+- 本会话全部改动未 commit/push；真实 PostgreSQL 集成（隔离库 deep_research_test）通过迁移到 0022、
+  账本、抽取缓存与报告草稿缓存测试；两个旧集成失败为 Windows ProactorEventLoop 与 psycopg
+  async pool 兼容问题，与性能开发无关，未计入结果。
+
+分阶段记录从下方开始，最新阶段（P1 集成）在上。
+
+=== 分阶段记录 ===
+P5（报告草稿缓存，2026-09-10，默认 report_draft_cache_enabled=false）：
+- 新增 report_draft_cache 表/迁移 20260910_0022 与 ReportDraftCacheRepository：键为 (run_id,
+  context_hash)，writer_version 参与；幂等 put、空 draft 不缓存。
+- services/report_writer.py：新增可选 draft_cache 依赖与 _draft_context_hash（对 goal/stop_reason/
+  quality_snapshot/questions/选中 evidence 排序序列化后 SHA-256，任一变化即失效）；命中时
+  ReportDraft.model_validate 复用并跳过模型调用（writer_mode=cache），未命中则生成后写缓存；
+  坏缓存条目回退重新生成，不阻断写作。最终 Citation Verifier 不受影响。
+- worker/tasks.py 注入；research_runs.py budget_snapshot 新增 report_draft_cache_enabled（默认 false）。
+- alembic/env.py 注册；test_migration_upgrade head 断言改为 20260910_0022。
+- 测试：单测 _draft_context_hash 确定性与证据/问题变化失效；PostgreSQL 集成 put/get 幂等、跨
+  context 失效、空 draft 不写、唯一键。全量回归 194 passed、Ruff、MyPy 通过；隔离库迁移到 0022 成功。
+
+P5（增量评估，2026-09-10，本阶段）：
+- evidence_graph_relations.refresh_question_relations 新增 touched_claim_ids 增量入参（None=全量，
+  兼容旧行为）。
+- 增量原理：关系/冲突基于 Claim 文本（静态）+ 证据（未变则不变）；只有"含新增证据绑定 Claim"
+  的 pair 需要重算。增量刷新只推断这类 pair、只按 touched 参与范围清理旧边/旧冲突、只重算
+  touched ∪ 争议中 claims 的 status。
+- 一致性关键点：被 touched claim 卷入冲突的非 touched claim 也随 disputed_claim_ids 更新为
+  disputed，避免增量下状态漂移；写报告前仍做完整一致性验证。
+- record_page 每页插入后改传 touched_claim_ids=graph_claim_ids（该页新增 evidence 绑定的 claims），
+  由全量 O(C²) 每轮降为 O(k·C)（k=本轮触达 claims 数）。
+- 测试：单测验证增量只 examine 含 touched 的 pair（3 claims 中 touched 1 个 → examined_pairs=2）、
+  只创建 touched 相关冲突、非触达 claim 状态不变、touched=None 为全量。全量回归 196 passed、Ruff、
+  MyPy 通过；P1/P3/P5 持久化集成 4 项通过。
+
+P5（前端预算诊断面板，2026-09-10）：
+- apps/web/src/App.tsx 进度面板 RESOURCE BUDGET 下新增 BUDGET DIAGNOSTICS 区块，展示：
+  剩余研究额度 (Token)、报告预留、尚未研究问题数、本题让出次数、已结算预留、是否预算停止 + 停止原因。
+- 数据来源：剩余额度 = max_tokens - 已用模型 Token；报告预留/待研究问题数取自最新 budget.updated
+  事件的 writer_token_reserve / pending_questions；让出次数统计 budget.question_yielded；停止原因取
+  run.termination_reason。
+- styles.css 新增 .budget-diagnostics/.budget-diag-grid/.budget-diag-stop 样式。
+- 验证：tsc --noEmit（typecheck）通过，vite build 打包成功（index.js 241kB/gzip 75.6kB）。
+- 说明：展示型改动；实际渲染需运行中的后端 + 真实 Run 数据（本会话未启动完整栈，故未做 GUI 截图，
+  以 typecheck+build 作为编译正确性验证）。
+
+2026-09-10 （追加：P1 真实 PostgreSQL 集成验证通过；P2 块感知选择器落地）
+
+P1 PostgreSQL 集成验证（本会话连接本机 PostgreSQL 18.6，隔离库 deep_research_test，未触碰业务库）：
+- alembic upgrade head 在 deep_research_test 上成功，链 20260906_0019 -> 20260909_0020（账本建表）。
+- tests/integration/test_migration_upgrade.py 通过（在临时 deep_research_upgrade_* 库上从头升级到 0020）。
+- tests/integration/test_model_budget_ledger.py 通过：预留/幂等结算/uncertain 保守占用/释放/
+  租约过期归还/预算拒绝/终态行均在真实事务边界验证。
+- 其余集成（test_postgres_recovery、test_checkpoint_and_redelivery）为 Windows ProactorEventLoop
+  与 psycopg async pool 兼容问题，与账本无关，未计入 P1 结果。
+- 前置单元/静态：183 passed、Ruff、MyPy 通过。
+
+P2（已完成，本阶段）：
+- context/source_selector.py 新增 select_relevant_blocks：按段落/标题边界切块（保留偏移），
+  MMR 去重，expand_neighbors 扩展邻接块（跨块答案），返回按原文顺序的块并带最近前驱表头
+  （heading）元数据。表头识别覆盖 # 标题、下划线标题与短行标题。
+- 已接入 evidence_extractor 主路径（relevant_chunks_enabled 为 True 时启用，默认 False）；
+  扩展因子=1。rank_source_windows 保留以兼容既有测试。
+- 单测：后部/跨块（邻接扩展纳入第二句、不拉到两段外的无关话题）、表头元数据、原文顺序/偏移、
+  中文检索、可重复性。全量回归 + Ruff + MyPy 通过。
+- 需真实测量项（尚未验证）：Recall 不低于全文基线、扩展费用计入净节省、模型错误率不增加——
+  依赖回放/真实运行，在本会话无网络/真实 Provider 的环境如实记录为未验证。
+
+P3（已完成，本阶段，默认 extraction_cache_enabled=false）：
+- 新增 extraction_cache 表/migration 20260910_0021 与 ExtractionCacheRepository：
+  键含 run_id、question_hash、snapshot_hash(content hash)、adapter、model、extractor_version；
+  唯一键幂等；put 空结果返回 False 永不缓存为成功。
+- services/evidence_extractor.py：新增可选 extraction_cache 依赖与命中路径——命中跳过 Provider
+  调用但重跑当前接纳规则（_score_batch 已抽取为复用方法），返回零用量 estimated；缓存只写通过
+  接纳（accepted）的候选；prompt/schema/extractor 版本参与缓存键，版本变化即失效。
+- worker/tasks.py 注入 ExtractionCacheRepository；run_providers binding 与 research_runs
+  budget_snapshot 新增 extraction_cache_enabled 开关（默认 false）。
+- alembic/env.py 注册新模型；test_migration_upgrade head 断言改为 20260910_0021。
+- 测试：单测（命中跳过 Provider、未命中写 accepted、空不缓存）；PostgreSQL 集成（put/get 幂等、
+  空不写、唯一键）。全量回归 + Ruff + MyPy 通过；隔离库到 0021 迁移成功。
+- 跨问题 Evidence→维度复用尚未实现（属 P3 后半），后续迭代。
+
+P4（已完成，本阶段，parallel_reads_enabled 默认关闭）：
+- 新增 services/parallel_reads.py 的 read_pages_concurrently：并发读取多网页，总量信号量与
+  每 Host 上限（保守累计，避免单 host 过载），单页故障隔离不取消兄弟抓取、URL 去重。
+- services/research_loop.py：新增 parallel_reads_enabled 构造开关（默认 False）；当启用时，
+  在串行处理前对"待用新页面"（granted 批、first_pass 单页）并发预取，循环内优先消费预取结果，
+  预取失败记录 page 失败并继续；reserve/extract/record 仍串行；非启用路径完全不变。
+- 测试：read_pages_concurrently 故障隔离/每 Host 上限/去重+稳定顺序；research_loop 并发路径
+  预取失败被隔离计数且不触发模型调用。全量回归 + Ruff + MyPy 通过。
+- 需真实测量项（尚未验证）：HTTP 连接复用收益、p95 改善、429/超时率不增加，依赖真实网络运行。
+
+下方为 P2/P3、P1 集成与更早记录，保持原样。
+
+2026-09-10 （追加：P1 真实 PostgreSQL 集成验证通过；P2 块感知选择器落地）
+
+本轮已完成（未提交）：
+- domain/research_budget.py 新增 conservative_chars_to_tokens 与 estimate_minimum_call_tokens
+  纯函数：CJK 按 1 字符/token、拉丁按保守系数估算；最小成本 = 固定开销(instructions+task+schema)
+  + 最小原文片段 + 最小输出 + 安全余量，永不低于各输入、不进位归零。
+- services/evidence_extractor.py 新增 estimate_minimum_request_tokens：用真实装配字符串
+  （EXTRACTOR_INSTRUCTIONS、最小 task_brief、item_limit=1 的 schema、一个 3000 字符原文块、
+  最小输出 768）估算一次调用最小成本，替代“3,000 对所有模型和任务都够”的假定（对应 T13）。
+- db/research_tools.py evidence_model_budget 新增 minimum_call 参数并 clamp 到单次调用上限，
+  不再固定用 3000；预留与判定按动态最小成本。
+- services/research_loop.py：target 开始时估算最小成本，传入 initial 与每页预算判定；
+  当可支付额度 < 最小装配成本时不发出必然截断的调用（break），避免强发必截断请求（T13）。
+- 测试：test_research_budget 新增动态最小成本 stop、estimate 不低于输入、CJK/拉丁 token 估算；
+  test_research_loop 新增最小成本不足时不读页不发调用、正常预算下最小成本被正确传递。
+- 统一 Writer 预留口径（P1 收尾）：
+  - domain/research_budget.py 新增 estimate_writer_reserve_tokens：按拟写问题数、待引用证据数、
+    固定装配与输出预留估算 Writer 调用成本，并 clamp 到既有 10,000 硬上限；随报告规模增长。
+  - db/research_tools.py evidence_model_budget 的 writer_reserve 改用该估算（以当前未完成问题数、
+    已收集证据驱动），不再用固定的 max(3000, max//10)。
+  - services/report_writer.py _writer_budget_available 改为同一估算口径（question/evidence 取自
+    ReportContext），使研究侧预留与写作侧判定一致，避免口径分歧。
+  - test_research_budget 新增 Writer 预留随报告规模增长、不低于装配形状且受上限约束的断言。
+
+已执行验证：tests/unit + tests/api 全量 183 passed；Ruff、MyPy 通过。
+真实 PostgreSQL 集成仍因本会话无数据库环境保持“未验证”。
+
+下方为此前轮次的 Token Ledger 记录，保持原样。
+
+2026-09-09 （追加：Token Reservation Ledger 已实现，基础验证通过）
+
+本轮已完成（未提交）：
+1. 新增 apps/api/app/infrastructure/db/model_budget_models.py：
+   model_budget_reservations 表（run/question/node/attempt_id、estimated_input、max_output、
+   reserved_total、actual_total、status reserved→settled|released|uncertain、usage_estimated、
+   lease_until、created_at/settled_at；唯一键 (run_id, attempt_id)）。
+2. 新增迁移 apps/api/alembic/versions/20260909_0020_model_budget_reservations.py，
+   head 从 20260906_0019 顺序派生；alembic/env.py 已注册新模型模块；
+   tests/integration/test_migration_upgrade.py 的 head 断言同步改为 20260909_0020。
+3. db/research_tools.py 新增账本方法（均在锁定 Run 的事务内）：
+   - reserve_model_tokens：按 attempt 原子预留；重复预留同一 attempt 幂等返回；
+     可用额度 = max_tokens - model_tokens - 在途预留，不足返回 insufficient_budget 不虚发调用。
+   - settle_model_reservation：按实际用量幂等结算（已 settled/released 不再结算）。
+   - mark_model_reservation_uncertain：Provider 可能已计费但用量未知时保守占用，不退还为零。
+   - release_model_reservation：确认未产生计费调用才释放。
+   - _outstanding_reservation_total：reserved（租约未过期，15 分钟）+ uncertain 全部计入在途；
+     Worker 崩溃后租约到期自动归还，对账前不丢失保守占用。
+4. evidence_model_budget 已扣除在途预留总额（remaining = max - used - outstanding）。
+5. record_page / record_extraction_failure 新增 attempt_id 参数：
+   成功或带用量失败→按 usage.total_tokens 结算（accuracy != EXACT 记 usage_estimated）；
+   失败且无用量→置 uncertain，不直接释放。
+6. services/research_loop.py：每次模型抽取前生成 uuid7 attempt_id 并预留
+   （estimated_input = max_call_tokens - min(max_call_tokens//4, 4000)，
+   max_output = min(max_call_tokens//4, 4000)）；预留不获批则停止本轮后续页面。
+7. tests/unit/test_research_loop.py FakeRepository 已补预留/结算/uncertain/释放桩，
+   并断言同一 attempt 不会被预留两次。
+8. 新增 tests/integration/test_model_budget_ledger.py：预留/幂等结算/uncertain 保守占用/
+   释放/租约过期归还/预算拒绝/终态行断言；依赖真实 PostgreSQL（skipif 守卫）。
+9. tests/integration/test_migration_upgrade.py 的 head 断言已改为 20260909_0020；
+   alembic history 确认迁移链正确加载，head = 20260909_0020。
+
+本轮已执行验证：
+- 全量 tests/unit + tests/api 回归通过（含 test_research_loop、test_research_budget）。
+- Ruff（model_budget_models、research_tools、research_loop、测试与迁移文件）通过；
+  MyPy（3 个业务模块 + 新集成测试）通过。
+- Alembic 迁移链加载校验通过（见上 9）。
+- 真实 PostgreSQL 集成（含 test_model_budget_ledger、test_migration_upgrade）本会话无数据库
+  环境，未能运行，保持"未验证"；具备 RUN_POSTGRES_INTEGRATION=1 + TEST_DATABASE_URL 时自动执行。
+
+本轮剩余待办：
+- 在具备 Postgres 的 CI/环境跑：test_model_budget_ledger.py 全场景、test_migration_upgrade.py
+  （含 0020 建表）、既有 4 项集成；修复后跑完整 Release Gate。
+- 可选补测：两 Worker 对同一 Run 并发预留不越界（T09）；恢复重放不重复扣同一 attempt（T08，已由幂等结算覆盖）。
+- 已知设计行为：durable transport 错误路径直接 raise，预留保持 reserved 由租约（15 分钟）到期归还；
+  如需立即转 uncertain 可在后续迭代收紧。
+- 下方为此前轮次的历史记录，保持原样。
+
+2026-09-09 17:54:54（Asia/Shanghai）
+
+本轮请求：执行《研究性能优化开发方案与本轮续接记录.txt》进行优化。
+工作区存在先前大量未提交修复，全部保留；未 commit/push，未重启业务容器。
+
+一、本轮已落地
+1. domain/research_budget.py：独立可测的预算分配策略。
+   将“为所有待办项扣固定预留直到 available=0”改为只分配当前真正付得起的席位。
+   execute / yield_question / stop_run 明确分开，只有无法支付调用才触发全局保护。
+2. db/research_tools.py 与 services/research_loop.py：
+   - 查询排除尝试耗尽问题；预算接口接收当前 question_id。
+   - 未尝试的问题先执行，之后按尝试轮次、覆盖率和优先级轮转。
+   - 多问题首轮每题最多抽取一个页面，避免第一个问题连续消耗三个页面的模型费用。
+   - 本题让出时不增加 gap.resolution_attempts 或质量失败次数，产生 budget.question_yielded 事件。
+   - 准备目标时一次读取所有 Gap，消除每个候选一次查询的 N+1。
+3. services/evidence_extractor.py：
+   - Schema 修复请求使用小上下文，预算不足时停止发起修复。
+   - 普通失败→紧凑回应→Schema 修复三段消耗完整累计。
+   - 空结果补救若 JSON Schema 错误也计入已经发生的调用 Token。
+   - 空结果补救前检查剩余预算。
+   - Context Manager 拒绝原文后不再退回未受控的大段原文。
+   - 正常调用输出额度较小时使用 1/2 条小批次 Schema，足额时保持最多 5 条，原文支持规则不变。
+4. context/source_selector.py：
+   中英文词项相关性与 MMR 选择原文窗口，保留 start/end/content；覆盖网页后部内容。
+   已接入 Extractor，但 relevant_chunks_enabled 默认 false，按 Run budget_snapshot 读取。
+   这是实验能力：尚未完成所有维度的邻接扩展、表头保护、Recall 对照；不得称为全部 P2 完成。
+5. 性能观测与对照工具：
+   - GET /api/v1/research-runs/{id}/performance：先检查 owner，提供已审计 Token、调用耗时合计、重试 Token、Coverage、策略版本。
+   - 未观测的 active/dependency_wait 时间返回 null；measurement_complete=false，避免把缺测当零。
+   - scripts/benchmark_research.py + evals/graders/performance_grader.py：读取成对测量记录，拒绝漏样本、重复样本、不同配置；失败运行仍计耗时和成本。
+   - 当前工具只做描述性比较，release_approved 恒为 false；不冒充统计非劣验证。
+6. 新 Run 固化 performance_policy_version=fair_first_pass.v1；相关片段实验默认关闭。
+
+二、已执行验证
+- 全量单元/API 回归通过；新增首轮单页、重试漏计费用、无预算修复、后部原文、中文检索、性能 API 越权和缺测测试。
+- 真实隔离 PostgreSQL deep_research_test 验证：22k 剩余/Writer 10k/5题仍可执行；q1 让出后选 q2，未设置全局停止且不增加尝试次数。
+- 完整 Release Gate 通过：Ruff、MyPy、pytest、PostgreSQL 4 项集成、Web build、Golden、Secret Scan。
+- 报告：evals/reports/performance_first_pass_gate.json。
+- 最后小批次 Schema 改动另通过 Extractor 回归与静态检查；全量最终结果见后续追加记录。
+- 没有进行真实付费 Provider A/B 测试，因此没有宣称节省 20% 或提升 10 个百分点。
+
+三、方案状态（严格区分）
+P0：部分完成。已有 API/离线对照工具，尚缺完整逻辑调用/attempt 时间分解、30 题 Provider 对照、按题聚类置信区间与人工盲评。
+P1：调度核心修复完成并通过数据库回归；完整 Token Reservation Ledger、未知 Usage 对账、按实际装配计算最小可执行成本仍待实现。当前 minimum_call 是策略阈值，不能保证所有模型请求均可容纳。
+P2：原文相关窗口实验接入，默认关闭；完整扩展与质量比较待完成。
+P3：未新增抽取缓存/跨维支持缓存；保留既有网页快照复用。
+P4：核查已有 Worker 生命周期 AsyncClient 复用，无须重复实现；新网页并发尚未启用，应在 Ledger 完成后做。
+P5：调度查询 N+1 已移除；增量 Evaluation/报告缓存/前端性能面板尚未完成。
+
+四、下次直接续接
+1. 先读取本记录、方案、当前 git diff；不要覆盖先前修复或重做已通过任务。
+2. 完成 P1 model_budget_reservations：按 attempt 幂等预留/结算/uncertain 对账，网络调用位于事务外，未知 Provider 消耗不能直接退还。
+3. 最小调用成本按 instructions/schema/task/原文窗口/输出/余量计算；统一 Writer 口径。测试极长问题与 3k 不可容纳情况。
+4. 完成 P0 测量导出和 30 题固定回放，再推进 P2 扩展策略。批量真实调用先明确成本上限。
+5. P1/P2 通过质量对照后继续 P3、P4、P5；实验开关逐项启用，恢复保留原 Run 配置。
+6. 业务服务本轮未重启，新功能尚未确认在当前网页进程生效；部署前检查在途 Run，避免中断研究。
+
+离线对照命令（输入为 JSON 数组）：
+.\.venv\Scripts\python.exe scripts/benchmark_research.py --baseline baseline.json --candidate candidate.json
+每行字段：case_id、repetition、config_hash、elapsed_ms、total_tokens、coverage、support_precision、technical_success、quality_success。
+config_hash 应固定 Provider/Model/研究预算/题目条件，优化版本另外记录；coverage/precision 范围 0～1。
+performance API 不提供完整基准样本，仍需按题与人工质量标注关联，不能直接拿调用成功代替事实准确率。
+
+=== 下一步续接（P5 及收尾） ===
+P5 尚未实施，建议下一会话按序：
+1. P5 增量评估：每轮只重算新增 Evidence 影响的 Claim/Dimension/Source，更正/撤销/冲突时主动失效关联缓存。
+2. P5 报告章节缓存：报告章节以 evidence/config/template hash 缓存，仅同 Run 恢复使用、证据变化后失效。
+3. P5 前端诊断：进度面板增加"剩余研究额度/报告预留""本题让出""尚未研究问题数""预算停止原因"；
+   SSE 批量合并渲染、限制历史列表 DOM。
+4. 真实测量补全：P0 的 30 题 Provider A/B 对照、按题聚类置信区间、≥100 条人工盲评；P2/P3/P4 的
+   Recall 净节省、模型错误率、429/超时率、p95 收益是否达标。批量真实调用先明确成本上限。
+5. 收尾：按 PR 拆分提交（PR-A~F）、完整 Release Gate（Ruff/MyPy/pytest/PG 集成/Web build/Golden/Secret Scan）。
+6. 已知事项：Windows 下 psycopg async pool 需 SelectorEventLoop；切换为 Linux/CI 或 Selector 策略可排除
+   test_postgres_recovery 与 test_checkpoint_and_redelivery 的环境性失败。
+
+=== 本轮离线回放测量（2026-09-10） ===
+新增 scripts/replay_recall_benchmark.py，产出 evals/reports/replay_recall_savings.json：
+确定性回放 30 个固定合成网页，关键证据句置于 14k 字符前缀之后。
+- 基线（前部 14000 字符）：关键证据句召回 0/30。
+- 相关块选择器（select_relevant_blocks, limit=64, expand_neighbors=1）：关键证据句召回 30/30。
+- 平均输入节省 32.4%（相关块在覆盖同一证据时比 14k 前缀少 32.4% 输入）。
+- 顺带修复 source_selector 性能：MMR 预计算每块词项并复用，单长页选择由数十秒级降至 0.6s 级。
+边界（如实）：
+- 这是方案 A 层「固定网页回放」，验证选择的确定性调度/覆盖率，不代表真实互联网或真实模型精度。
+- 真实 429 率、真实 p95、真实模型错误率需要真实付费 Provider + 网络 + 成本上限授权，本会话未进行，
+  不宣称达标。后续需 P0 阶段真实 A/B 对照补全。
+
+=== 本轮执行进展（2026-09-10 22:19:54，Asia/Shanghai） ===
+本轮按推荐顺序执行到第 5 步，未进行未授权的真实 Provider 消费调用。
+1. 已完成：scripts/replay_recall_benchmark.py 的中文全角标点 Fixture Ruff 告警处理。
+2. 已完成：Ruff 全部通过；MyPy 通过（113 个源文件）；全部 tests/unit 与 tests/api 通过。
+3. 已完成：隔离 PostgreSQL Release Gate 通过。报告：evals/reports/performance_optimization_gate.json；migration_head=20260910_0022；包含 PostgreSQL 7 项集成测试、Web build、Golden、Secret Scan。
+4. 已完成：新增 domain/incremental_evaluation.py，定义 Evidence→Question→Global→Section→Report 失效边界；Evidence 撤销或冲突变化触发报告草稿缓存失效；新增 tests/unit/test_incremental_evaluation.py，局部测试和 MyPy 通过。
+5. 已完成：在 deep_research_test 隔离库执行 3 条真实 EXPLAIN (ANALYZE, BUFFERS)。accepted evidence 查询命中 ix_research_evidence_question；report citations 命中 Index Only Scan；model budget 状态查询约 0.12ms Seq Scan（当前数据量小，不新增索引）。
+6. 未完成：3 个真实 Provider 冒烟；需要用户明确单次/总成本上限，并在隔离 Run 中执行。
+7. 未完成：30 题×每题 3 次新旧版本交替 A/B；依赖第 6 步及成本授权。
+8. 未完成：至少 100 条关键事实人工盲评；需要固定报告样本和标注人员/规则。
+9. 未完成：只有在 6～8 步完成后，才能判断覆盖率、引用支持精度、技术成功率是否不退步并逐项开启优化开关。
+10. 未完成：最终 Release Gate 必须在所有修改收敛后重新生成；本轮 Gate 通过不等于真实 Provider 性能目标已达成。
+当前结论：P0/P1 基础、P2 离线回放、P4 基础并发与 P5 失效规划已具备验证证据；真实性能发布门仍未满足。
+
+=== 本轮最终本地 Gate（2026-09-10 22:23:25，Asia/Shanghai） ===
+当前代码重新生成 evals/reports/performance_optimization_final_local_gate.json：passed=true；Ruff 通过；MyPy 通过（113 files）；pytest 通过；PostgreSQL 集成通过；Web build、Golden、Secret Scan 通过；migration_head=20260910_0022。
+该 Gate 仅证明本地确定性质量和数据库回归，不包含真实 Provider 冒烟、30×3 真实 A/B 或 100 条人工盲评，因此不能据此宣称性能目标达成或进入发布。
+
+=== 本轮增量优化（2026-09-11，Asia/Shanghai） ===
+用户要求在不影响现有行为的前提下复核并补齐：搜索退避、分层预算、原始问题首轮触达、动态 Writer 预留释放，以及暂停/受限报告/取消拆分。
+
+1. 已确认并保留：搜索 transport 的持久化退避（30/120/600/1800 秒）、后台 Outbox 恢复、倒计时字段、当前题让出，以及 Web Search Circuit Breaker/fallback 均已存在，本轮不重复实现。
+2. 已确认并保留：question_schedule_key 先完成所有零尝试问题，再进行有限轮次 gap 补证；已有单元测试覆盖首轮优先，因此不改调度顺序。
+3. 已新增：apps/api/app/domain/research_budget.py 的 estimate_question_budgets，按 priority、evidence_requirements、search_hints 在研究开始前计算可行的逐题 Token envelope；预算不足时等额降级，不突破 max_tokens。
+4. 已接入：save_generated_plan 在保存计划时持久化 question_token_budgets、question_token_budget_total、writer_tokens_initial 和 budget_estimate_version，便于前端/诊断解释预算为何可行。
+5. 已补齐：报告保存时根据 Writer 实际用量写入 writer_token_reserve_released；动态预留未使用额度显式回收并可审计。原有 evidence pre-call guard 继续保护 Writer 额度。
+6. 已拆分生命周期：新增 ResearchRunRepository.pause、ResearchRunService.pause_run 和 POST /api/v1/research-runs/{run_id}/pause。暂停撤销待派发任务、清理 Worker lease、保留 interrupted 状态和 Checkpoint；resume 继续恢复；cancel 仍是不可逆取消；completed_with_limitations 仍仅表示受限报告。
+7. 校验：新增预算估算单元测试；修改文件已通过 Git diff --check 与容器内 Python 语法编译检查。当前容器未安装 Ruff/pytest，未宣称本轮完整测试通过；提交前需在 CI/开发依赖容器运行 Ruff、MyPy、unit/API、PostgreSQL Gate。
+8. 当前未做：没有改动搜索策略阈值、Provider 调用协议或既有状态迁移，避免影响当前运行；真实 Provider、A/B 和人工盲评仍按上一条 Gate 记录执行。

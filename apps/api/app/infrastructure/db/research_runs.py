@@ -18,6 +18,12 @@ from app.domain.planning import (
     fit_plan_to_budget,
 )
 from app.domain.providers import TokenUsage
+from app.domain.research_budget import (
+    build_resource_pool_snapshot,
+    classify_question_risk,
+    estimate_question_budgets,
+    model_token_pool_limits,
+)
 from app.domain.research_runs import (
     TERMINAL_RUN_STATUSES,
     AgentEventView,
@@ -32,6 +38,107 @@ from app.infrastructure.db.run_models import (
     ResearchRunRow,
     TaskDispatchOutboxRow,
 )
+
+_MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS = (30, 120, 600, 1800)
+_MODEL_TRANSPORT_RETRY_PENDING = "model_transport_retry_pending"
+_SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS = (30, 120, 600, 1800)
+_SEARCH_TRANSPORT_RETRY_PENDING = "search_transport_retry_pending"
+
+
+def _reset_plan_scoped_question_budget(
+    usage_snapshot: Mapping[str, object],
+    *,
+    reset_question_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Reset only per-question state explicitly reopened by a replan.
+
+    A question-level budget exhaustion is real run state, not a plan-wide
+    switch.  Carrying it across a replan is wrong for reopened gaps, while
+    clearing the whole map lets unrelated questions re-enter repeatedly.
+    """
+    usage = dict(usage_snapshot)
+    for field in (
+        "question_budget_exhausted_by_question",
+        "query_strategy_exhausted_by_question",
+    ):
+        values = usage.get(field)
+        if isinstance(values, dict) and reset_question_ids:
+            remaining = dict(values)
+            for question_id in reset_question_ids:
+                value = remaining.get(question_id)
+                hard_exhaustion = (
+                    field == "question_budget_exhausted_by_question"
+                    and isinstance(value, dict)
+                    and value.get("reason") == "hard_question_token_limit"
+                )
+                if not hard_exhaustion:
+                    # Legacy boolean entries were produced by temporary
+                    # fairness yields and are safe to clear for a targeted gap.
+                    # Proven hard token limits survive every plan version.
+                    remaining.pop(question_id, None)
+            if remaining:
+                usage[field] = remaining
+            else:
+                usage.pop(field, None)
+    return usage
+
+
+def _reset_replanned_quality_state(
+    quality_snapshot: Mapping[str, object],
+    *,
+    reset_question_ids: tuple[str, ...],
+    plan_version: int | None = None,
+) -> dict[str, object]:
+    """Reopen targeted risk states and clear only their low-gain history."""
+
+    quality = dict(quality_snapshot)
+    streaks = quality.get("low_information_gain_streak_by_question")
+    if isinstance(streaks, dict):
+        remaining = dict(streaks)
+        for question_id in reset_question_ids:
+            remaining.pop(question_id, None)
+        quality["low_information_gain_streak_by_question"] = remaining
+    quality["low_information_gain_streak"] = 0
+    raw_questions = quality.get("risk_state_by_question", {})
+    questions = dict(raw_questions) if isinstance(raw_questions, dict) else {}
+    for question_id in reset_question_ids:
+        raw_state = questions.get(question_id, {})
+        state = dict(raw_state) if isinstance(raw_state, dict) else {}
+        reasons_raw = state.get("reasons", [])
+        reasons = list(reasons_raw) if isinstance(reasons_raw, list) else []
+        if "replan_reopened" not in reasons:
+            reasons.append("replan_reopened")
+        state.update(
+            {
+                "gap_open": True,
+                "lifecycle": "open",
+                "borrow_eligible": bool(state.get("unresolved_high_risk", False)),
+                "reasons": reasons,
+            }
+        )
+        questions[question_id] = state
+    quality["risk_state_by_question"] = questions
+    raw_risk = quality.get("risk_state", {})
+    risk = dict(raw_risk) if isinstance(raw_risk, dict) else {}
+    risk["version"] = "claim_gap.v2"
+    if plan_version is not None:
+        risk["plan_version"] = plan_version
+    risk["questions"] = questions
+    summary_raw = risk.get("summary", {})
+    summary = dict(summary_raw) if isinstance(summary_raw, dict) else {}
+    summary["unresolved_questions"] = sum(
+        bool(state.get("unresolved_high_risk"))
+        for state in questions.values()
+        if isinstance(state, dict)
+    )
+    summary["borrow_eligible_questions"] = sum(
+        bool(state.get("borrow_eligible"))
+        for state in questions.values()
+        if isinstance(state, dict)
+    )
+    risk["summary"] = summary
+    quality["risk_state"] = risk
+    return quality
 
 
 class ResearchRunNotFoundError(LookupError):
@@ -99,6 +206,27 @@ class ResearchRunRepository:
                 raise CredentialVersionNotFoundError(str(credential_version_id))
             profile, credential = binding
 
+            allocation = budget_snapshot.get("allocation", {})
+            allocation = allocation if isinstance(allocation, dict) else {}
+            initial_model_pools: dict[str, object] = {
+                name: {
+                    "allocated_tokens": limit,
+                    "committed_tokens": 0,
+                    "reserved_tokens": 0,
+                    "remaining_tokens": limit,
+                    "status": "available" if limit > 0 else "disabled",
+                }
+                for name, limit in model_token_pool_limits(allocation).items()
+            }
+            initial_usage: dict[str, object] = {
+                "model_token_pools": initial_model_pools,
+            }
+            initial_usage["resource_pools"] = build_resource_pool_snapshot(
+                budget_snapshot,
+                initial_usage,
+                model_token_pools=initial_model_pools,
+            )
+
             run = ResearchRunRow(
                 id=uuid7(),
                 owner_hash=owner_hash,
@@ -121,6 +249,7 @@ class ResearchRunRepository:
                     "max_output_tokens": profile.non_secret_settings.get("max_output_tokens"),
                 },
                 budget_snapshot=budget_snapshot,
+                usage_snapshot=initial_usage,
             )
             session.add(run)
             await session.flush()
@@ -214,6 +343,57 @@ class ResearchRunRepository:
                 refs={
                     "run_id": str(run.id),
                     "previous_status": previous_status,
+                    "cancelled_dispatches": len(pending_dispatches),
+                },
+                metrics={"cancelled_dispatches": len(pending_dispatches)},
+            )
+            await session.flush()
+        return self._view(run)
+
+    async def pause(self, owner_hash: str, run_id: UUID) -> ResearchRunView:
+        """Pause a run without conflating it with cancellation or a report limit.
+
+        Pending dispatches are revoked and an already-claimed worker is made a
+        no-op by clearing its lease.  The run remains ``interrupted`` and can be
+        resumed through the existing checkpoint path; no report is finalized.
+        """
+        async with self._sessions() as session, session.begin():
+            run = await self._lock_run(session, owner_hash, run_id)
+            current = RunStatus(run.status)
+            if current in TERMINAL_RUN_STATUSES:
+                return self._view(run)
+            pending_dispatches = (
+                await session.scalars(
+                    select(TaskDispatchOutboxRow)
+                    .where(
+                        TaskDispatchOutboxRow.run_id == run.id,
+                        TaskDispatchOutboxRow.status.in_(
+                            ("pending", "retry", "publishing")
+                        ),
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            for dispatch in pending_dispatches:
+                dispatch.status = "cancelled"
+                dispatch.last_error = "run_paused_by_user"
+            now = datetime.now(UTC)
+            run.status = RunStatus.INTERRUPTED.value
+            run.termination_reason = "user_paused"
+            run.lease_owner = None
+            run.lease_until = None
+            run.worker_task_id = None
+            run.finished_at = None
+            run.updated_at = now
+            run.state_version += 1
+            await self._append_event(
+                session,
+                run,
+                event_type="run.paused",
+                public_summary="研究任务已暂停; 当前 Checkpoint 将在恢复时继续。",
+                refs={
+                    "run_id": str(run.id),
+                    "previous_status": current.value,
                     "cancelled_dispatches": len(pending_dispatches),
                 },
                 metrics={"cancelled_dispatches": len(pending_dispatches)},
@@ -395,12 +575,32 @@ class ResearchRunRepository:
             if current_status != RunStatus.QUEUED and not expired_takeover:
                 return False
             run.status = RunStatus.RUNNING.value
-            if not expired_takeover:
+            if not expired_takeover and RunPhase(run.phase) == RunPhase.INITIALIZING:
                 run.phase = (
-                    RunPhase.RESEARCHING.value
-                    if run.plan_version > 0
-                    else RunPhase.PLANNING.value
+                    RunPhase.RESEARCHING.value if run.plan_version > 0 else RunPhase.PLANNING.value
                 )
+            # A run may be resumed after an older Worker already recorded more
+            # Provider usage than the configured ceiling. Preserve that truthful
+            # telemetry, but mark it guarded before State synchronization so the
+            # graph can converge to deterministic limited-report writing without
+            # issuing another model call.
+            usage = dict(run.usage_snapshot)
+            model_tokens = _model_token_total(usage)
+            maximum_tokens = int(run.budget_snapshot.get("max_tokens", 0) or 0)
+            if maximum_tokens > 0 and model_tokens >= maximum_tokens:
+                usage["model_tokens"] = model_tokens
+                usage["model_budget_guarded"] = True
+            usage.pop("model_retry_after_seconds", None)
+            usage.pop("model_retry_not_before", None)
+            usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot, usage
+            )
+            run.usage_snapshot = usage
+            if run.termination_reason in {
+                _MODEL_TRANSPORT_RETRY_PENDING,
+                _SEARCH_TRANSPORT_RETRY_PENDING,
+            }:
+                run.termination_reason = None
             run.started_at = run.started_at or now
             run.updated_at = now
             run.lease_owner = "celery-worker"
@@ -508,6 +708,14 @@ class ResearchRunRepository:
                 plan,
                 max_iterations=int(run.budget_snapshot.get("max_iterations", 0) or 0),
             )
+            allocation = dict(run.budget_snapshot.get("allocation", {}))
+            pool_limits = model_token_pool_limits(allocation)
+            writer_reserve = pool_limits["writer"]
+            research_pool = pool_limits["research"]
+            question_budgets = estimate_question_budgets(
+                [question.model_dump(mode="json") for question in plan.questions],
+                max_tokens=research_pool,
+            )
             plan_version = run.plan_version + 1
             for question in plan.questions:
                 session.add(
@@ -531,10 +739,116 @@ class ResearchRunRepository:
                 "plan_scope_summary": plan.scope_summary,
                 "plan_completion_criteria": plan.completion_criteria,
             }
-            run.usage_snapshot = {
+            allocation.update(
+                {
+                    "writer_tokens_initial": writer_reserve,
+                    "question_token_budgets": {
+                        item.question_id: item.target_tokens for item in question_budgets
+                    },
+                    "question_token_floors": {
+                        item.question_id: item.minimum_tokens for item in question_budgets
+                    },
+                    "question_token_budget_total": sum(
+                        item.target_tokens for item in question_budgets
+                    ),
+                    "budget_estimate_version": "question_weighted.v2",
+                    "question_budget_plan_version": plan_version,
+                }
+            )
+            run.budget_snapshot = {**run.budget_snapshot, "allocation": allocation}
+            initial_risk_states = {
+                question.id: classify_question_risk(
+                    question_id=question.id,
+                    priority=question.priority,
+                    coverage=0.0,
+                    requirements=question.evidence_requirements,
+                    gap_open=True,
+                    open_dimension_keys=tuple(
+                        f"{question.id}:d{index}"
+                        for index, _criterion in enumerate(
+                            question.evidence_requirements, start=1
+                        )
+                    ),
+                ).as_dict()
+                for question in plan.questions
+            }
+            run.quality_snapshot = {
+                **run.quality_snapshot,
+                "risk_state": {
+                    "version": "claim_gap.v2",
+                    "plan_version": plan_version,
+                    "questions": initial_risk_states,
+                    "claims": {},
+                    "gaps": {},
+                    "conflicts": {},
+                    "summary": {
+                        "unresolved_questions": sum(
+                            bool(state.get("unresolved_high_risk"))
+                            for state in initial_risk_states.values()
+                        ),
+                        "unresolved_claims": 0,
+                        "open_gaps": len(plan.questions),
+                        "open_conflicts": 0,
+                        "borrow_eligible_questions": sum(
+                            bool(state.get("borrow_eligible"))
+                            for state in initial_risk_states.values()
+                        ),
+                    },
+                },
+                "risk_state_by_question": initial_risk_states,
+            }
+            updated_usage = {
                 **run.usage_snapshot,
                 "planner": usage.model_dump(mode="json"),
             }
+            updated_usage["model_tokens"] = _model_token_total(updated_usage)
+            ledger_raw = updated_usage.get("budget_ledger", [])
+            budget_ledger = list(ledger_raw) if isinstance(ledger_raw, list) else []
+            budget_ledger.extend(
+                [
+                    {
+                        "node": "planner",
+                        "phase": "planning",
+                        "allocated_tokens": pool_limits["planner"],
+                        "actual_tokens": usage.total_tokens,
+                        "status": "settled",
+                    },
+                    {
+                        "node": "evidence_extractor",
+                        "phase": "researching",
+                        "allocated_tokens": research_pool,
+                        "actual_tokens": 0,
+                        "status": "available",
+                    },
+                    {
+                        "node": "writer",
+                        "phase": "writing",
+                        "allocated_tokens": writer_reserve,
+                        "actual_tokens": 0,
+                        "status": "protected",
+                    },
+                    {
+                        "node": "verification",
+                        "phase": "writing",
+                        "allocated_tokens": _safe_int(allocation.get("verification_tokens", 0)),
+                        "actual_tokens": 0,
+                        "status": "protected",
+                    },
+                    {
+                        "node": "safety",
+                        "phase": "all",
+                        "allocated_tokens": _safe_int(allocation.get("safety_tokens", 0)),
+                        "actual_tokens": 0,
+                        "status": "protected",
+                    },
+                ]
+            )
+            updated_usage["budget_ledger"] = budget_ledger[-20:]
+            updated_usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot,
+                updated_usage,
+            )
+            run.usage_snapshot = updated_usage
             run.phase = RunPhase.RESEARCHING.value
             run.termination_reason = None
             run.updated_at = datetime.now(UTC)
@@ -629,11 +943,26 @@ class ResearchRunRepository:
             run.plan_version = plan_version
             run.phase = RunPhase.RESEARCHING.value
             run.termination_reason = None
-            quality = dict(run.quality_snapshot)
-            quality["low_information_gain_streak"] = 0
-            run.quality_snapshot = quality
-            usage = dict(run.usage_snapshot)
-            usage["replans"] = int(usage.get("replans", 0) or 0) + 1
+            run.quality_snapshot = _reset_replanned_quality_state(
+                run.quality_snapshot,
+                reset_question_ids=tuple(reset_ids),
+                plan_version=plan_version,
+            )
+            usage = _reset_plan_scoped_question_budget(
+                run.usage_snapshot,
+                reset_question_ids=tuple(reset_ids),
+            )
+            replans = usage.get("replans", 0)
+            usage["replans"] = (
+                int(replans) + 1 if isinstance(replans, (int, float, str)) else 1
+            )
+            # A question-level budget yield belongs to the old plan version.
+            # Replan creates fresh pending work for the selected gaps; carrying
+            # the old map forward would make prepare_target skip those new
+            # items and incorrectly conclude that sources are exhausted.
+            usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot, usage
+            )
             run.usage_snapshot = usage
             run.updated_at = datetime.now(UTC)
             run.state_version += 1
@@ -732,6 +1061,82 @@ class ResearchRunRepository:
             run.plan_version = plan_version
             run.phase = RunPhase.RESEARCHING.value
             run.termination_reason = None
+            allocation = dict(run.budget_snapshot.get("allocation", {}))
+            research_pool = model_token_pool_limits(allocation)["research"]
+            question_budgets = estimate_question_budgets(
+                [question.model_dump(mode="json") for question in revised.questions],
+                max_tokens=research_pool,
+            )
+            allocation.update(
+                {
+                    "question_token_budgets": {
+                        item.question_id: item.target_tokens for item in question_budgets
+                    },
+                    "question_token_floors": {
+                        item.question_id: item.minimum_tokens for item in question_budgets
+                    },
+                    "question_token_budget_total": sum(
+                        item.target_tokens for item in question_budgets
+                    ),
+                    "budget_estimate_version": "question_weighted.v3_rebalanced",
+                    "question_budget_plan_version": plan_version,
+                }
+            )
+            run.budget_snapshot = {**run.budget_snapshot, "allocation": allocation}
+            updated_usage = _reset_plan_scoped_question_budget(
+                run.usage_snapshot,
+                reset_question_ids=tuple(question.id for question in additions),
+            )
+            updated_usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot, updated_usage
+            )
+            run.usage_snapshot = updated_usage
+            quality = _reset_replanned_quality_state(
+                run.quality_snapshot,
+                reset_question_ids=tuple(question.id for question in added),
+                plan_version=plan_version,
+            )
+            risk_by_question_raw = quality.get("risk_state_by_question", {})
+            risk_by_question = (
+                dict(risk_by_question_raw)
+                if isinstance(risk_by_question_raw, dict)
+                else {}
+            )
+            for question in added:
+                risk_by_question[question.id] = classify_question_risk(
+                    question_id=question.id,
+                    priority=question.priority,
+                    coverage=0.0,
+                    requirements=question.evidence_requirements,
+                    gap_open=True,
+                    open_dimension_keys=tuple(
+                        f"{question.id}:d{index}"
+                        for index, _criterion in enumerate(
+                            question.evidence_requirements, start=1
+                        )
+                    ),
+                ).as_dict()
+            quality["risk_state_by_question"] = risk_by_question
+            risk_raw = quality.get("risk_state", {})
+            risk = dict(risk_raw) if isinstance(risk_raw, dict) else {}
+            risk["questions"] = risk_by_question
+            risk["plan_version"] = plan_version
+            risk["version"] = "claim_gap.v2"
+            summary_raw = risk.get("summary", {})
+            summary = dict(summary_raw) if isinstance(summary_raw, dict) else {}
+            summary["unresolved_questions"] = sum(
+                bool(state.get("unresolved_high_risk"))
+                for state in risk_by_question.values()
+                if isinstance(state, dict)
+            )
+            summary["borrow_eligible_questions"] = sum(
+                bool(state.get("borrow_eligible"))
+                for state in risk_by_question.values()
+                if isinstance(state, dict)
+            )
+            risk["summary"] = summary
+            quality["risk_state"] = risk
+            run.quality_snapshot = quality
             run.updated_at = datetime.now(UTC)
             run.state_version += 1
             for question in added:
@@ -752,9 +1157,7 @@ class ResearchRunRepository:
                 session,
                 run,
                 event_type="plan.revised",
-                public_summary=(
-                    f"REPLAN 已创建计划版本 {plan_version}, 新增 {len(added)} 个问题."
-                ),
+                public_summary=(f"REPLAN 已创建计划版本 {plan_version}, 新增 {len(added)} 个问题."),
                 refs={
                     "plan_version": plan_version,
                     "added_question_ids": [item.id for item in added],
@@ -844,6 +1247,204 @@ class ResearchRunRepository:
             )
             return True
 
+    async def defer_retryable_model_error(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        error_code: str,
+        detail_code: str | None,
+    ) -> int | None:
+        """Persist a delayed retry after the short in-process retry window fails.
+
+        Network outages often last longer than the Planner's bounded 3/10 second
+        backoff. Turning that temporary condition into a terminal failed Run loses
+        useful checkpoints and forces the user to resume manually. This transition
+        releases the Worker lease and creates an Outbox message in the same
+        transaction, so Dispatcher/Celery can retry after a wider recovery window.
+
+        The returned integer is the selected delay in seconds. ``None`` means the
+        retry budget was exhausted or the caller no longer owns the Run lease.
+        """
+
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
+            )
+            if (
+                run is None
+                or RunStatus(run.status) != RunStatus.RUNNING
+                or run.worker_task_id != worker_task_id
+            ):
+                return None
+
+            usage = dict(run.usage_snapshot)
+            retry_phase = run.phase
+            previous_retry_phase = str(usage.get("model_transport_retry_phase", ""))
+            completed_requeues = (
+                max(0, int(usage.get("model_transport_requeues", 0) or 0))
+                if previous_retry_phase == retry_phase
+                else 0
+            )
+            if completed_requeues >= len(_MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS):
+                return None
+
+            delay_seconds = _MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS[completed_requeues]
+            requeue_attempt = completed_requeues + 1
+            now = datetime.now(UTC)
+            retry_at = now + timedelta(seconds=delay_seconds)
+            usage["model_transport_requeues"] = requeue_attempt
+            usage["model_transport_retry_phase"] = retry_phase
+            usage["model_retry_after_seconds"] = delay_seconds
+            usage["model_retry_not_before"] = retry_at.isoformat()
+            usage["last_model_error_code"] = error_code[:100]
+            usage["last_model_detail_code"] = (detail_code or "UNKNOWN")[:100]
+            # A model error may occur after a page slot was reserved but before
+            # the page result was committed. A new Worker must never inherit it.
+            usage["page_slots_reserved"] = 0
+            usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot, usage
+            )
+            run.usage_snapshot = usage
+            run.status = RunStatus.QUEUED.value
+            run.termination_reason = _MODEL_TRANSPORT_RETRY_PENDING
+            run.lease_owner = None
+            run.lease_until = None
+            run.worker_task_id = None
+            run.finished_at = None
+            run.updated_at = now
+            run.state_version += 1
+
+            dispatch_key = f"{run.id}:model-retry:{run.state_version}"
+            session.add(
+                TaskDispatchOutboxRow(
+                    id=uuid7(),
+                    run_id=run.id,
+                    dispatch_type="resume",
+                    dispatch_key=dispatch_key,
+                    payload_ref={
+                        "run_id": str(run.id),
+                        "reason": _MODEL_TRANSPORT_RETRY_PENDING,
+                    },
+                    status="pending",
+                    next_attempt_at=retry_at,
+                )
+            )
+            await self._append_event(
+                session,
+                run,
+                event_type="model.retry_deferred",
+                public_summary=(
+                    "模型网络在短时重试窗口内仍不可用; "
+                    f"任务状态已保留, 将在 {delay_seconds} 秒后自动恢复。"
+                ),
+                refs={
+                    "error_code": error_code[:100],
+                    "detail_code": (detail_code or "UNKNOWN")[:100],
+                    "requeue_attempt": requeue_attempt,
+                    "max_requeue_attempts": len(_MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS),
+                    "dispatch_key": dispatch_key,
+                },
+                metrics={"delay_seconds": delay_seconds},
+            )
+            return delay_seconds
+
+    async def defer_retryable_search_error(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        error_code: str,
+        detail_code: str | None,
+    ) -> int | None:
+        """Persist a delayed resume when the shared Search Provider is unavailable.
+
+        Individual webpage failures remain isolated by the research loop. This
+        path is only used after SearXNG's internal strategies and circuit breaker
+        have reported a retryable run-wide dependency failure.
+        """
+
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
+            )
+            if (
+                run is None
+                or RunStatus(run.status) != RunStatus.RUNNING
+                or run.worker_task_id != worker_task_id
+            ):
+                return None
+
+            usage = dict(run.usage_snapshot)
+            retry_phase = run.phase
+            previous_retry_phase = str(usage.get("search_transport_retry_phase", ""))
+            completed_requeues = (
+                max(0, int(usage.get("search_transport_requeues", 0) or 0))
+                if previous_retry_phase == retry_phase
+                else 0
+            )
+            if completed_requeues >= len(_SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS):
+                return None
+
+            delay_seconds = _SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS[completed_requeues]
+            requeue_attempt = completed_requeues + 1
+            now = datetime.now(UTC)
+            retry_at = now + timedelta(seconds=delay_seconds)
+            usage["search_transport_requeues"] = requeue_attempt
+            usage["search_transport_retry_phase"] = retry_phase
+            usage["search_retry_after_seconds"] = delay_seconds
+            usage["search_retry_not_before"] = retry_at.isoformat()
+            usage["last_search_error_code"] = error_code[:100]
+            usage["last_search_detail_code"] = (detail_code or "UNKNOWN")[:100]
+            usage["page_slots_reserved"] = 0
+            usage = _record_search_transport_retry(usage)
+            usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot, usage
+            )
+            run.usage_snapshot = usage
+            run.status = RunStatus.QUEUED.value
+            run.termination_reason = _SEARCH_TRANSPORT_RETRY_PENDING
+            run.lease_owner = None
+            run.lease_until = None
+            run.worker_task_id = None
+            run.finished_at = None
+            run.updated_at = now
+            run.state_version += 1
+
+            dispatch_key = f"{run.id}:search-retry:{run.state_version}"
+            session.add(
+                TaskDispatchOutboxRow(
+                    id=uuid7(),
+                    run_id=run.id,
+                    dispatch_type="resume",
+                    dispatch_key=dispatch_key,
+                    payload_ref={
+                        "run_id": str(run.id),
+                        "reason": _SEARCH_TRANSPORT_RETRY_PENDING,
+                    },
+                    status="pending",
+                    next_attempt_at=retry_at,
+                )
+            )
+            await self._append_event(
+                session,
+                run,
+                event_type="search.retry_deferred",
+                public_summary=(
+                    "搜索服务在内部回退后仍暂时不可用; "
+                    f"任务状态已保留, 将在 {delay_seconds} 秒后自动恢复。"
+                ),
+                refs={
+                    "error_code": error_code[:100],
+                    "detail_code": (detail_code or "UNKNOWN")[:100],
+                    "requeue_attempt": requeue_attempt,
+                    "max_requeue_attempts": len(_SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS),
+                    "dispatch_key": dispatch_key,
+                },
+                metrics={"delay_seconds": delay_seconds},
+            )
+            return delay_seconds
+
     async def fail_execution(
         self,
         run_id: UUID,
@@ -863,6 +1464,7 @@ class ResearchRunRepository:
                 or run.worker_task_id != worker_task_id
             ):
                 return
+            failure_phase = run.phase
             run.status = RunStatus.FAILED.value
             run.phase = RunPhase.TERMINAL.value
             safe_code = error_code if error_code.isupper() else "WORKER_EXECUTION_FAILED"
@@ -873,6 +1475,14 @@ class ResearchRunRepository:
             now = datetime.now(UTC)
             run.updated_at = now
             run.finished_at = now
+            # A failed task must not leave a batch reservation blocking a later
+            # explicit resume. Committed usage remains untouched and truthful.
+            usage = dict(run.usage_snapshot)
+            usage["page_slots_reserved"] = 0
+            usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot, usage
+            )
+            run.usage_snapshot = usage
             run.state_version += 1
             allowed_diagnostics = {
                 "structured_output_strategy",
@@ -885,12 +1495,30 @@ class ResearchRunRepository:
                 "first_error_code",
                 "attempt_stage",
                 "compact_trigger",
+                "failure_node",
+                "budget_type",
+                "budget_limit",
+                "budget_used",
+                "budget_overrun",
             }
             safe_diagnostics = {
                 key: value[:200] if isinstance(value, str) else value
                 for key, value in (diagnostics or {}).items()
                 if key in allowed_diagnostics and isinstance(value, str | int)
             }
+            safe_diagnostics.setdefault("failure_node", failure_phase[:100])
+            if detail_code == "PAGE_BUDGET_OVERRUN":
+                limit = int(run.budget_snapshot.get("max_pages", 0) or 0)
+                used = int(run.usage_snapshot.get("pages", 0) or 0)
+                safe_diagnostics.update(
+                    {
+                        "failure_node": "research_iteration",
+                        "budget_type": "pages",
+                        "budget_limit": limit,
+                        "budget_used": used,
+                        "budget_overrun": max(0, used - limit),
+                    }
+                )
             await self._append_event(
                 session,
                 run,
@@ -983,3 +1611,33 @@ class ResearchRunRepository:
             refs=row.refs,
             metrics=row.metrics,
         )
+
+
+def _model_token_total(usage: dict[str, object]) -> int:
+    total = _safe_int(usage.get("evidence_total_tokens", 0))
+    for key in ("planner", "writer"):
+        item = usage.get(key)
+        if isinstance(item, dict):
+            total += _safe_int(item.get("total_tokens", 0))
+    return total
+
+
+def _record_search_transport_retry(usage: dict[str, object]) -> dict[str, object]:
+    """Count a durable provider recovery as a technical retry.
+
+    Retryable search failures bypass the normal iteration evaluator, so this
+    counter must be updated at the durable requeue boundary.
+    """
+
+    updated = dict(usage)
+    updated["technical_retries"] = _safe_int(updated.get("technical_retries", 0)) + 1
+    return updated
+
+
+def _safe_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, bytes, bytearray)):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0

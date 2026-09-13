@@ -85,7 +85,15 @@ class ResearchToolCallRow(Base):
 class SearchQueryRow(Base):
     __tablename__ = "research_search_queries"
     __table_args__ = (
-        Index("uq_research_search_query_hash", "run_id", "normalized_hash", unique=True),
+        # Query idempotency is scoped to a question. Different questions may
+        # share wording but must retain independent evidence attribution.
+        Index(
+            "uq_research_search_query_question_hash",
+            "run_id",
+            "question_id",
+            "normalized_hash",
+            unique=True,
+        ),
         Index("ix_research_search_queries_run", "run_id", "created_at"),
     )
 

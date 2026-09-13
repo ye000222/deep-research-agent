@@ -84,6 +84,7 @@ class CanonicalModelResult(BaseModel):
     provider_request_id: str | None = None
     capability_strategy: dict[str, str] = Field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    diagnostics: dict[str, str | int] = Field(default_factory=dict)
 
 
 class RunLLMBinding(BaseModel):

@@ -1,0 +1,152 @@
+七项根因与八项修复实施记录
+日期：2026-09-12
+
+范围与保护原则
+
+- 本轮仅修改研究调度、REPLAN 状态、质量补强、检索幂等、页面去重、主题预检、预算诊断及对应测试。
+- 开始时工作区已有大量未提交改动，相关核心文件也已有前序修复。本轮保留这些改动，仅追加局部补丁，没有执行 reset、checkout、清理或覆盖操作。
+
+步骤 1：拆开 yield_question 与真实题目预算耗尽
+
+定位：ResearchLoopService 可能收到预算分配器的临时 yield_question；持久层另有 question_budget_exhausted 分支。
+
+实施：
+- yield_question 保持独立、非消耗型结果，只记录 budget.question_yielded，不写 exhausted map，不把问题改为 blocked/partial。
+- evidence_model_budget 的公平性由稳定调度器负责，不再把局部让出转换成永久耗尽。
+- question_budget_exhausted 只接受显式硬题目 Token 上限结果，并记录 reason=hard_question_token_limit 与计划版本。
+- REPLAN 可清理历史上由错误 yield 产生的布尔耗尽值，但不会清理带 hard_question_token_limit 证明的真实硬耗尽。
+
+步骤 2：搜索尝试次数跨 plan_version 继承
+
+定位：Gap.resolution_attempts 同时混入缓存复用、零结果和评估轮次，不能代表真实搜索次数。
+
+实施：
+- 调度公平性继续按 SearchQueryRow 中稳定 question_id 的全计划历史聚合。
+- 新计划创建 Gap 时继承该 question_id 的历史搜索次数。
+- 查询策略 attempt_index 改用跨计划的成功搜索计数；Gap 评估轮次单独放入 gap_attempt_index，只用于缓存/新搜索交替。
+- 缓存复用不再创建 SearchQueryRow，也不消耗 searches，因此不会伪造一次真实搜索尝试。
+
+步骤 3：REPLAN 只重置指定缺口
+
+定位：全局清理会让无关问题重新进入；全局低信息增益清零会丢失其他问题的历史。
+
+实施：
+- save_gap_resolution_plan 仅把 gaps 参数命中的原问题复制为 pending，其他问题保留原状态。
+- 仅删除指定 question_id 的遗留错误耗尽状态、查询策略耗尽状态和题目级低信息增益 streak。
+- 未被点名问题的耗尽、状态、搜索历史和低信息增益记录全部保留。
+- 真实 hard_question_token_limit 跨 REPLAN 保留。
+
+步骤 4：质量补强绑定可改善质量门的具体维度
+
+定位：旧逻辑只看全局 source_quality/cross_validation，随后把“当前问题”强制设为 partial。
+
+实施：
+- 每个验收维度的质量快照新增 max_source_reliability。
+- 生成 quality_repair_targets：
+  - cross_validation 仅指向已获证据但独立来源数未达到该维度要求的问题；
+  - source_quality 仅指向已有证据但该维度最佳来源可靠性仍低于阈值的问题。
+- 只有进入 quality_repair_targets 的问题才会因全局质量门被重新设为 partial。
+- 覆盖率 100%、普通一来源要求已满足、且没有具体修复维度的问题会恢复 researched，不再充当全局补强锚点。
+- 页面尾部质量预留量按具体 repair target 数计算，不再仅因全局分数偏低固定保留 6 页。
+
+步骤 5：统一 URL、最终 URL、source_id、content_hash 去重
+
+定位：原始 URL 直接哈希，http/https、fragment 和跟踪参数可绕过去重。
+
+实施：
+- 新增 normalize_source_url：HTTP/HTTPS 统一为 HTTPS；主机名小写；去 fragment、默认端口、尾斜杠、常见跟踪参数；保留并排序真实内容查询参数。
+- 搜索结果内去重、已读候选过滤、缓存页映射、SearchResult 持久化、ResearchSource URL hash 全部使用统一身份 URL。
+- 页面重定向完成后、模型抽取之前，按当前 question_id 检查已处理 source_id、规范化最终 URL 和 content_hash。
+- 命中重复时记录 source.duplicate_skipped，不调用模型、不增加 pages，保留页面槽给本批次的下一个唯一候选。
+- record_page 同时按规范化 URL hash 或 content_hash 合并同一来源。
+
+步骤 6：禁止成功标准化查询跨计划重复执行
+
+定位：ResearchToolCall duplicate_key 包含 plan_version，REPLAN 可重新调用同一查询。
+
+实施：
+- duplicate_key 改为 question_id + normalize_search_query(query)，不包含 plan_version。
+- SearchQueryRow 改为 run_id + question_id + normalized_hash 唯一约束；同一问题跨计划幂等，不同问题保留独立归属。
+- prepare_target 会读取本次 run 已成功的标准化查询哈希，选择下一个未执行检索角度。
+- 若工具调用对应查询已经成功，研究循环只允许复用已有结果，不再次调用搜索提供方。
+
+步骤 7：查询变体耗尽后切换问题或核心角度
+
+定位：七个中文来源后缀使用 modulo 循环，核心查询不变。
+
+实施：
+- 去除后缀 modulo 循环。
+- 先有限遍历不同来源类型；用完后切换到基准指标、落地实测、失败分析、数据集协议、标准合规、成本性能等有限核心检索角度。
+- 所有角度耗尽时返回空策略并写 search.strategy_exhausted；问题进入 query_strategy_exhausted_by_question，调度器切换其他问题。
+- 定向 REPLAN 可为指定缺口提供新 hints，但标准化查询成功历史仍保留，不能重放旧查询。
+- Gap 研究尝试也有 _MAX_GAP_ATTEMPTS 硬边界，避免零产出页面持续吞噬预算。
+
+步骤 8：细分预算停止原因
+
+定位：所有停止统一写 research_budget_exhausted，无法判断实际触发资源。
+
+实施：
+- 新增精确诊断：page_budget_exhausted、search_budget_exhausted、token_budget_exhausted、iteration_budget_exhausted。
+- prepare_target、finish_iteration、termination_reason、evaluation.completed refs 和进入 Writer 的公开摘要统一携带具体原因。
+- 若模型调用前保护已触发，归类为 token_budget_exhausted。
+
+验证记录
+
+1. Ruff（本轮涉及文件）：All checks passed。
+2. Mypy（4 个生产代码文件）：Success: no issues found。
+3. 定向研究回归：101 passed。
+4. 全量测试：265 passed，7 skipped。
+5. 全量测试有 3 条非失败警告：2 条 Starlette/FastAPI 弃用提醒；1 条 .pytest_cache 写入权限提醒。均不影响测试结果。
+
+新增/强化的关键回归场景
+
+- yield_question 属于非消耗结果，不等同 question_budget_exhausted。
+- 定向 REPLAN 只清目标问题状态，并保留真实硬题目预算耗尽。
+- q1 存在双来源/低可靠性缺口而 q3 已完成时，repair targets 只包含 q1。
+- http://arxiv.org/... 与 https://arxiv.org/...（含 utm/fragment）只保留一个候选。
+- 最终 URL 或正文哈希重复时，跳过抽取且页面计数为 0。
+- 工业控制系统网络/过程异常论文无法通过工业机器视觉表面缺陷问题的主题预检。
+- 中文来源后缀用完后切换核心角度，不回到第一个后缀。
+- 四类预算分别产生精确停止原因。
+
+截图复核追加（2026-09-12）
+
+复核发现截图中的“读取页面 13”与资源预算“30/30”并非研究循环再次绕过去重，而是前端把证据漏斗限定在最近 200 条 AgentEvent；资源预算和质量快照则来自全量持久化状态。新运行还会出现细分停止原因，但旧前端只识别 research_budget_exhausted，导致预算诊断显示“否”。
+
+追加修复：
+
+- ResearchToolRepository 在 usage_snapshot 持久化 candidate_urls、zero_yield_pages。
+- 前端 Evidence Funnel 优先使用 usage_snapshot.pages、usage_snapshot.candidate_urls、quality_snapshot.candidate_evidence、quality_snapshot.accepted_evidence，不再受事件分页截断影响。
+- 零产出率和页/证据成本优先使用全量页面诊断。
+- 前端识别四类细分预算停止原因，显示对应中文标签，并正确切换“生成研究报告”操作。
+- usage_snapshot 追加 writer_token_reserve、pending_questions、question_yields、settled_reservations，避免预算诊断随事件窗口滚动而丢失。
+
+追加验证：
+
+- pnpm --filter @deep-research/web typecheck：通过。
+- pnpm --filter @deep-research/web build：通过。
+- 研究循环、REPLAN、查询归一化定向测试：65 passed。
+- 全量回归复核：265 passed，7 skipped。
+
+全面审计与回归修复（2026-09-12）
+
+本轮不是针对单一截图修补，而是对状态、预算、幂等、并发、API、前端和迁移进行交叉审查。确认并修复：
+
+1. 抽取失败路径曾直接对原始 final_url 计算哈希，HTTP/HTTPS、跟踪参数或重定向会生成第二个 ResearchSource；成功快照也曾保留未规范化 final_url。现在成功/失败路径都先 normalize_source_url，并按 URL hash 或正文 hash 复用来源。
+2. 查询表原先只按 run_id + normalized_hash 唯一，导致不同问题使用同一查询时互相污染 question_id；现在数据库模型、查询读取和迁移均按问题隔离，仍保持同一问题跨计划幂等。
+3. URL 规范化对 https://host:80 曾错误视为默认端口。现在仅原协议的默认端口可折叠，并保留非默认端口，避免错误合并端点。
+4. 模型预留后在本地 artifact 写入、抽取器异常或落库异常时可能悬挂，重试会错误看到预算不足。现在调用前失败释放预留，调用中/后未知结果标记 uncertain，并释放未使用页面槽。
+5. extraction_cache/report_draft_cache 的 lookup-then-insert 并发竞态已收敛：唯一键冲突只有在确认胜者已存在时视为幂等成功，其他完整性错误继续抛出。
+6. 前端轮询切换任务时，旧任务的迟到响应可能污染新任务事件；现在所有事件合并均受取消标记保护。单条损坏 SSE 事件也不会阻塞其余快照刷新。
+7. 预算诊断新增持久化 model_tokens_remaining/model_tokens_reserved，前端优先使用全量快照而非最近事件窗口，避免再次出现“页面已满但诊断显示未停止”的口径漂移。
+8. Worker 与 API Runtime 的关闭流程改为逐层 finally，即使单个 HTTP/Redis/Checkpoint 后端关闭失败，也会继续释放其余连接池，降低反复测试和重启后的假性不健康。
+9. 临时 LLM 连接测试接口补齐端点安全校验：拒绝凭据/查询串/片段、回环/私有/元数据 IP 及常见内部主机名；可解析到混合私网地址的主机也拒绝，避免接口成为内网探测入口。
+10. 搜索提供方入口同步执行主题预检和规范化 URL 去重；视觉问题会排除工业控制/网络异常等同词误命中，控制系统问题仍可正常检索。
+11. 报告最终化保留 `research_stop_reason` 到 usage snapshot，前端不再因终态覆盖或事件窗口截断而显示“预算触发停止：否”。
+12. Compose 默认服务端口改为仅监听 `127.0.0.1`；配置校验拒绝与凭据 Cookie 同时使用的通配符 CORS。
+
+新增回归测试：URL 规范化及非默认端口、查询表问题级唯一索引、迁移 head 版本、预留清理路径、临时连接测试的私有 HTTPS 地址与内部主机名拒绝；并复核所有现有 worker/API/状态/缓存测试。
+
+最终验证：ruff 全量通过；mypy apps/api/app 全量通过（114 个源文件）；pytest 280 passed、7 skipped；前端 typecheck 和 production build 均通过；Compose 配置校验通过；git diff --check 无空白错误。
+
+仍需在部署侧明确的风险（未伪装成代码已解决）：生产环境必须注入 SECRET_MASTER_KEY_BASE64、收紧 CORS_ORIGINS；Compose 默认端口已收紧为仅本机监听，但生产仍应在反向代理/网络策略层再次限制。公共网页读取的 DNS 在解析后仍可能发生极窄的 rebinding 窗口，若部署在高威胁网络应使用固定出口或 egress 代理。

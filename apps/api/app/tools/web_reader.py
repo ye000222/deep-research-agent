@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import re
 import socket
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -88,9 +89,34 @@ class PublicWebReader:
                 clean_text=clean,
                 content_hash=hashlib.sha256(clean.encode("utf-8")).hexdigest(),
                 fetched_at=datetime.now(UTC),
+                published_at=_extract_published_at(html),
                 truncated=truncated,
             )
         raise ToolExecutionError("WEBPAGE_REDIRECT_REJECTED", retryable=False)
+
+
+_PUBLICATION_META_RE = re.compile(
+    r"<meta[^>]+(?:property|name)=[\"'](?:article:published_time|date|pubdate|datePublished)"
+    r"[\"'][^>]+content=[\"']([^\"']+)[\"']|"
+    r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"']"
+    r"(?:article:published_time|date|pubdate|datePublished)[\"']",
+    re.IGNORECASE,
+)
+
+
+def _extract_published_at(html: str) -> datetime | None:
+    """Extract a conservative publication timestamp from common page metadata."""
+
+    for match in _PUBLICATION_META_RE.finditer(html[:200_000]):
+        raw = next((value for value in match.groups() if value), "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return None
 
 
 async def _bounded_body(response: httpx.Response) -> bytes:

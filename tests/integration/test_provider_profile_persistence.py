@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,13 +14,22 @@ from app.domain.context import ContextCandidate, ContextItemType
 from app.domain.identifiers import uuid7
 from app.domain.planning import ResearchPlan
 from app.domain.providers import TokenUsage, UsageAccuracy
+from app.infrastructure.db.evidence_graph_models import ResearchSourceSnapshotRow
 from app.infrastructure.db.llm_call_models import LLMCallRow
 from app.infrastructure.db.llm_calls import LLMCallRepository
 from app.infrastructure.db.llm_capability_models import LLMCapabilityTestRow
 from app.infrastructure.db.memory_models import MemoryItemRow
 from app.infrastructure.db.postgres import PostgresRuntime
+from app.infrastructure.db.research_models import (
+    ResearchGapRow,
+    ResearchSourceRow,
+    SearchQueryRow,
+    SearchResultRow,
+)
 from app.infrastructure.db.research_runs import ResearchRunRepository
+from app.infrastructure.db.research_tools import ResearchToolRepository
 from app.infrastructure.db.run_models import AgentEventRow, ResearchRunRow, TaskDispatchOutboxRow
+from app.infrastructure.db.state_runtime import ResearchStateRuntimeRepository
 from app.main import create_app
 from app.memory.manager import ResearchMemoryManager
 from app.retrieval.projections import rebuild_memory
@@ -116,6 +126,144 @@ async def _exercise_plan_persistence(settings: Settings, run_id: UUID) -> None:
                 accuracy=UsageAccuracy.EXACT,
             ),
         )
+    finally:
+        await database.close()
+
+
+async def _exercise_initial_target_selection(settings: Settings, run_id: UUID) -> None:
+    """Compile and execute the question-scoped candidate/snapshot selection query."""
+
+    database = PostgresRuntime(settings.database_url)
+    repository = ResearchToolRepository(database.session_factory)
+    try:
+        target = await repository.prepare_target(
+            run_id,
+            worker_task_id="integration-planner-1",
+        )
+        assert target is not None
+        assert target.question_id == "q1"
+        assert target.attempt_index == 0
+        assert target.reusable_results == ()
+        assert target.reusable_pages == ()
+        assert target.first_pass is True
+
+        # A real transaction must not freeze 12k spendable research tokens just
+        # because five unfinished questions cannot all receive fixed reserves.
+        async with database.session_factory() as session, session.begin():
+            run = await session.get(ResearchRunRow, run_id)
+            assert run is not None
+            old_budget, old_usage = dict(run.budget_snapshot), dict(run.usage_snapshot)
+            run.budget_snapshot = {**old_budget, "max_tokens": 100_000}
+            run.usage_snapshot = {"evidence_total_tokens": 78_000}
+        budget = await repository.evidence_model_budget(
+            run_id,
+            worker_task_id="integration-planner-1",
+            question_id="q1",
+        )
+        assert budget.allowed and budget.max_call_tokens > 0
+        async with database.session_factory() as session, session.begin():
+            gap = await session.get(ResearchGapRow, target.gap_id)
+            assert gap is not None
+            gap.resolution_attempts = 1
+        budget = await repository.evidence_model_budget(
+            run_id,
+            worker_task_id="integration-planner-1",
+            question_id="q1",
+        )
+        # Fairness is selected by prepare_target; a prior gap attempt must not
+        # be converted into a persistent question-budget yield.
+        assert budget.outcome == "execute"
+        evaluation = await repository.finish_iteration(
+            run_id,
+            worker_task_id="integration-planner-1",
+            target=target,
+            attempt_outcome="yield_question",
+        )
+        assert evaluation.continue_research
+        next_target = await repository.prepare_target(
+            run_id,
+            worker_task_id="integration-planner-1",
+        )
+        assert next_target is not None and next_target.question_id == "q1"
+        async with database.session_factory() as session, session.begin():
+            run = await session.get(ResearchRunRow, run_id)
+            gap = await session.get(ResearchGapRow, target.gap_id)
+            assert run is not None and gap is not None
+            assert not run.usage_snapshot.get("model_budget_guarded")
+            assert gap.resolution_attempts == 1
+            gap.resolution_attempts = 0
+            run.budget_snapshot, run.usage_snapshot = old_budget, old_usage
+
+        unrelated_url = "https://unrelated.example.com/q2-only"
+        unrelated_hash = hashlib.sha256(unrelated_url.encode()).hexdigest()
+        source_id = uuid7()
+        query_id = uuid7()
+        now = datetime.now(UTC)
+        async with database.session_factory() as session, session.begin():
+            session.add_all(
+                [
+                    SearchQueryRow(
+                        id=query_id,
+                        run_id=run_id,
+                        question_id="q2",
+                        tool_call_id=target.tool_call_id,
+                        query="q2 unrelated source",
+                        normalized_hash=hashlib.sha256(b"q2 unrelated source").hexdigest(),
+                        provider="searxng",
+                        status="succeeded",
+                        result_count=1,
+                        created_at=now,
+                    ),
+                    ResearchSourceRow(
+                        id=source_id,
+                        run_id=run_id,
+                        canonical_url=unrelated_url,
+                        url_hash=unrelated_hash,
+                        domain="unrelated.example.com",
+                        source_owner_key="unrelated.example.com",
+                        title="Q2-only source",
+                        source_type="web",
+                        reliability=0.8,
+                        artifact_uri="runs/integration/q2-only.txt",
+                        content_hash="a" * 64,
+                        char_count=200,
+                        fetched_at=now,
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    SearchResultRow(
+                        id=uuid7(),
+                        search_query_id=query_id,
+                        rank=1,
+                        title="Q2-only source",
+                        url=unrelated_url,
+                        snippet="Only relevant to q2.",
+                    ),
+                    ResearchSourceSnapshotRow(
+                        id=uuid7(),
+                        run_id=run_id,
+                        source_id=source_id,
+                        final_url=unrelated_url,
+                        fetched_at=now,
+                        content_hash="a" * 64,
+                        parser_version="integration-v1",
+                        artifact_uri="runs/integration/q2-only.txt",
+                        char_count=200,
+                    ),
+                ]
+            )
+
+        repeated_target = await repository.prepare_target(
+            run_id,
+            worker_task_id="integration-planner-1",
+        )
+        assert repeated_target is not None
+        assert repeated_target.question_id == "q1"
+        assert repeated_target.reusable_results == ()
+        assert repeated_target.reusable_pages == ()
     finally:
         await database.close()
 
@@ -330,8 +478,7 @@ async def _exercise_stale_run_reconciler(settings: Settings, run_id: UUID) -> No
             assert row.lease_until is None
             dispatches = list(
                 await session.scalars(
-                    select(TaskDispatchOutboxRow)
-                    .where(TaskDispatchOutboxRow.run_id == run_id)
+                    select(TaskDispatchOutboxRow).where(TaskDispatchOutboxRow.run_id == run_id)
                 )
             )
             assert len(dispatches) == 2
@@ -344,6 +491,152 @@ async def _exercise_stale_run_reconciler(settings: Settings, run_id: UUID) -> No
                 )
             )
             assert "run.requeued" in event_types
+    finally:
+        await database.close()
+
+
+async def _exercise_durable_model_retry(settings: Settings, run_id: UUID) -> None:
+    """A transient Provider outage is persisted instead of terminating the Run."""
+
+    database = PostgresRuntime(settings.database_url)
+    repository = ResearchRunRepository(database.session_factory)
+    state_repository = ResearchStateRuntimeRepository(database.session_factory)
+    try:
+        initialized = await state_repository.ensure_initialized(run_id)
+        assert initialized.status.value == "queued"
+        assert await repository.acquire_for_execution(
+            run_id,
+            worker_task_id="network-failure-worker",
+        )
+        retry_delay = await repository.defer_retryable_model_error(
+            run_id,
+            worker_task_id="network-failure-worker",
+            error_code="MODEL_NETWORK_ERROR",
+            detail_code="CONNECT_ERROR",
+        )
+        assert retry_delay == 30
+        state = await state_repository.synchronize(
+            run_id,
+            node_name="model_retry_boundary",
+            worker_task_id=None,
+        )
+        assert state.status.value == "queued"
+        assert state.stop_reason is None
+
+        async with database.session_factory() as session:
+            row = await session.get(ResearchRunRow, run_id)
+            assert row is not None
+            assert row.status == "queued"
+            assert row.phase == "planning"
+            assert row.termination_reason == "model_transport_retry_pending"
+            assert row.worker_task_id is None
+            assert row.lease_until is None
+            assert row.usage_snapshot["model_transport_requeues"] == 1
+            assert row.usage_snapshot["model_transport_retry_phase"] == "planning"
+            assert row.usage_snapshot["model_retry_after_seconds"] == 30
+            assert row.usage_snapshot["last_model_error_code"] == "MODEL_NETWORK_ERROR"
+            assert row.usage_snapshot["last_model_detail_code"] == "CONNECT_ERROR"
+
+            dispatches = list(
+                await session.scalars(
+                    select(TaskDispatchOutboxRow)
+                    .where(TaskDispatchOutboxRow.run_id == run_id)
+                    .order_by(TaskDispatchOutboxRow.created_at)
+                )
+            )
+            assert len(dispatches) == 2
+            retry_dispatch = next(item for item in dispatches if item.dispatch_type == "resume")
+            assert retry_dispatch.status == "pending"
+            assert retry_dispatch.next_attempt_at > datetime.now(UTC)
+            assert retry_dispatch.payload_ref["reason"] == "model_transport_retry_pending"
+
+            event_types = list(
+                await session.scalars(
+                    select(AgentEventRow.event_type)
+                    .where(AgentEventRow.run_id == run_id)
+                    .order_by(AgentEventRow.run_seq)
+                )
+            )
+            assert event_types == [
+                "run.created",
+                "state.initialized",
+                "run.started",
+                "model.retry_deferred",
+                "state.patch_applied",
+            ]
+    finally:
+        await database.close()
+
+
+async def _exercise_durable_search_retry(settings: Settings, run_id: UUID) -> None:
+    """A transient Search Provider outage preserves state and schedules resume."""
+
+    database = PostgresRuntime(settings.database_url)
+    repository = ResearchRunRepository(database.session_factory)
+    state_repository = ResearchStateRuntimeRepository(database.session_factory)
+    try:
+        initialized = await state_repository.ensure_initialized(run_id)
+        assert initialized.status.value == "queued"
+        assert await repository.acquire_for_execution(
+            run_id,
+            worker_task_id="search-failure-worker",
+        )
+        retry_delay = await repository.defer_retryable_search_error(
+            run_id,
+            worker_task_id="search-failure-worker",
+            error_code="SEARCH_PROVIDER_DEGRADED",
+            detail_code="SEARCH_PROVIDER_EXHAUSTED",
+        )
+        assert retry_delay == 30
+        state = await state_repository.synchronize(
+            run_id,
+            node_name="search_retry_boundary",
+            worker_task_id=None,
+        )
+        assert state.status.value == "queued"
+        assert state.stop_reason is None
+
+        async with database.session_factory() as session:
+            row = await session.get(ResearchRunRow, run_id)
+            assert row is not None
+            assert row.status == "queued"
+            assert row.phase == "planning"
+            assert row.termination_reason == "search_transport_retry_pending"
+            assert row.worker_task_id is None
+            assert row.lease_until is None
+            assert row.usage_snapshot["search_transport_requeues"] == 1
+            assert row.usage_snapshot["search_transport_retry_phase"] == "planning"
+            assert row.usage_snapshot["search_retry_after_seconds"] == 30
+            assert row.usage_snapshot["last_search_error_code"] == ("SEARCH_PROVIDER_DEGRADED")
+            assert row.usage_snapshot["last_search_detail_code"] == ("SEARCH_PROVIDER_EXHAUSTED")
+
+            dispatches = list(
+                await session.scalars(
+                    select(TaskDispatchOutboxRow)
+                    .where(TaskDispatchOutboxRow.run_id == run_id)
+                    .order_by(TaskDispatchOutboxRow.created_at)
+                )
+            )
+            assert len(dispatches) == 2
+            retry_dispatch = next(item for item in dispatches if item.dispatch_type == "resume")
+            assert retry_dispatch.status == "pending"
+            assert retry_dispatch.next_attempt_at > datetime.now(UTC)
+            assert retry_dispatch.payload_ref["reason"] == "search_transport_retry_pending"
+
+            event_types = list(
+                await session.scalars(
+                    select(AgentEventRow.event_type)
+                    .where(AgentEventRow.run_id == run_id)
+                    .order_by(AgentEventRow.run_seq)
+                )
+            )
+            assert event_types == [
+                "run.created",
+                "state.initialized",
+                "run.started",
+                "search.retry_deferred",
+                "state.patch_applied",
+            ]
     finally:
         await database.close()
 
@@ -521,6 +814,8 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
         assert planner_status.json()["termination_reason"] is None
         assert planner_status.json()["usage_snapshot"]["planner"]["total_tokens"] == 30
 
+        asyncio.run(_exercise_initial_target_selection(settings, UUID(planner_run_id)))
+
         persisted_plan = restarted.get(f"/api/v1/research-runs/{planner_run_id}/plan")
         assert persisted_plan.status_code == 200
         assert len(persisted_plan.json()["questions"]) == 5
@@ -559,6 +854,32 @@ def test_profile_and_research_run_survive_restart_with_replayable_events() -> No
             _exercise_stale_run_reconciler(
                 settings,
                 UUID(reconciler_run.json()["run_id"]),
+            )
+        )
+
+        durable_retry_run = restarted.post(
+            "/api/v1/research-runs",
+            json={**run_request, "query": "Recover after a transient model network outage."},
+            headers={"Idempotency-Key": "integration-model-retry-run-v1"},
+        )
+        assert durable_retry_run.status_code == 202
+        asyncio.run(
+            _exercise_durable_model_retry(
+                settings,
+                UUID(durable_retry_run.json()["run_id"]),
+            )
+        )
+
+        durable_search_retry_run = restarted.post(
+            "/api/v1/research-runs",
+            json={**run_request, "query": "Recover after a transient search outage."},
+            headers={"Idempotency-Key": "integration-search-retry-run-v1"},
+        )
+        assert durable_search_retry_run.status_code == 202
+        asyncio.run(
+            _exercise_durable_search_retry(
+                settings,
+                UUID(durable_search_retry_run.json()["run_id"]),
             )
         )
 

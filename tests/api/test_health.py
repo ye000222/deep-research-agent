@@ -1,6 +1,12 @@
+import pytest
 from app.core.config import Settings
 from app.main import create_app
 from fastapi.testclient import TestClient
+
+
+def test_settings_reject_wildcard_cors_with_credentials() -> None:
+    with pytest.raises(ValueError, match="CORS_ORIGINS"):
+        Settings(app_env="test", cors_origins="*")
 
 
 def make_test_settings() -> Settings:

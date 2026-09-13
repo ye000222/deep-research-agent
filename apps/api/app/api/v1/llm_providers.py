@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
+import socket
 from time import perf_counter
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -126,7 +129,19 @@ async def test_connection(payload: ConnectionTestRequest) -> ConnectionTestRespo
     """
 
     parsed = urlsplit(payload.base_url.strip())
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error_code": "INVALID_BASE_URL"},
+        )
+    if not await _is_public_provider_endpoint(parsed.hostname):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error_code": "INVALID_BASE_URL"},
@@ -199,3 +214,36 @@ async def test_connection(payload: ConnectionTestRequest) -> ConnectionTestRespo
             error_code=exc.code,
             detail_code=exc.detail_code,
         )
+
+
+async def _is_public_provider_endpoint(hostname: str) -> bool:
+    """Reject loopback/private/metadata destinations before making a probe call.
+
+    A DNS failure is left to the provider request so mocked or newly registered
+    public endpoints remain testable; any address that *does* resolve privately
+    is rejected, including mixed public/private DNS responses.
+    """
+
+    host = hostname.rstrip(".").lower()
+    if (
+        host in {"localhost", "localhost.localdomain", "metadata.google.internal"}
+        or host.endswith((".localhost", ".local", ".internal", ".home.arpa"))
+    ):
+        return False
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return literal.is_global
+    try:
+        records = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return True
+    addresses = {record[4][0] for record in records}
+    return bool(addresses) and all(ipaddress.ip_address(address).is_global for address in addresses)

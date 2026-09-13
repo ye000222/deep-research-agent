@@ -1,0 +1,185 @@
+# 运行态最新版本保证记录
+
+## 目的
+
+从本记录开始，每次代码或运行配置发生改动后，必须同步更新实际运行态，不能只完成源码修改就直接交付测试。
+
+## 固定执行流程
+
+1. 运行 `docker compose up -d --force-recreate api worker dispatcher beat web`，重建所有会加载项目代码的服务。
+2. 运行 `docker compose ps`，确认 API、Worker、Dispatcher、Beat、Web 均处于 `Up` 状态。
+3. 检查 Worker 启动参数和日志，确认新配置已生效（当前并发配置为 2）。
+4. 检查 Web `http://localhost:5174` 与 API `http://localhost:8000/openapi.json` 均返回 HTTP 200。
+5. 对关键改动做容器内源码核验，避免宿主机文件已更新但容器仍使用旧版本。
+6. 代码改动完成后再执行测试；只有“测试通过 + 运行态更新 + 健康检查通过”才算可测试版本。
+
+## 2026-09-11 本次验收
+
+- 已执行：`docker compose up -d --force-recreate api worker dispatcher beat web`
+- `docker compose ps`：api、worker、dispatcher、beat、web 全部 `Up`；Postgres healthy；Redis、SearXNG 正常。
+- Worker 实际启动命令：`celery -A app.worker.celery_app:celery_app worker --loglevel=INFO --concurrency=2`
+- Worker 日志：`concurrency: 2 (prefork)`，并已进入 `ready`。
+- Web 健康检查：HTTP 200。
+- API OpenAPI 健康检查：HTTP 200。
+- 容器内源码核验：`App.tsx` 已包含 `Standard · 20 轮 / 20 次搜索 / 30 页`。
+- 已完成的质量检查：API 单元测试 206 项通过；ruff 通过；compileall 通过；Web typecheck/build 通过。
+
+## 测试口径
+
+本次只更新并验收运行态，没有自动创建新的研究任务，避免消耗真实搜索/模型预算。后续测试应在刷新页面后新建 Run；旧 Run 的历史状态不代表新版本未生效。
+
+## 2026-09-11 Run 01a08f12 终止原因诊断
+
+### 已确认事实
+
+- 终止状态：`completed_with_limitations`。
+- 数据库终止分支：`sources_exhausted`，不是 `research_budget_exhausted`。
+- 研究预算仍有余量：研究轮次 4/20、搜索 8/20、页面 4/30、模型 Token 8,913/100,000。
+- 质量仍未达标：Coverage 11.11%，关键缺口 3，未回答问题 7；截图中的低增益连续次数为 21。
+- 计划版本已到 3；q1、q2、q3、q5、q6、q7、q8 均为 `blocked`，只有 q4 获得 5 条证据。
+- 每个缺口的 `resolution_attempts` 达到当前硬上限 3 后，`prepare_target()` 不再把它列为候选；候选为空时直接调用 `_enter_writing(..., reason="sources_exhausted")`。
+- 32 次评估中有 24 次只是复用候选，实际搜索 8 次；13 个网页读取/提取失败，失败来源包含抖音、哔哩哔哩、人人文档、Docin、360 搜索结果页等不可稳定读取页面。
+
+### 根因链路
+
+1. 搜索结果中不可读取、动态渲染或文档站页面比例较高，导致网页读取/正文提取失败。
+2. 候选复用机制正确地跳过已失败 URL，但没有足够的新鲜、可验证来源补位；多个问题连续产生 0 条新证据。
+3. 这些问题的缺口重试次数达到 3 次后被硬性排除；计划版本 3 又禁止继续 Replan。
+4. 于是“预算还有很多”与“当前计划没有可执行候选”同时成立，系统按 `sources_exhausted` 进入限制性报告，最终显示 `completed_with_limitations`。
+
+### 结论
+
+这次显示该状态是“候选/缺口状态机提前耗尽”，不是资源预算真的用完。当前最需要根治的是：在仍有搜索、页面和 Token 预算时，不能把缺口重试上限当作全局终止条件；应触发新查询策略/来源类型降级，并保留可执行候选，只有真实预算耗尽或明确不可恢复的技术故障才进入限制性写作。
+
+## 关联修复
+
+2026-09-11 已完成 `completed_with_limitations` 全路径审计与修复，详见：[completed_with_limitations全路径审计与修复记录.txt](D:/agentProject/completed_with_limitations全路径审计与修复记录.txt)。修复后的 API、Worker、Dispatcher、Beat、Web 已全部强制重建并通过健康检查。
+
+## 2026-09-11 研究空转与吞吐优化发布
+
+- 已执行：`docker compose up -d --force-recreate api worker dispatcher beat web`。
+- api、worker、dispatcher、beat、web 全部为新创建容器并处于 `Up`；Postgres healthy；Redis、SearXNG 正常。
+- Worker 日志：`concurrency: 2 (prefork)`，并已进入 `ready`。
+- Web 健康检查：HTTP 200；API OpenAPI 健康检查：HTTP 200。
+- 容器内源码核验：已加载问题配额软借用事件 `budget.question_allocation_borrowed`，以及视频/登录/文档聚合页读取前过滤规则。
+- 本轮质量检查：研究循环专项测试 38 项通过；全部单元测试 215 项通过；ruff、compileall、Web typecheck/build 全部通过。
+- 原卡顿 Run `01a08ff2-076e-734a-84c6-5326d747ff00` 在发布前已经被用户取消，数据库状态为 `cancelled / user_cancelled`，不是容器替换造成的终止。
+- 详细诊断与实现记录见：[研究空转与吞吐优化实施记录.txt](D:/agentProject/研究空转与吞吐优化实施记录.txt)。
+
+## 2026-09-11 页面预算幂等与检索质量发布
+
+- 现场 Run `01a09021-dafc-7f72-92d2-9984f52caff0` 的 30 次计费读页仅有 12 个不同“问题 × 来源”组合，18 次（60%）为重复抽取。
+- 已修复同一计划版本内 question_id + source_id 的抽取幂等性；空结果、低分拒绝和抽取失败也不会重复消耗页面。
+- 已启用低价值域名前置过滤、同域候选上限、明显无关结果过滤以及搜索策略继续回退。
+- 搜索候选窗口已调整为 20，单轮候选检查上限为 12，成功页面结算批次仍保持最多 3 页。
+- 已执行 `docker compose up -d --force-recreate api worker dispatcher beat web`。
+- API、Worker、Dispatcher、Beat、Web 全部处于 `Up`；Worker `concurrency: 2 (prefork)` 且 `ready`；Web/API HTTP 200。
+- 容器内源码核验：`search_results=20`、`page_attempts=12`、CSDN 过滤与 `processed_source_ids` 查询均已加载。
+- 本轮验证：研究/搜索专项测试 52 项、全部单元测试 223 项通过；ruff、compileall、Web typecheck/build、diff-check 全部通过。
+- 搜索冒烟验证：q2 返回工业异常检测 arXiv 论文；q8 返回市场展望与制造业采用路线图。学术来源排序已增加标题相关性门槛。
+- 完整记录见：[页面预算重复消耗与检索质量修复记录.txt](D:/agentProject/页面预算重复消耗与检索质量修复记录.txt)。
+
+## 2026-09-11 低信息增益与质量门治理发布
+
+- 本次源码指纹：`51dcdcbb476a`。
+- 已执行：`scripts/start.ps1 -NoBrowser -NoBuild`（包含 `--force-recreate`）。
+- API、Worker、Dispatcher、Beat、Web 已全部重建；脚本确认运行态版本一致：`51dcdcbb476a`。
+- API 健康检查通过，Web HTTP 200，Checkpoint 初始化完成。
+- 本轮验证：全部 unit 测试通过、全部 API 测试通过；Ruff、compileall、Mypy（研究循环/检索/研究仓储）通过。
+- 已上线改动：连续零产出页面两次后立即轮换查询；按问题隔离低信息增益 streak；P1/来源质量/交叉验证页面尾部预算优先；工业视觉领域锚点过滤跑题页面。
+- 详细实施、根因与后续复测口径见：[低信息增益与检索质量治理实施记录.txt](D:/agentProject/低信息增益与检索质量治理实施记录.txt)。
+
+## 2026-09-12 第二轮质量门修复发布
+
+- 本轮源码指纹：`4d6da9adf7bd`。
+- 已强制重建并启动 API、Worker、Dispatcher、Beat、Web；启动脚本确认所有服务 revision 一致。
+- API `/healthz` 与 Web 均返回 200，Checkpoint 初始化完成。
+- 来源质量已改为按独立发布者聚合；P1/未覆盖问题在页面预算保留区真正优先；已识别的一方工业视觉与行业研究来源不再错误落入未知 `.com` 默认评级。
+- 全量发布门禁通过：114 个 API 源文件 Mypy 通过、Ruff 通过、全量 Pytest 通过、Web typecheck/build 通过、Golden Eval 30/30、secret scan 与 Compose 校验通过。
+- 机器可读门禁结果：[current_release_gate_quality_20260912_final.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_final.json)。
+- 发布后 SearXNG 冒烟探测显示当前外部引擎存在 timeout/CAPTCHA/Suspended，查询暂时返回 0 条；该结果已记录为上游搜索依赖状态，不能用它冒充新 Run 的质量结论。
+- 运行态补强：启动脚本现在显式重建 SearXNG，API/Worker 也声明搜索服务依赖；Docker Desktop 重启后不会再出现 API/Web 在线但 SearXNG 未启动的假可用状态。当前 API、Worker、Dispatcher、Beat、Web、SearXNG 均为 Up，Postgres/Redis healthy，API/Web HTTP 200。
+- 最新版本指纹计算范围已扩展到 `scripts/start.ps1` 与 `infra/searxng`；以后启动逻辑或搜索配置改动也会触发 revision 变化和全服务校验。
+
+## 2026-09-12 Docker 引擎解耦补强（本轮）
+
+- 发现 Docker Desktop 当前因 `dockerInference` Unix socket 初始化错误退出；`docker.exe` 客户端仍在，但本机没有可用 Docker daemon。
+- `scripts/start.ps1` 新增 `-DockerContext` 与 `-NoAutoStartDockerDesktop`：可通过 WSL2、远程 Linux、Podman 兼容 Docker API 等独立引擎运行 Compose，不再把 Docker Desktop 视为唯一引擎。
+- 当指定 `DockerContext`、`DOCKER_CONTEXT` 或 `DOCKER_HOST` 时，脚本会直接诊断目标引擎，不会反复启动损坏的 Docker Desktop；未指定替代引擎时保留原有自动启动行为。
+- README 已补充命令行 Docker 的边界说明：CLI 本身仍需要 daemon，并给出 `docker context ls`、`DOCKER_CONTEXT` 和启动命令示例。
+- 本轮工作树源码指纹为 `3c0afbda3418`；仅完成脚本/文档与本地测试验证，尚未写入任何容器运行态。
+- 本轮代码修改尚未宣称运行态发布完成：由于当前 Docker daemon 不可用，必须在独立引擎可访问后重新执行启动脚本，并重新记录新的源码 revision、API/Web 健康检查和各服务版本一致性。
+
+## 2026-09-12 Docker Desktop 启动故障复核
+
+- 只读日志确认 Docker Desktop 4.70.0 后端在初始化 `Inference manager` 时崩溃，首个错误为 `run\dockerInference`，随后同批次的 `docker-secrets-engine\engine.sock` 也出现同类 WinError 1920。
+- 已停止卡住的 Docker 进程，并将仅含运行时 socket 的目录可回退地轮换为 `run.stale`、`docker-secrets-engine.stale`；没有删除镜像、卷、WSL 发行版或项目文件。
+- 已备份并将用户设置中的 `EnableDockerAI` 改为 `false`，但 Docker Desktop 重启后仍重新创建 `dockerInference` 并崩溃；因此当前判断为 Docker Desktop 本地运行时/版本故障，而非本项目配置或 Compose 故障。
+- 当前仍未获得 Docker server 版本，不能执行最新版本容器发布；项目工作树代码与旧运行态必须分开看待。
+
+## 2026-09-12 Docker Desktop 恢复与最新版本重新发布
+
+- 复核发现之前关闭的是 `EnableDockerAI`，但实际触发 Model Runner 的本地开关还需要 `EnableInference=false`；已同时设置 `EnableInferenceGPUVariant=false`。
+- 设置文件已备份为 `C:\Users\Lenovo\AppData\Roaming\Docker\settings-store.json.before-enable-inference-disable`；运行时目录保留在 `run.stale`、`run.stale.2` 和 `docker-secrets-engine.stale`，没有删除 Docker 数据。
+- Docker daemon 已恢复：`docker version` 返回 `client=29.4.0 server=29.4.0`。
+- 已重新执行 `scripts/start.ps1 -NoBrowser -NoBuild`，强制重建并启动全部服务；运行态 revision 已确认一致：`3c0afbda3418`。
+- API、Web、SearXNG 均 HTTP 200；Postgres、Redis、SearXNG、API、Worker、Dispatcher、Beat、Web 全部 running。
+- 同类故障与 workaround 已对照 Docker Desktop 社区 issue #532/#448；该问题属于 Docker Desktop Windows 运行时 socket 缺陷，不是项目 Compose 配置问题。
+
+## 2026-09-12 Writer Evidence Cards 防护发布
+
+- 新增报告 Writer 防护：上下文预算若裁掉全部 Evidence Cards，不再向模型发送空卡片请求；改走确定性证据模板，避免模型误报“未提供 Evidence Cards”。
+- 全量 Release Gate 通过：[current_release_gate_quality_20260912_writer_guard.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_writer_guard.json)。
+- 已强制重建并核验最新运行态 revision：`e51c93ff4c5e`；API、Worker、Dispatcher、Beat、Web、SearXNG 全部 running，API/Web/SearXNG HTTP 200。
+
+## 2026-09-12 第三批检索预算与仪表盘发布
+
+- 本批源码指纹：`ae972666351f`。
+- 已执行：`scripts/start.ps1 -NoBrowser -NoBuild`，包含全服务 force recreate；迁移幂等初始化完成。
+- API `/api/v1/meta`、API/Worker/Dispatcher/Beat `SOURCE_REVISION`、Web `VITE_SOURCE_REVISION` 均为 `ae972666351f`，拒绝版本漂移。
+- Postgres、Redis、SearXNG、API、Worker、Dispatcher、Beat、Web 全部 running；API `/healthz`、Web `5174`、SearXNG `8081` 均返回 HTTP 200。
+- Release Gate 报告：[current_release_gate_quality_20260912_budget_dashboard.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_budget_dashboard.json)；全量 unit/API、Ruff、Mypy、Web typecheck/build 均通过。
+
+## 2026-09-12 并行预读硬上限复核发布
+
+- 并行读取批次已与单次查询 `page_limit=2` 共用同一上限，避免旁路预取绕过预算限制。
+- 再次执行 `scripts/start.ps1 -NoBrowser -NoBuild` 强制重建；最新源码指纹：`a47e7cab9b18`。
+- `/api/v1/meta`、API/Worker/Dispatcher/Beat `SOURCE_REVISION`、Web `VITE_SOURCE_REVISION` 全部为 `a47e7cab9b18`。
+- API `/healthz`、Web `5174`、SearXNG `8081` 返回 HTTP 200；Postgres、Redis、SearXNG、API、Worker、Dispatcher、Beat、Web 全部 running。
+
+## 2026-09-12 逐项验收补强发布
+
+- 新增严格预算调度、首个零候选立即换检索词、P1 三变体优先和至少 6 页质量补强保护。
+- Release Gate 报告：[current_release_gate_quality_20260912_budget_scheduler_strict.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_budget_scheduler_strict.json)。
+- 最新源码指纹：`1e90dbcabd87`；API 元信息、API/Worker/Dispatcher/Beat `SOURCE_REVISION`、Web `VITE_SOURCE_REVISION` 全部一致。
+- API `/healthz`、Web、SearXNG 均 HTTP 200；全部服务 running。
+
+## 2026-09-12 搜索/页面预算联动发布
+
+- 页面槽位预留已与剩余新搜索数联动，避免页面预算耗尽时仍有未使用的新搜索预算。
+- Release Gate 报告：[current_release_gate_quality_20260912_budget_coupled.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_budget_coupled.json)。
+- 最新源码指纹：`8680077b58c2`；API 元信息、API/Worker/Dispatcher/Beat `SOURCE_REVISION`、Web `VITE_SOURCE_REVISION` 全部一致。
+- API `/healthz`、Web、SearXNG 均 HTTP 200；Postgres、Redis、SearXNG、API、Worker、Dispatcher、Beat、Web 全部 running。
+
+## 2026-09-12 研究循环空转修复后强制重建发布
+
+- 修复 q2 在 `yield_question` 分支反复重入的调度缺口，新增本题预算耗尽标记与 P1 首轮公平调度约束。
+- Release Gate 报告：[current_release_gate_quality_20260912_yield_loop_fix.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_yield_loop_fix.json)，Ruff、Mypy、全量单元/API/集成测试、Golden Eval、前端构建全部通过。
+- 全量 pytest、研究循环/预算回归测试、Ruff 均通过。
+- 使用 `scripts/start.ps1 -NoBrowser` 强制重新构建镜像并 `--force-recreate` 全部服务，避免挂载源码之外残留旧 Python 字节码。
+- 最新源码指纹：`58ff58eb5726`；API `/api/v1/meta`、API/Worker/Dispatcher/Beat `SOURCE_REVISION`、Web `VITE_SOURCE_REVISION` 全部一致。
+- API `/healthz`、Web `5174`、SearXNG `8081` HTTP 200；Postgres、Redis、SearXNG、API、Worker、Dispatcher、Beat、Web 全部运行。
+- 发布后检查活动运行：迭代/搜索/页面先从 `2/4/3` 推进到 `6/10/8`，随后达到 `12/18/22`；覆盖率由约 32% 提升到约 91%，来源质量约 76.6%，旧的每 6 秒状态空转已停止。
+
+## 2026-09-12 REPLAN 状态修复后强制重建发布
+
+- 修复跨 `plan_version` 复用 `question_budget_exhausted_by_question` 导致新计划 pending 问题被错误跳过的问题。
+- Release Gate 报告：[current_release_gate_quality_20260912_replan_state_fix.json](D:/agentProject/evals/reports/current_release_gate_quality_20260912_replan_state_fix.json)；Ruff、Mypy、全量 pytest、Postgres 集成、Golden Eval、Web 构建全部通过。
+- 使用 `scripts/start.ps1 -NoBrowser` 强制重建镜像并强制重建全部服务；最新源码指纹：`81f2daf638a9`。
+- API 元信息、API/Worker/Dispatcher/Beat `SOURCE_REVISION`、Web `VITE_SOURCE_REVISION` 全部一致；API `/healthz`、Web `5174`、SearXNG `8081` 均 HTTP 200。
+
+## 2026-09-12 最终回归测试与运行态核对
+
+- 新增 `tests/unit/test_research_runs.py`，覆盖 REPLAN 清除旧问题预算状态的回归场景。
+- 最终 Release Gate 重新通过：Ruff、Mypy、全量 pytest、Postgres 集成、Golden Eval、Web 构建均通过。
+- 再次强制重建并重启全部服务，最终源码指纹：`897c14d3af96`；API、Worker、Dispatcher、Beat、Web、SearXNG 版本一致且健康检查通过。

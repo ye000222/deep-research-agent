@@ -1,0 +1,43 @@
+# 研究轮次口径与空转重试修复实施记录
+
+日期：2026-09-11 13:10（Asia/Shanghai）；运行态重载：2026-09-11 13:14（Asia/Shanghai）
+
+## 本次 Run 证据
+
+Run：`01a08ec9-95c2-7599-9768-c3fc0d28ef68`
+
+- 后端预算快照：20 轮、20 次搜索、30 页、100,000 Token。
+- 实际终态：20/20 轮、11/20 搜索、2/30 页面、13,364/100,000 Token；剩余 86,636 Token。
+- q1、q2 产生了有效页面和 8 条证据；q3–q8 的大量事件是候选复用、来源拒绝或不可读页面，页面数没有继续增加。
+- 因旧逻辑把上述空转也计入 `iterations`，第 20 次后直接以 `research_budget_exhausted` 进入报告，最终显示 `completed_with_limitations`。
+- 前端 Standard 文案显示“15 轮 / 15 次搜索”，而后端实际固化为 20/20，形成展示口径不一致。
+
+## 实施内容
+
+1. `apps/api/app/infrastructure/db/research_tools.py`
+   - 新增非消耗轮次结果集合：`zero_results`、`unreadable`、`provider_error`、`budget_exhausted`、`yield_question` 等。
+   - `finish_iteration` 只有实际完成证据研究（例如 `evidence_gained` 或页面已读取但无证据的 `no_evidence`）才递增 `usage_snapshot.iterations`。
+   - 空转重试仍保留事件、问题级 `resolution_attempts` 和搜索/页面预算，不会无限循环；达到问题级最大尝试次数后进入明确的证据不足/来源耗尽路径。
+   - `question.retry_scheduled` 记录 `research_attempt_consumed`，便于前端和审计区分有效轮次与空转。
+2. `apps/web/src/App.tsx`
+   - Standard 预算显示统一为“20 轮 / 20 次搜索 / 30 页”，与后端 `_BUDGETS` 和 Run 快照一致。
+3. 保留既有硬质量门，不降低 Coverage、来源质量、交叉验证或引用要求；真实缺口仍显示 `completed_with_limitations`。
+
+## 验证
+
+- `ruff check apps/api tests scripts`：通过。
+- `python -m pytest tests/unit -q`：206 项通过。
+- Web `npm.cmd run typecheck`：通过。
+- Web `npm.cmd run build`：通过。
+- 后端 `compileall`：通过。
+- Worker 已重新创建并加载最新代码；日志确认 `concurrency: 2 (prefork)`，成功连接 Redis 并进入 ready 状态。
+
+## 预期结果
+
+- 在 Token 尚未耗尽但出现不可读/无结果来源时，系统会继续轮转其他问题或使用剩余检索预算，不再被无效重试快速吃完研究轮次。
+- UI 的预算上限与后端实际值一致，`used / max` 和下拉框不再出现 15/20 的矛盾。
+- 旧 Run 的状态不会回写；必须创建新 Run 验证新口径。
+
+## 边界
+
+如果所有问题的有效来源确实耗尽，或搜索服务持续不可用，任务仍可能以 `completed_with_limitations` 结束；这代表真实证据不足，而不是轮次计数错误。完整生产 Graph 仍需在隔离数据库和固定 Provider 回放集上进行 30 案例验证。

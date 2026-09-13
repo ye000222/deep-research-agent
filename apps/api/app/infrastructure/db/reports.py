@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.domain.identifiers import uuid7
 from app.domain.providers import TokenUsage
 from app.domain.reports import ReportCitationView, ReportSectionView, ReportView
+from app.domain.research_budget import build_resource_pool_snapshot
 from app.domain.research_runs import RunPhase, RunStatus
 from app.infrastructure.db.analysis_models import AnalysisArtifactRow, AnalysisInputRow
 from app.infrastructure.db.evidence_graph_models import (
@@ -78,6 +79,84 @@ class PersistedSection:
     title: str
     markdown: str
     verification_result: dict[str, Any]
+
+
+def _canonical_research_stop_reason(run: ResearchRunRow) -> str | None:
+    """Recover the concrete budget cause before lifecycle finalization.
+
+    Older workers used the generic ``research_budget_exhausted`` marker. The
+    report finalizer is the last durable write, so infer the first exhausted
+    counter here and persist it in ``usage_snapshot`` for the UI and audits.
+    """
+
+    reason = run.termination_reason
+    if reason not in {"research_budget_exhausted", "RESEARCH_BUDGET_EXHAUSTED"}:
+        return reason
+    usage = run.usage_snapshot or {}
+    budget = run.budget_snapshot or {}
+
+    def as_int(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, bytes, bytearray)):
+            return 0
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    checks = (
+        ("provider_request_budget_exhausted", "search_provider_requests", "max_provider_requests"),
+        ("logical_query_budget_exhausted", "logical_queries", "max_logical_queries"),
+        ("fetched_page_budget_exhausted", "pages_fetched", "max_pages_fetched"),
+        ("extracted_page_budget_exhausted", "pages_extracted", "max_pages_extracted"),
+        ("extraction_call_budget_exhausted", "extraction_calls", "max_extraction_calls"),
+        (
+            "verification_call_budget_exhausted",
+            "verification_calls",
+            "max_verification_calls",
+        ),
+        ("action_budget_exhausted", "scheduler_actions", "max_scheduler_actions"),
+        ("page_budget_exhausted", "pages", "max_pages"),
+        ("search_budget_exhausted", "searches", "max_searches"),
+        ("token_budget_exhausted", "model_tokens", "max_tokens"),
+        ("iteration_budget_exhausted", "iterations", "max_iterations"),
+    )
+    usage_for_check = {**usage, "model_tokens": _model_token_total(usage)}
+    if usage.get("model_budget_guarded"):
+        return "token_budget_exhausted"
+    for concrete, used_key, limit_key in checks:
+        if as_int(budget.get(limit_key)) > 0 and as_int(
+            usage_for_check.get(used_key)
+        ) >= as_int(budget.get(limit_key)):
+            return concrete
+    started_at = run.started_at or run.created_at
+    deadline = as_int(budget.get("max_wall_clock_seconds"))
+    if deadline > 0 and started_at is not None:
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        if (datetime.now(UTC) - started_at).total_seconds() >= deadline:
+            return "deadline_exhausted"
+    return reason
+
+
+def _verification_budget_ledger_entry(
+    *,
+    allocated_tokens: int,
+    verification_calls: int,
+    report_version: int,
+    budget_exhausted: bool,
+) -> tuple[int, dict[str, Any]]:
+    """Describe deterministic verification without inventing model-token usage."""
+
+    released_tokens = max(0, allocated_tokens)
+    return released_tokens, {
+        "node": "verification",
+        "phase": "writing",
+        "allocated_tokens": released_tokens,
+        "actual_tokens": 0,
+        "status": "budget_exhausted" if budget_exhausted else "deterministic_no_model",
+        "verification_calls": max(0, verification_calls),
+        "report_version": report_version,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,8 +255,7 @@ class ReportRepository:
             for evidence_id, artifact in analysis_rows:
                 analysis_by_evidence.setdefault(evidence_id, artifact)
             analysis_ids = {
-                evidence_id: artifact.id
-                for evidence_id, artifact in analysis_by_evidence.items()
+                evidence_id: artifact.id for evidence_id, artifact in analysis_by_evidence.items()
             }
             analysis_operations = {
                 evidence_id: artifact.operation
@@ -313,16 +391,82 @@ class ReportRepository:
                     )
                 )
             writer_usage = usage.model_dump(mode="json") if usage is not None else None
-            run.usage_snapshot = {
+            updated_usage = {
                 **run.usage_snapshot,
                 "writer": writer_usage,
                 "writer_mode": writer_mode,
             }
+            max_verification_calls = int(
+                run.budget_snapshot.get("max_verification_calls", 0) or 0
+            )
+            verification_calls = int(updated_usage.get("verification_calls", 0) or 0)
+            if max_verification_calls > 0 and verification_calls >= max_verification_calls:
+                updated_usage["verification_budget_exhausted"] = True
+            else:
+                verification_calls += 1
+                updated_usage["verification_calls"] = verification_calls
+            # Finalization replaces the lifecycle termination reason with the
+            # terminal report status. Preserve the research stop cause in the
+            # authoritative usage snapshot so API clients do not have to
+            # reconstruct it from a truncated event stream.
+            research_stop_reason = _canonical_research_stop_reason(run)
+            updated_usage["research_stop_reason"] = research_stop_reason
+            allocation = run.budget_snapshot.get("allocation", {})
+            initial_writer_reserve = int(
+                allocation.get("writer_tokens_initial", 0)
+                if isinstance(allocation, dict)
+                else 0
+            )
+            writer_actual = int(
+                writer_usage.get("total_tokens", 0)
+                if isinstance(writer_usage, dict)
+                else 0
+            )
+            if initial_writer_reserve:
+                updated_usage["writer_token_reserve_released"] = max(
+                    0, initial_writer_reserve - writer_actual
+                )
+            ledger_raw = updated_usage.get("budget_ledger", [])
+            budget_ledger = list(ledger_raw) if isinstance(ledger_raw, list) else []
+            budget_ledger.append(
+                {
+                    "node": "writer",
+                    "phase": "writing",
+                    "allocated_tokens": initial_writer_reserve,
+                    "actual_tokens": writer_actual,
+                    "status": "settled" if writer_usage is not None else "deterministic_fallback",
+                    "report_version": version,
+                }
+            )
+            verification_tokens = int(
+                allocation.get("verification_tokens", 0)
+                if isinstance(allocation, dict)
+                else 0
+            )
+            released_verification_tokens, verification_ledger_entry = (
+                _verification_budget_ledger_entry(
+                    allocated_tokens=verification_tokens,
+                    verification_calls=verification_calls,
+                    report_version=version,
+                    budget_exhausted=bool(updated_usage.get("verification_budget_exhausted")),
+                )
+            )
+            updated_usage["verification_token_reserve_released"] = released_verification_tokens
+            budget_ledger.append(verification_ledger_entry)
+            updated_usage["budget_ledger"] = budget_ledger[-20:]
+            updated_usage["model_tokens"] = _model_token_total(updated_usage)
+            updated_usage["resource_pools"] = build_resource_pool_snapshot(
+                run.budget_snapshot,
+                updated_usage,
+            )
+            run.usage_snapshot = updated_usage
             run.quality_snapshot = {
                 **run.quality_snapshot,
                 "citation_completeness": verification_result["citation_completeness"],
                 "numeric_citation_rate": verification_result["numeric_citation_rate"],
                 "report_verified": verification_result["verified"],
+                "citation_support": verification_result.get("semantic_support_rate", 0.0),
+                "unresolved_citations": verification_result.get("unresolved_citations", 0),
             }
             run.status = (
                 RunStatus.COMPLETED_WITH_LIMITATIONS.value
@@ -384,9 +528,7 @@ class ReportRepository:
             pages = int(usage.get("pages", 0) or 0)
             search_failures = int(usage.get("search_provider_failures", 0) or 0)
             extraction_failures = int(usage.get("evidence_extraction_failures", 0) or 0)
-            if search_failures and pages == 0 and (
-                searches == 0 or search_failures >= searches
-            ):
+            if search_failures and pages == 0 and (searches == 0 or search_failures >= searches):
                 detail_code = "SEARCH_PROVIDER_EXHAUSTED"
                 cause = "search_provider_unavailable"
             elif pages and extraction_failures >= pages:
@@ -636,3 +778,12 @@ class ReportRepository:
             )
         )
         await session.flush()
+
+
+def _model_token_total(usage: dict[str, Any]) -> int:
+    total = int(usage.get("evidence_total_tokens", 0) or 0)
+    for key in ("planner", "writer"):
+        item = usage.get(key)
+        if isinstance(item, dict):
+            total += int(item.get("total_tokens", 0) or 0)
+    return total

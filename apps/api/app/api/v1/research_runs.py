@@ -26,6 +26,7 @@ from app.domain.controlled_tools import (
 from app.domain.evaluation import EvaluationSnapshot
 from app.domain.evidence_graph import EvidenceGraphView
 from app.domain.memory import MemoryAccessView, MemoryItemView
+from app.domain.performance import summarize_performance
 from app.domain.planning import ResearchPlan
 from app.domain.reports import ReportView, VerificationView
 from app.domain.research_runs import TERMINAL_RUN_STATUSES, ResearchRunView
@@ -57,7 +58,6 @@ class ResearchRunCreate(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
     saved_profile_version_id: UUID
     budget_tier: str = Field(default="quick", pattern="^(quick|standard|deep)$")
-
 
 
 class EvidenceSearchPayload(BaseModel):
@@ -183,6 +183,17 @@ async def get_run(
     service: Annotated[ResearchRunServiceProtocol, Depends(get_research_run_service)],
 ) -> ResearchRunResponse:
     return ResearchRunResponse.from_view(await _get_run(service, client, run_id))
+
+
+@router.get("/{run_id}/performance", response_model=dict[str, object])
+async def get_performance(
+    run_id: UUID,
+    client: Annotated[ClientSession, Depends(get_client_session)],
+    service: Annotated[ResearchRunServiceProtocol, Depends(get_research_run_service)],
+) -> dict[str, object]:
+    run = await _get_run(service, client, run_id)
+    calls = await service.list_llm_calls(client.owner_hash, run_id)
+    return summarize_performance(run, calls)
 
 
 @router.get("/{run_id}/plan", response_model=ResearchPlan)
@@ -385,8 +396,9 @@ async def search_evidence_tool(
         raise _not_found() from exc
     except ToolExecutionError as exc:
         raise HTTPException(
-            status_code=
-                status.HTTP_409_CONFLICT if exc.retryable else status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_409_CONFLICT
+            if exc.retryable
+            else status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error_code": exc.code, "retryable": exc.retryable},
         ) from exc
     except ValueError as exc:
@@ -410,8 +422,9 @@ async def analyze_data_tool(
         raise _not_found() from exc
     except ToolExecutionError as exc:
         raise HTTPException(
-            status_code=
-                status.HTTP_409_CONFLICT if exc.retryable else status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_409_CONFLICT
+            if exc.retryable
+            else status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error_code": exc.code, "retryable": exc.retryable},
         ) from exc
     except ValueError as exc:
@@ -446,6 +459,20 @@ async def cancel_run(
 ) -> ResearchRunResponse:
     try:
         run = await service.cancel_run(client.owner_hash, run_id)
+    except ResearchRunNotFoundError as exc:
+        raise _not_found() from exc
+    return ResearchRunResponse.from_view(run)
+
+
+@router.post("/{run_id}/pause", response_model=ResearchRunResponse)
+async def pause_run(
+    run_id: UUID,
+    client: Annotated[ClientSession, Depends(get_client_session)],
+    service: Annotated[ResearchRunServiceProtocol, Depends(get_research_run_service)],
+) -> ResearchRunResponse:
+    """Pause and checkpoint a run; use ``cancel`` when the run must terminate."""
+    try:
+        run = await service.pause_run(client.owner_hash, run_id)
     except ResearchRunNotFoundError as exc:
         raise _not_found() from exc
     return ResearchRunResponse.from_view(run)

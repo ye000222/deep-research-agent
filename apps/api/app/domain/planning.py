@@ -146,9 +146,7 @@ def normalize_research_plan_draft_payload(
     hint_count = 1 if compact else 2
     criteria_count = 2 if compact else 4
 
-    normalized["scope_summary"] = _clip_text(
-        normalized.get("scope_summary"), scope_limit
-    )
+    normalized["scope_summary"] = _clip_text(normalized.get("scope_summary"), scope_limit)
     questions = normalized.get("questions")
     if isinstance(questions, list):
         bounded_questions: list[object] = []
@@ -157,12 +155,8 @@ def normalize_research_plan_draft_payload(
                 bounded_questions.append(raw_question)
                 continue
             question: dict[object, object] = dict(raw_question)
-            question["question"] = _clip_text(
-                question.get("question"), question_limit
-            )
-            question["rationale"] = _clip_text(
-                question.get("rationale"), rationale_limit
-            )
+            question["question"] = _clip_text(question.get("question"), question_limit)
+            question["rationale"] = _clip_text(question.get("rationale"), rationale_limit)
             question["evidence_requirements"] = _clip_text_list(
                 question.get("evidence_requirements"),
                 max_items=requirement_count,
@@ -216,9 +210,7 @@ def fit_plan_to_budget(
     )[:executable_questions]
     retained_indexes = {index for index, _question in ranked}
     retained = [
-        question
-        for index, question in enumerate(plan.questions)
-        if index in retained_indexes
+        question for index, question in enumerate(plan.questions) if index in retained_indexes
     ]
     return plan.model_copy(update={"questions": retained})
 
@@ -288,9 +280,9 @@ def build_gap_driven_questions(
         while f"q{next_number}" in used_ids:
             next_number += 1
         reason_text = "; ".join(missing_reasons) or "缺少满足验收标准的独立证据"
-        follow_up = (
-            f"针对研究问题「{question}」, 还需哪些独立公开证据补齐缺口: {reason_text}?"
-        )[:500]
+        follow_up = (f"针对研究问题「{question}」, 还需哪些独立公开证据补齐缺口: {reason_text}?")[
+            :500
+        ]
         additions.append(
             ResearchQuestion(
                 id=f"q{next_number}",

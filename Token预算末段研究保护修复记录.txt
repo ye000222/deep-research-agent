@@ -1,0 +1,40 @@
+# Token 预算末段研究保护修复记录
+
+## 2026-09-09 11:35:56（Asia/Shanghai）
+
+### 用户现象
+
+- 多次真实研究可以完成到 100% 执行流程，但在约 82% 附近显示“研究 Token 已耗尽”，随后直接进入报告阶段。
+- 因为模型预算保护只保留报告 Writer 额度，最后一个或几个 Research Plan 未获得最后一次证据检索机会。
+
+### 根因
+
+- `ResearchToolRepository.evidence_model_budget()` 原来只计算 `remaining - writer_reserve`，并使用固定 5,000 Token 的调用门槛。
+- 当剩余预算低于 Writer 预留 + 5,000 时，立即写入 `model_budget_guarded`；下一轮 `_budget_exhausted()` 直接进入写作，即使仍有未完成计划项。
+- Evidence Extractor 的调用预算由上层传入，末段没有为“当前问题/剩余问题”建立最低可执行额度，因此实际表现为约 80%～85% 提前收尾。
+
+### 本轮已完成
+
+- 将证据调用前保护阈值从 5,000 调整为 3,000；这是调用前保护阈值，不是降低 Evidence Schema 或正常输出质量。
+- 在同一事务内统计当前 Run 尚未完成的 Research Plan 项（`pending/active/blocked/partial/technical_retry`）。
+- 为除当前问题之外的每个未完成问题保留 3,000 Token 的最低研究额度；当前问题仍可使用剩余额度进行紧凑证据抽取。
+- 预算不足时仍保留 Writer 预算，不绕过 Evidence Schema、不伪造证据，也不提高全局硬上限。
+- 预算事件额外记录 `pending_questions` 与 `future_question_reserve_tokens`，便于前端和审计定位是否因末段预算保护停止。
+
+### 验证
+
+- `python -m compileall`（目标模块）通过。
+- `tests/unit/test_research_loop.py` 与 `tests/unit/test_worker_failure_diagnostics.py`：24 passed。
+- 当前改动尚未 commit/push；需要继续运行全量 Release Gate、真实 Provider Smoke Test，并观察至少 3 次不同研究任务的末段覆盖率。
+
+### 后续续接顺序
+
+1. 运行全量 pytest、Ruff、MyPy、Web build、PostgreSQL Integration 和 Strict Release Gate。
+2. 用真实 Provider 做至少 3 次含 5～8 个问题的研究，核对 `model_tokens_remaining`、`pending_questions`、最终未完成问题数和 Coverage。
+3. 若仍在末段提前停止，继续检查 Evidence Extractor 的输入上下文是否重复计费；只能采用自适应紧凑上下文，不能直接放大全局 Token 上限。
+4. 将结果追加到 `DeepResearch_Agent_V1_功能审查结果.txt`，并在确认测试后再 commit/push。
+
+## 2026-09-09 17:14:44 复核补充
+
+上面的“已完成”仅表示初步预留计算已写入。当前预算不足仍设置全局停止，未实现让出当前问题继续下一题；多题预留可能反而提前结束。3k 预算也会影响实际模型输出上限，不能保证质量不变。
+下一步以《研究性能优化开发方案与本轮续接记录.txt》P0/P1 为准，补齐可执行预算、问题轮转、yield_question 与回归测试。性能及质量提升尚未通过真实对照验证。

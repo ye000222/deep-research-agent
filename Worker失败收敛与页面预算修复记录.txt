@@ -1,0 +1,57 @@
+Worker 失败收敛与页面预算修复记录
+================================
+记录时间：2026-09-08 10:18:25（Asia/Shanghai）
+
+一、问题证据
+- 失败 Run：01a07ea1-a25a-7fa3-836b-8517c59c8c01。
+- budget_snapshot.max_pages=30，usage_snapshot.pages=31；已接受 Evidence=18，覆盖率=0.7885。
+- 最后事件依次为 evaluation.completed（research_budget_exhausted）、report.writing_started、run.failed。
+- Worker 栈：ResearchState.model_validate -> ValueError: page budget exceeded；失败终态同步再次校验相同非法 State，造成 VALIDATIONERROR。
+- 报告 Writer 实际没有成为异常来源；前端依据 report.writing_started 误标为“报告生成”。
+
+二、根因
+ResearchLoop 每轮开始时只检查一次预算，但单轮最多读取3页。剩余28/30或29/30时仍可启动3页批次，导致 31/30 或 30/30 之后继续外部读取。这是按数据边界触发的确定性批量越界，不是模型随机故障。
+
+三、已完成修复
+1. ResearchToolRepository 增加带行锁的 reserve_page_slots；读取前原子计算并记录 page_slots_reserved。
+2. ResearchLoop 按实际授予槽位裁剪批次；页面成功、抽取失败、读取失败分别结算槽位；提前停止释放未使用槽位。
+3. Worker 将 page budget ValidationError 映射为 RESEARCH_BUDGET_EXHAUSTED / PAGE_BUDGET_OVERRUN，不再暴露 WORKER_EXECUTION_FAILED / VALIDATIONERROR。
+4. 失败执行清理未结算页面预留；状态投影允许预算失败终态保留真实历史使用量，不隐藏超支事实。
+5. 前端将预算越界归入证据评估阶段，并显示页面预算诊断，不再误归报告生成。
+6. 新增批量边界、页面错误分类和终态投影测试。
+
+四、验证
+- Ruff 通过。
+- MyPy apps/api/app：103 source files，无错误。
+- 全量 tests/unit + tests/api：148 passed，2 个既有弃用警告。
+- 目标研究循环/Worker 测试：24 passed，1 skipped。
+- Docker API/Worker 已重启，容器均 Up；API 重启瞬间检查过早出现 Connection Refused，随后容器恢复正常，日志显示 Uvicorn startup completed。
+- PostgreSQL 集成测试在 Windows 主机直接运行未能全通过：AsyncPostgresSaver 受 ProactorEventLoop 限制，Migration 测试缺少 TEST_DATABASE_URL；不是本次业务代码失败。CI/Linux Docker 仍需执行。
+
+五、仍需完成
+- 在 Linux/CI PostgreSQL 环境执行真实边界集成测试，确认 reserve/commit/release 的事务行为。
+- 增加 Celery 崩溃发生在 reservation 与 commit 之间的故障注入，验证恢复不会泄漏槽位。
+- 将 failure_node 与预算实际值完整展示在前端；当前后端已保留安全诊断字段。
+- 完整 Release Gate 与 生产 Graph 30 案例仍需在本轮修改后重新运行。
+- 真实 Provider Smoke 仍需明确授权后执行，不能用离线测试替代。
+
+六、续接顺序
+先读取本文件和 git status；在 Linux/CI 跑 PostgreSQL 集成；再做 Celery reservation crash recovery；最后重跑完整 Release Gate。不要恢复旧失败 Run 作为新验证，创建新 Run 并确认 API/Worker 已加载当前代码。
+
+七、回归验证补充（2026-09-08 10:29:56，Asia/Shanghai）
+- 本机 `tests/unit + tests/api` 全部通过；Ruff、MyPy（103 个后端源文件）通过，Web typecheck/build 通过。
+- `scripts/release_gate.py --skip-integration` 通过：静态检查、全量 pytest、Compose 配置、Golden Eval、Secret Scan 和 MySQL 检查均通过；新报告保存为 `evals/reports/current_release_gate_after_budget_fix.json`。
+- Docker Compose 状态：PostgreSQL healthy，API/Worker/Beat/Dispatcher/Web 均 Up；API/Worker 已重载当前修复。
+- 仍不能把本机跳过的 PostgreSQL 集成等同于 GitHub CI 通过；下一步必须在 Linux/CI 执行真实 reserve/commit/release 事务与 Celery 崩溃恢复。
+
+八、Docker PostgreSQL 集成复核（2026-09-08 10:37:34，Asia/Shanghai）
+- 当前 Docker PostgreSQL、测试库和 Checkpoint 库上的 `tests/integration` 4 项全部通过。
+- Windows 运行时显式使用 Selector 事件循环后，AsyncPostgresSaver 集成通过；此前 Proactor 错误属于本机事件循环兼容性。
+- 仍待 GitHub Linux CI 的最终确认，以及 reservation/commit 间 Celery 崩溃故障注入。
+
+九、PostgreSQL 恢复烟测（2026-09-08 10:41:02，Asia/Shanghai）
+- `scripts/verify_postgres_recovery.py` 通过：PostgreSQL 18.6、扩展、回滚、Outbox 幂等、事件键唯一性及 Checkpoint 表均正常。
+- 专门的 Celery reservation/commit 间崩溃故障注入仍待补齐。
+
+十、运行中任务清理检查（2026-09-08 10:46:08，Asia/Shanghai）
+- Docker PostgreSQL 查询显示过期 `running` 任务数量为 0；没有发现孤儿租约。

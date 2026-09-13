@@ -57,6 +57,7 @@ def allocate_budget(
     context_window: int | None,
     requested_output_tokens: int,
     provider_max_output_tokens: int | None = None,
+    max_input_tokens: int | None = None,
 ) -> ContextBudgetAllocation:
     window = context_window or DEFAULT_CONTEXT_WINDOW
     if window < 1024:
@@ -66,6 +67,8 @@ def allocate_budget(
     safety_margin = max(512, math.ceil(window * 0.10))
     available = window - output_reserve - safety_margin
     input_budget = min(available, math.floor(window * MAX_INPUT_FRACTION))
+    if max_input_tokens is not None:
+        input_budget = min(input_budget, max_input_tokens)
     if input_budget < MIN_INPUT_BUDGET:
         raise ContextBudgetInsufficientError("CONTEXT_BUDGET_INSUFFICIENT")
     return ContextBudgetAllocation(
@@ -97,11 +100,13 @@ class ContextBudgetManager:
         context_window: int | None,
         provider_max_output_tokens: int | None,
         prompt_template_version: str,
+        max_input_tokens: int | None = None,
     ) -> ContextEnvelope:
         allocation = allocate_budget(
             context_window=context_window,
             requested_output_tokens=requested_output_tokens,
             provider_max_output_tokens=provider_max_output_tokens,
+            max_input_tokens=max_input_tokens,
         )
         original = tuple(candidates)
         measured = [(candidate, estimate_tokens(candidate.content)) for candidate in original]
@@ -209,7 +214,9 @@ class ContextBudgetManager:
                             rank_score=candidate.rank_score,
                             token_count=token_by_index.get(ordinal, original_tokens),
                             compression_level=effective.compression_level.value,
-                            content_hash=hashlib.sha256(effective.content.encode("utf-8")).hexdigest(),
+                            content_hash=hashlib.sha256(
+                                effective.content.encode("utf-8")
+                            ).hexdigest(),
                             selected=is_selected,
                             protected=candidate.protected,
                             selected_reason_code=reason,

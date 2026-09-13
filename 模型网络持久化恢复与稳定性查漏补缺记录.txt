@@ -1,0 +1,75 @@
+模型网络持久化恢复与稳定性查漏补缺记录
+========================================
+
+记录时间：2026-09-08 18:25:13（Asia/Shanghai）
+当前分支：codex/v1.1-budget-guard
+起始 HEAD：ddf5df1 docs: record V1.1 merge gate audit
+状态：代码和验证已完成，尚未 git commit / git push
+
+一、本轮问题
+------------
+
+网页中的研究任务在 Planner 阶段停在 9%，显示 MODEL_NETWORK_ERROR，诊断为 CONNECT_ERROR 或 CONNECT_TIMEOUT。
+
+数据库审计显示：
+
+- 最近两个失败 Run 均实际完成了三次 Planner 调用，不是 API Key 或 Schema 问题。
+- 其中一个 Run 人工恢复后再次落在同一故障窗口，总计六次连接错误。
+- 旧行为只在同一 Celery Worker 内等待 3 秒、10 秒，约 35 秒短窗口耗尽后便永久标记 failed。
+- 故障窗口结束后，从 Worker 容器访问 Provider Endpoint 可在约 2.2 秒得到 HTTP 401，证明 DNS/TCP/TLS/出口已经恢复；401 是未携带认证的只读连通性探测结果。
+- 根因是暂时网络抖动持续时间大于进程内退避窗口，同时系统缺少跨 Worker、跨进程重启的持久化延迟恢复。
+
+二、已完成修复
+--------------
+
+1. Worker 的 httpx AsyncHTTPTransport 增加两次连接建立重试。仅覆盖建立连接时的错误；不自动重放 HTTP 响应或业务结果，避免重复副作用。
+2. 短时重试仍失败时，不再立即把暂时性模型错误写成 terminal failed。
+3. 对 retryable 的 MODEL_NETWORK_ERROR、MODEL_TIMEOUT、MODEL_RATE_LIMITED、MODEL_PROVIDER_UNAVAILABLE 启用 PostgreSQL Outbox 持久化恢复。
+4. 在同一数据库事务中保留 Run/Checkpoint、释放 Worker Lease、清理页面预留、将 Run 置为 queued、写入 resume Outbox 和 model.retry_deferred 事件。
+5. 分阶段退避为 30 秒、120 秒、600 秒、1800 秒；同一执行阶段最多四次持久化重试，防止永久故障形成无限循环。
+6. 鉴权失败、请求参数错误、Schema 错误等确定性错误不进入该循环。
+7. 自动恢复保留实际 phase，不会把 writing/verifying 错误重置成 researching；人工 resume 的既有语义不变。
+8. model_transport_retry_pending 在 ResearchState 中映射为 queued + stop_reason=None，不再误投影成 FatalError。
+9. 重试计数按 phase 隔离；Planner 的网络故障不会耗尽后续 Writer 阶段的恢复额度。
+10. 前端显示检查点已保留、预计自动恢复秒数、当前重试次数/4，并在 Activity 中显示 Durable Retry。
+11. 2026-09-08 18:33:54 完成剩余诊断收敛：非预算类 Pydantic 错误映射为 STATE_VALIDATION_FAILED + 安全字段位置/类型，不再退化成 VALIDATIONERROR 或 UNKNOWN；不绕过不变量。
+
+三、验证结果
+------------
+
+- 单元/API：152 项通过。
+- Ruff：通过。
+- MyPy：apps/api/app 共 103 个源文件，0 error。
+- Web：TypeScript typecheck 和 Vite production build 通过。
+- PostgreSQL Integration：4/4 通过。
+- 新增真实数据库断言：Run 变为 queued；phase 保留；租约释放；延迟 resume Outbox 与公开事件原子写入；ResearchState stop_reason 为空。
+- Strict V1 Release Gate：完整模式通过，包括 PostgreSQL、Compose、Golden 30、Secret Scan、MySQL 禁用检查与 Web Build。
+- 机器可读报告：evals/reports/current_release_gate_network_recovery_full.json。
+- 服务健康：/readyz 中 PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 全部 ready。
+- 过期 running 任务：0。
+
+四、保证边界
+------------
+
+项目现在可以保证：一次短暂网络抖动耗尽 3/10 秒进程内重试后，不会立刻把研究永久停在 9%；状态会持久保存并由 Outbox 跨 Worker 自动恢复。
+
+项目不能保证外部 Provider、用户网络或 DNS 永远可用。如果连续约 42 分钟的四级持久化恢复仍全部失败，任务最终仍必须以明确模型网络错误终止，避免无限占用队列和预算。鉴权失效、余额不足、模型下线等也不会被伪装成成功。
+
+五、下次安全续接
+----------------
+
+1. 禁止 reset/restore 当前工作区；其中包含本轮之前尚未提交的 V1.1 稳定性、Coverage、Evidence 和预算修复。
+2. 先运行 git status --short 和 git diff --check。
+3. 如需发布，提交前再跑一次完整 scripts/release_gate.py，并在 GitHub CI 验证 Linux 环境。
+4. 可用真实 Provider 新建一次 Smoke Run；如主动制造短时断网，应观察 Run 进入 queued/model_transport_retry_pending，而不是 failed，并在网络恢复后由 Dispatcher 自动继续。
+5. 真实 Provider 长时间不可用不能作为代码失败；验收重点是持久化恢复、无重复 Evidence/预算扣减、最终明确终态。
+
+六、研究依赖故障最终查漏补缺（2026-09-08 22:14:17，Asia/Shanghai）
+--------------------------------------------------------------------
+
+- 修复 Evidence Extractor 暂时性模型故障被吞成单页无证据的问题；现在持久化 Snapshot 后交给 Worker 延迟恢复。
+- 修复 SearXNG retryable 全局故障在同一 Worker 窗口消耗后续问题的问题；新增独立 search_transport_retry_pending 和 30/120/600/1800 秒 Outbox 恢复。
+- SecretCipher 将 InvalidTag/Key 版本/编码错误映射为安全明确的凭据诊断；通用失败记录实际 failure_node。
+- 完整验证通过：154 项单元/API、4 项 PostgreSQL Integration、Ruff、MyPy 103 文件、Web build、Strict V1 Release Gate、Golden Eval 与 Secret Scan。
+- 服务已重启，/readyz 全 ready，过期 running=0；机器报告为 evals/reports/current_release_gate_dependency_recovery.json。
+- 详细记录见 研究依赖故障持久化恢复与最终查漏补缺记录.txt；仍未 commit/push。

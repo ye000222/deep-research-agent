@@ -42,6 +42,95 @@ def request() -> CanonicalModelRequest:
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize(
+    ("host", "model", "enabled", "disabled"),
+    [
+        ("api.deepseek.com", "deepseek-v4-flash", False, True),
+        ("api.deepseek.com", "deepseek-v4-pro", False, True),
+        ("compatible.example.com", "deepseek-v4-flash", False, False),
+        ("api.deepseek.com", "other-model", False, False),
+        ("api.deepseek.com", "deepseek-v4-flash", True, False),
+    ],
+)
+async def test_planner_thinking_control_is_scoped_to_verified_provider(
+    host: str, model: str, enabled: bool, disabled: bool
+) -> None:
+    route = respx.post(f"https://{host}/chat/completions").respond(
+        200,
+        json={"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]},
+    )
+    model_request = request().model_copy(
+        update={
+            "model": model,
+            "max_output_tokens": 1200,
+            "generation_parameters": {"reasoning_enabled": enabled},
+        }
+    )
+    async with httpx.AsyncClient() as client:
+        await LLMGateway(client).generate_structured(
+            adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT,
+            base_url=f"https://{host}",
+            api_key=SecretStr("test-secret"),
+            request=model_request,
+            allow_regeneration=False,
+        )
+    body = json.loads(route.calls[0].request.content)
+    assert (body.get("thinking") == {"type": "disabled"}) is disabled
+    assert body["max_tokens"] == 1200
+    assert "reasoning_enabled" not in body
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("content", ["", "{}"])
+async def test_length_stop_rejected_even_with_closed_json_and_reasoning_is_not_logged(
+    content: str,
+) -> None:
+    respx.post("https://compatible.example.com/chat/completions").respond(
+        200,
+        json={
+            "choices": [
+                {
+                    "message": {
+                        "content": content,
+                        "reasoning_content": "private reasoning sentinel",
+                    },
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 1200,
+                "completion_tokens_details": {"reasoning_tokens": 1190},
+            },
+        },
+    )
+    recorded: list[dict[str, object]] = []
+
+    async def record(payload: dict[str, object]) -> None:
+        recorded.append(payload)
+
+    model_request = request().model_copy(update={"metadata": {"run_id": str(uuid4())}})
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(ModelGatewayError) as raised:
+            await LLMGateway(client, call_recorder=record).generate_structured(
+                adapter_type=AdapterType.OPENAI_COMPATIBLE_CHAT,
+                base_url="https://compatible.example.com",
+                api_key=SecretStr("test-secret"),
+                request=model_request,
+                allow_regeneration=False,
+            )
+    assert raised.value.code == "MODEL_OUTPUT_TRUNCATED"
+    assert raised.value.diagnostics["reasoning_tokens"] == 1190
+    assert raised.value.diagnostics["reasoning_content_present"] == 1
+    assert raised.value.diagnostics["response_length"] == len(content)
+    assert len(recorded) == 1
+    assert "private reasoning sentinel" not in str(recorded)
+    assert "test-secret" not in str(recorded)
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_openai_responses_adapter_uses_native_schema() -> None:
     route = respx.post("https://api.openai.com/v1/responses").mock(
         return_value=httpx.Response(
@@ -322,9 +411,7 @@ async def test_compatible_invalid_json_exposes_safe_finish_diagnostics() -> None
                 200,
                 json={
                     "id": "chat_invalid_1",
-                    "choices": [
-                        {"finish_reason": "length", "message": {"content": "not-json"}}
-                    ],
+                    "choices": [{"finish_reason": "length", "message": {"content": "not-json"}}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 20},
                 },
             ),
@@ -359,9 +446,10 @@ async def test_compatible_invalid_json_exposes_safe_finish_diagnostics() -> None
     assert raised.value.code == "MODEL_OUTPUT_TRUNCATED"
     assert raised.value.detail_code == (
         "OUTPUT_INVALID_JSON_MODE_REGENERATED_ONCE_FINISH_LENGTH_"
-        "PARSE_EXPECTING_VALUE_AT_0_CHARS_14"
+        "PROVIDER_LENGTH_STOP_CHARS_14"
     )
     assert raised.value.diagnostics == {
+        "reasoning_content_present": 0,
         "structured_output_strategy": "json_mode_regenerated_once",
         "finish_reason": "length",
         "output_tokens": 40,
@@ -380,9 +468,7 @@ async def test_compatible_adapter_honors_control_plane_temperature() -> None:
             200,
             json={
                 "id": "chat_deterministic",
-                "choices": [
-                    {"finish_reason": "stop", "message": {"content": json.dumps(PLAN)}}
-                ],
+                "choices": [{"finish_reason": "stop", "message": {"content": json.dumps(PLAN)}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 20},
             },
         )

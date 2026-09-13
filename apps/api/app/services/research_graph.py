@@ -242,9 +242,12 @@ class ResearchGraphService:
         max_attempts = len(_PLANNER_RETRY_DELAYS_SECONDS) + 1
         for attempt in range(1, max_attempts + 1):
             try:
+                planner_kwargs: dict[str, Any] = {}
                 if memory_leads:
-                    return await self._planner.generate(run_id, memory_leads=memory_leads)
-                return await self._planner.generate(run_id)
+                    planner_kwargs["memory_leads"] = memory_leads
+                if isinstance(self._planner, PlannerService):
+                    planner_kwargs["worker_task_id"] = worker_task_id
+                return await self._planner.generate(run_id, **planner_kwargs)
             except ModelGatewayError as exc:
                 if not exc.retryable or attempt >= max_attempts:
                     raise

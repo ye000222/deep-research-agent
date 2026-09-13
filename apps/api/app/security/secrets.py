@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import SecretStr
 
@@ -24,6 +25,14 @@ class EncryptedSecret:
     aad_version: int
     hmac_fingerprint: str
     last_four: str
+
+
+class SecretDecryptionError(RuntimeError):
+    """A safe, classified credential failure without secret material."""
+
+    def __init__(self, detail_code: str) -> None:
+        super().__init__(detail_code)
+        self.detail_code = detail_code
 
 
 class SecretCipher:
@@ -76,10 +85,17 @@ class SecretCipher:
         credential_version: int,
     ) -> SecretStr:
         if encrypted.key_version != self.key_version:
-            raise ValueError("credential key version is not available")
+            raise SecretDecryptionError("KEY_VERSION_UNAVAILABLE")
         aad = self._aad(credential_id, adapter_type, credential_version)
-        plaintext = self._aead.decrypt(encrypted.nonce, encrypted.ciphertext, aad)
-        return SecretStr(plaintext.decode("utf-8"))
+        try:
+            plaintext = self._aead.decrypt(encrypted.nonce, encrypted.ciphertext, aad)
+        except InvalidTag as exc:
+            # Do not leak whether the key, nonce, ciphertext, or AAD mismatched.
+            raise SecretDecryptionError("CREDENTIAL_AUTHENTICATION_FAILED") from exc
+        try:
+            return SecretStr(plaintext.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise SecretDecryptionError("CREDENTIAL_PLAINTEXT_INVALID") from exc
 
     @staticmethod
     def _aad(credential_id: UUID, adapter_type: str, credential_version: int) -> bytes:

@@ -1,0 +1,27 @@
+# Token 预算与 Writer 闭环修复实施记录
+
+日期：2026-09-11
+阶段：2 / 4
+
+## 问题
+
+图1任务在 93,604 / 100,000 Token 时停止。此前每个问题的预算只写入 `budget_snapshot`，没有在实际预留时执行；Writer 预留按 1 条证据估算，研究停止后常被迫走 deterministic fallback。
+
+## 实施
+
+1. `reserve_model_tokens` 按 `allocation.question_token_budgets` 检查问题级累计预留/实际消耗，超出分配时拒绝新的调用，避免单个问题吞噬全局预算。
+2. Writer 预留按最多 20 条 Evidence Card 估算，不再按 1 条证据估算。
+3. 新任务启用 relevant chunks、extraction cache、report draft cache。
+4. Worker 的 ResearchLoop 开启并行页面读取；模型调用仍由 Token reservation 统一限额。
+
+## 验证
+
+执行：
+
+`.venv\\Scripts\\python.exe -m pytest tests/unit/test_research_budget.py tests/unit/test_research_loop.py tests/unit/test_evidence_extractor.py tests/unit/test_planner_service.py -q`
+
+结果：58 passed。
+
+## 后续
+
+需要在集成环境验证新任务的预算快照、缓存命中和 Writer 实际调用；旧任务不会被回写或重新计算。

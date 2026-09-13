@@ -1,0 +1,599 @@
+搜索策略与预算优化 V2 开发对照方案
+====================================
+
+文档用途
+--------
+
+本文件用于后续开发前的统一对照。目标是在不牺牲证据可信度的前提下，降低研究总耗时、无效页面读取、无效模型调用和重复搜索，并让 token、调用次数、页面上限、上游请求和截止时间真正形成闭环。
+
+本轮结论来自现有源码、实施记录、单元/集成测试和评测报告。以下状态以当前工作区源码和测试证据为准；已完成项不再重复开发，只补齐仍有运行路径缺口的项目。
+
+
+一、当前版本基线
+----------------
+
+1. 当前预算档位
+
+quick：
+- max_iterations = 5
+- max_searches = 5
+- max_pages = 10
+- max_tokens = 30,000
+
+standard：
+- max_iterations = 20
+- max_searches = 20
+- max_pages = 30
+- max_tokens = 100,000
+
+deep：
+- max_iterations = 30
+- max_searches = 30
+- max_pages = 60
+- max_tokens = 220,000
+
+来源：apps/api/app/services/research_runs.py 中的 _BUDGETS。
+
+2. 当前检索链路
+
+- Planner 生成 5–8 个研究问题。
+- Research Loop 按问题调度搜索、读取页面、Evidence Extractor 抽取证据、Evaluator 计算覆盖度和信息增益。
+- 首次尝试读取 1 页；重试通常最多读取 2 页。
+- 单次搜索最多拿 20 个候选结果。
+- 搜索结果按 URL、来源 owner、主题关键词去重和过滤。
+- Evidence Extractor 进行逐字引文校验、主题匹配、来源可靠性、模型 relevance/confidence 和综合分数判断。
+- 满足质量门、资源耗尽或信息增益停滞后进入 Writer。
+
+3. 当前质量门
+
+- 总 coverage >= 0.85
+- priority-one coverage >= 0.80
+- source_quality >= 0.75
+- cross_validation >= 0.70
+- critical_gaps == 0
+
+4. 当前优点
+
+- 搜索摘要不会直接充当 Evidence。
+- URL、最终 URL、正文 hash 已有规范化去重。
+- 同一问题跨 plan_version 的成功查询不会重复执行。
+- 页面预取、模型 token 预留、页面槽位预留、失败恢复和缓存复用已经存在。
+- Evidence 必须有原文逐字引文，并且有明确接受/拒绝原因。
+- 当前 Release Gate、Ruff、Mypy、单元测试和集成测试已通过。
+
+
+二、当前需要优先解决的问题
+----------------------------
+
+P0-1：预算分配有一部分只是快照，不是真正的执行约束
+
+allocate_budget_shares() 会计算 research_searches、report_pages、validation_iterations、writer_tokens 等字段，但这些字段多数只进入预算快照，没有对应的运行时扣减和停止逻辑。实际主要依赖总 searches、pages、model_tokens、iterations。
+
+影响：页面、搜索、验证和写作之间没有真正的资源隔离，预算面板可能看起来有分配，但调度并没有按分配执行。
+
+建议：所有预算字段必须对应一个可扣减的 ledger；没有下游消费者的字段要删除或改成明确的派生展示字段。
+
+P0-2：问题级 token 预算是软目标，借用没有收益门槛
+
+系统已计算 question_token_budgets，但 reserve_model_tokens() 允许超出问题目标并从全局池借用。当前借用主要用于审计，不是真正的调度限制。
+
+影响：低收益问题可能持续消耗全局 token，挤压尚未首轮尝试的问题或验证池。
+
+建议：问题预算采用“首轮硬保障 + 后续软借用”模型。借用必须满足高预期信息收益、未关闭的高风险缺口和不会侵占 writer/verification reserve 三个条件。
+
+P0-3：逻辑搜索次数与真实上游请求次数不一致
+
+一次 SearXNG 逻辑搜索可能顺序尝试默认策略、Sogou、arxiv/openaire 等多个策略；每次请求 timeout 为 20 秒，但最终只记作一次 searches。
+
+影响：搜索预算无法反映真实网络压力和真实延迟；一个逻辑搜索极端情况下可能接近 100 秒。
+
+建议：拆成两个计数：logical_queries 和 provider_requests；失败、超时、fallback、重试都记录 provider_requests，并纳入单独上限。
+
+P0-4：Wall-clock 字段存在，但研究循环没有真正执行截止检查
+
+状态模型有 max_wall_clock_seconds，但当前研究路径没有统一的 deadline 检查。
+
+影响：网络退化、重复重试或 worker 空转时，研究可能长时间保持运行态。
+
+建议：run 创建时保存 deadline_at；prepare_target、外部搜索前、页面读取前、模型调用前和 finish_iteration 都检查 deadline。
+
+P0-5：查询策略的“核心角度”与耗尽边界不一致
+
+中文查询变体有 7 个，核心角度另有 12 个；但 _MAX_GAP_ATTEMPTS = 8。问题通常在核心角度开始前就被标记 strategy exhausted。
+
+影响：基准、落地实测、失败分析、成本性能、标准合规等设计好的检索角度可能实际不可达。
+
+建议：将查询策略改成显式 QueryFamily 列表，并按已实际执行的 family 计数；不要用 gap attempt 代替 query strategy attempt。
+
+P0-6：迭代预算不能约束无效动作
+
+zero_results、unreadable、no_evidence 等结果被视为非消耗迭代，但仍会消耗页面、token、搜索请求和时间。
+
+影响：max_iterations 不是严格的研究动作上限；无效循环只能等其他预算触发。
+
+建议：拆出 scheduler_actions、productive_iterations、technical_retries 三个计数。所有调度动作消耗 action；只有技术恢复不消耗 productive iteration，但必须消耗 retry/request 预算。
+
+P1-1：昂贵抽取前的页面筛选仍然不足
+
+当前很多可读页面会直接进入 Evidence Extractor。页面有候选但全部未通过时，仍可能消耗模型 token。
+
+建议：将页面流程拆为 fetch -> cheap triage -> extract。cheap triage 只做正文清洗、主题/维度匹配、来源角色和重复检测，不调用模型。
+
+P1-2：调度主要按 attempts、coverage、priority 排序，没有单位成本收益
+
+当前调度没有直接使用“预计有效证据概率 / token / 页面 / 延迟 / 上游请求”的比值。
+
+建议：使用 cost-adjusted expected utility，维护查询族、来源类型和 owner 的在线收益统计。
+
+P1-3：来源可靠性过于依赖固定域名目录
+
+固定目录适合当前工业视觉用例，但迁移到其他领域时会损失召回；未知 .com/.org 来源也可能被系统性压低。
+
+建议：可靠性改为“来源角色 + 主体身份 + 内容类型 + 机构/作者 + 时效性 + 可追溯性”的特征评分；域名目录只作为先验，不作为唯一依据。
+
+P1-4：全局质量门没有覆盖所有高风险因素
+
+当前质量门没有把 unresolved conflicts、数字单位/时间一致性、Claim 类型与来源角色匹配、时效要求作为硬条件。
+
+建议：质量门下沉到 requirement/claim 级别；高风险 Claim 必须通过独立来源、数字一致性和冲突检查。
+
+P1-5：现有性能评测主要是确定性回放
+
+replay_recall_savings.json 报告约 32.4% 输入节省，但明确不代表真实模型准确率、真实网络 p95、429 率或成本。
+
+建议：建立真实 provider + 真实网络 + 固定问题集的成对 A/B 评测。
+
+
+三、V2 总体设计
+----------------
+
+V2 名称建议：Adaptive Evidence Budget Scheduler（自适应证据预算调度器）。
+
+基本原则：
+
+1. 资源按动作计费，而不是只按问题或轮次计费。
+2. 先保障所有重要问题的首轮机会，再允许高收益问题借用预算。
+3. 搜索、抓取、抽取、验证和写作使用不同预算池。
+4. 页面抓取和模型抽取分开计数。
+5. 停止条件使用“成本归一化边际收益”，不只看绝对信息增益。
+6. 每个质量结论都必须可追溯到具体 Claim、来源、引文、来源角色和验证结果。
+
+动作的预期效用建议使用以下概念模型：
+
+expected_utility =
+    priority_weight
+    * gap_risk
+    * probability_of_accepted_evidence
+    * expected_coverage_delta
+    * source_novelty
+    /
+    (estimated_tokens + latency_cost + page_cost + provider_request_cost)
+
+不是要求一次性实现完整概率模型；第一版可以使用可解释的确定性分数，并逐步用运行数据校准 probability_of_accepted_evidence。
+
+
+四、预算模型
+------------
+
+1. 总预算拆分
+
+总 token 预算 T 建议按以下动态池管理：
+
+- Planner：3%–5%，设置绝对上限。
+- Research extraction：55%–60%。
+- Claim verification、交叉验证、反证：约 15%。
+- Writer：12%–15%，按问题数量和 Evidence Card 数量动态计算。
+- Safety/uncertainty reserve：8%–10%，用于网络/模型未知结果和估算偏差。
+
+writer 和 verification reserve 必须在研究开始时预留，不能被普通探索调用侵占。
+
+2. 单次模型调用
+
+- Compact extraction：4k–6k total tokens。
+- Normal extraction：6k–8k total tokens。
+- Long/complex page：最多 12k，必须由 cheap triage 证明值得投入。
+- 当前 18k 上限只保留为极端兜底，不应作为普通调用默认上限。
+
+3. 问题级预算
+
+每个问题分成三个阶段：
+
+- First-pass floor：每个问题获得至少一次有效候选机会；P1 问题优先获得一至两次。
+- Gap repair target：预算只用于当前未满足的 acceptance dimension。
+- Borrowed pool：首轮完成后开放，但只有高预期效用动作才可借用。
+
+借用约束建议：
+
+- 首轮未完成前，不允许普通 P2/P3 无限借用。
+- 单问题借用不得超过其 target 的 150%，除非仍有 P1 高风险缺口。
+- 连续两个不同 query family 低收益后，自动冻结该问题，转向其他问题或验证。
+- 真正达到 hard_question_token_limit 后，跨 REPLAN 也不能恢复。
+
+4. 推荐初始档位
+
+以下是 V2 的起始参数，用于 A/B 校准，不是最终固定值：
+
+quick：
+- logical_queries：4–6
+- provider_requests：8
+- pages_fetched：8–10
+- pages_extracted：4–5
+- total_model_tokens：30,000
+- deadline：180 秒
+
+standard：
+- logical_queries：10–14
+- provider_requests：24
+- pages_fetched：20–30
+- pages_extracted：10–14
+- total_model_tokens：100,000
+- deadline：480 秒
+
+deep：
+- logical_queries：18–24
+- provider_requests：48
+- pages_fetched：40–60
+- pages_extracted：20–28
+- total_model_tokens：220,000
+- deadline：1,200 秒
+
+注意：pages_fetched 和 pages_extracted 必须分别记录。若为了兼容当前页面预算，第一阶段可令 pages = pages_extracted，同时新增 fetched_pages 观察指标；第二阶段再放宽抓取上限。
+
+
+五、搜索策略 V2
+---------------
+
+1. QueryFamily 替代无限后缀
+
+每个开放维度最多生成四类查询：
+
+- scope：精确问题和范围查询。
+- authoritative：官方、标准、政府、原始数据、论文等权威来源。
+- alternate：同义词、跨语言、不同术语表达。
+- contradiction：失败、限制、反例、反方证据。
+
+查询族由缺口类型决定，不再简单循环 generic suffix。
+
+2. 搜索请求的 hedged fallback
+
+- 首选引擎先启动。
+- 约 1.5–2 秒仍无可用结果时启动备用引擎。
+- 达到候选数或来源 owner 数要求后取消剩余请求。
+- 每个 logical query 记录实际 provider_requests、timeouts、fallbacks、usable_results。
+- provider_requests 设独立硬上限，避免网络故障吞噬研究时间。
+
+3. 查询结果选择
+
+候选排序同时考虑：
+
+- 主题/维度相关性。
+- 来源角色是否适合该 Claim。
+- owner 新颖度。
+- 来源类型多样性。
+- 时效性。
+- 页面可读性。
+- 历史接受率。
+
+每个批次至少保留一个探索位，防止历史高分来源造成闭环偏差。
+
+4. 跨问题搜索缓存
+
+相同标准化查询可共享上游搜索结果，以节省 provider_requests；但 SearchQueryRow、Evidence、coverage 和审计归属仍按 question_id 隔离。
+
+
+六、页面与模型调用漏斗
+----------------------
+
+每个候选按以下流程执行：
+
+1. URL/正文 hash/owner 去重。
+2. HTTP 页面抓取和正文清洗。
+3. cheap triage：
+   - 查询与正文的主题相关性。
+   - 当前 acceptance dimension 的术语匹配。
+   - 来源角色和可追溯性。
+   - 是否疑似转载、广告、登录页、导航页或提示注入。
+4. 只把高于抽取阈值的页面交给 Evidence Extractor。
+5. Evidence Extractor 生成有限数量 Evidence Card。
+6. 对高风险 Claim 进入独立验证或反证查询。
+
+抽取并发建议：
+
+- Quick：最多 1 个抽取调用并发。
+- Standard：最多 2 个。
+- Deep：最多 2–3 个，必须受 token reservation 限制。
+
+读取页面可以比抽取更高并发，但必须使用全局并发上限、单 host 上限和 deadline。
+
+
+七、质量与可信度 V2
+--------------------
+
+1. 来源可靠性
+
+域名只作为先验，最终分数由以下因素组成：
+
+- 来源主体身份是否明确。
+- 是否一方原始来源、独立研究、政府/监管或转载。
+- 作者、机构、出版时间和方法是否可追溯。
+- 内容是否直接回答当前 Claim。
+- 是否有数据、方法、评估协议或原始规格。
+- 是否存在正文截断、广告、二次转载或相似内容。
+
+2. Claim 级证据门
+
+每条高风险 Claim 至少检查：
+
+- exact quote 是否逐字存在。
+- quote 是否真正蕴含 Claim，而非只存在关键词。
+- Claim 是否正确绑定到 acceptance dimension。
+- 数字、单位、时间、地区和统计口径是否一致。
+- 来源是否适合该 Claim 类型。
+- 是否存在独立来源或冲突来源。
+
+3. 独立来源
+
+独立性不应只按 hostname 判断，还要考虑：
+
+- 共同发布机构。
+- 母子公司关系。
+- 转载或高度相似正文。
+- 同一数据源的二次引用。
+
+4. 质量门建议
+
+全局门仍可保留 coverage >= 0.85，但必须增加：
+
+- P1 acceptance dimensions 全部满足。
+- 高风险 Claim 的双来源率达到目标。
+- unresolved high-risk conflicts == 0。
+- 数字 Claim 的单位/时间/地区一致性通过。
+- 关键 Claim 的 source-role fit 通过。
+- writer reserve 仍然足够。
+
+
+八、停止策略 V2
+---------------
+
+1. 成功停止
+
+满足以下条件时进入 Writer：
+
+- 全部 P1 维度满足。
+- 总 coverage 达到目标。
+- 高风险 Claim 完成交叉验证。
+- 没有未解决的高风险冲突。
+- Writer 和验证预算仍然可用。
+
+2. 边际收益停止
+
+若连续两个不同 query family 的成本归一化收益都低于阈值，且没有可改善的 P1/高风险缺口，则停止继续扩展。
+
+不要只用当前绝对 information_gain；至少同时记录：
+
+- gain per token。
+- gain per page。
+- gain per provider request。
+- gain per second。
+
+3. 问题级冻结
+
+某问题连续两个 query family 没有新 accepted evidence，且剩余动作的 expected utility 低于全局阈值时，冻结该问题并转向其他问题或验证任务。
+
+4. 资源停止
+
+分别记录并公开：
+
+- token_budget_exhausted。
+- logical_query_budget_exhausted。
+- provider_request_budget_exhausted。
+- fetched_page_budget_exhausted。
+- extracted_page_budget_exhausted。
+- action_budget_exhausted。
+- deadline_exhausted。
+
+5. 来源空间耗尽
+
+只有在当前开放缺口至少尝试过 scope、authoritative、alternate 或 contradiction 中适用的查询族后，才允许标记 source_space_exhausted。
+
+
+九、开发阶段拆分
+----------------
+
+Phase 0：观测闭环，不改变研究行为
+
+- 新增 logical_queries、provider_requests、pages_fetched、pages_extracted、extraction_calls、verification_calls、deadline_remaining。
+- 所有 budget reservation 记录 estimated、reserved、actual、uncertain。
+- 统计每个 query family、source type、owner 的 accepted evidence 率。
+- 给每个动作记录 latency、tokens、page cost 和 outcome。
+
+验收：可以从一次运行完整回答“哪个动作消耗了什么资源、换来了多少有效证据”。
+
+Phase 1：修复硬边界和预算语义
+
+- 接入 deadline_at。
+- 拆分 logical query 与 provider request。
+- 拆分 scheduler_actions 与 productive_iterations。
+- 让 allocation 字段真正参与 reservation 和停止。
+- 修复 QueryFamily 与 _MAX_GAP_ATTEMPTS 不一致。
+
+验收：任何资源消耗都能触发对应精确停止原因；没有无界重试或隐性超时。
+
+Phase 2：检索和页面漏斗提速
+
+- QueryFamily 调度。
+- hedged fallback。
+- cheap triage。
+- 页面抓取和抽取预算拆分。
+- 跨问题标准化查询结果缓存。
+
+验收：在相同 token 上限下，首条有效证据延迟和无效抽取比例明显下降。
+
+Phase 3：成本归一化调度
+
+- 计算 expected utility。
+- 首轮 floor、P1 保护、借用上限和收益门槛。
+- 维护 query family/source type 的在线收益统计。
+- 连续低收益后冻结问题。
+
+验收：高收益问题可获得追加预算，但低收益问题不能无限吞噬全局池。
+
+Phase 4：可信度增强
+
+- 来源角色评分。
+- Claim—Quote entailment 校验。
+- 数字/单位/时间/地区一致性检查。
+- 转载和共同来源检测。
+- 高风险 Claim 反证预算。
+
+验收：coverage 增长不能通过低质量、重复或冲突证据伪造；高风险 Claim 有明确验证链。
+
+Phase 5：真实 A/B 校准
+
+- 固定至少 30 个代表性研究问题。
+- 每个配置至少 3 次重复。
+- 同 provider、同模型、同预算、尽量相同网络窗口。
+- 保留所有失败运行，不允许只比较成功样本。
+- 人工审计关键 Claim、引用支持和冲突处理。
+
+
+十、评测指标与建议验收线
+--------------------------
+
+必须同时记录速度、成本、覆盖和可信度：
+
+- 首条有效证据 p50/p95 延迟。
+- 研究完成总耗时 p50/p95。
+- 总 token 和每条 accepted evidence token。
+- 每个满足 acceptance dimension 的页面成本。
+- logical query 数和 provider request 数。
+- 抓取页面数、抽取页面数、零产出抽取率。
+- P1 coverage、总 coverage。
+- 引用支持准确率。
+- 高风险 Claim 双来源率。
+- 冲突发现率和未解决冲突率。
+- completed_with_limitations 比例。
+- 技术失败率、超时率、429 率。
+
+初始验收线建议：
+
+- 中位完成时间下降至少 30%。
+- 每条有效证据 token 成本下降至少 25%。
+- 零产出抽取率低于 20%。
+- P1 coverage 不下降。
+- 人工审计的引用支持准确率不下降。
+- 高风险 Claim 双来源率不下降。
+- 技术成功率不下降。
+
+
+十一、开发前的关键决策
+----------------------
+
+开发前需要确认以下默认策略：
+
+1. 是否接受把总页面预算拆成 pages_fetched 和 pages_extracted。
+2. 是否将 provider_requests 纳入正式资源预算。
+3. 是否保留当前 30k/100k/220k 总 token 档位作为第一轮 A/B 基线。
+4. 是否允许跨问题共享标准化查询的上游结果缓存。
+5. 高风险 Claim 的双来源范围是否按 Planner criterion 自动识别，还是增加用户可配置风险标签。
+6. 是否把 deadline 作为和 token/page 同等重要的硬停止条件。
+
+
+十二、参考文件
+--------------
+
+- apps/api/app/services/research_runs.py：预算档位和运行预算快照。
+- apps/api/app/domain/research_management.py：预算份额和信息增益计算。
+- apps/api/app/domain/research_budget.py：问题级预算估算和调用分配。
+- apps/api/app/infrastructure/db/research_tools.py：目标调度、页面/token reservation、质量门和停止逻辑。
+- apps/api/app/services/research_loop.py：搜索、页面读取、抽取和页面上限。
+- apps/api/app/tools/web_search.py：SearXNG fallback、搜索结果去重和主题预检。
+- apps/api/app/services/evidence_extractor.py：Evidence Schema、来源可靠性和接受门。
+- evals/graders/performance_grader.py：配对性能比较框架。
+- evals/reports/replay_recall_savings.json：确定性回放结果及其真实网络评测限制。
+- 低信息增益与检索质量治理实施记录.txt：历史零产出和预算浪费案例。
+
+
+文档状态
+--------
+
+状态：P0-1/P0-2 的预算语义与风险状态闭环已完成，Phase 1 硬边界已闭环；Phase 0 的跨运行聚合及 Phase 2–4 的剩余增强仍未全部完成。Phase 5 仅完成离线评测框架，真实 Provider/模型运行和人工审计仍取决于外部凭据、网络窗口和费用授权。
+
+逐项对照结果：
+
+| 项目 | 状态 | 当前实现/证据 |
+|---|---|---|
+| P0-1 预算分配落到账本 | 已实现 | 五个模型 Token 池按 settled/reserved/uncertain 分账；logical query、provider request、fetched/extracted page、extraction/verification call、scheduler action、productive iteration 均进入统一 resource_pools 运行视图并映射唯一硬上限。旧 research_searches、report_pages、validation_iterations、writer_tokens 已移入 allocation.derived_display，不再冒充可执行池。问题 Token 子池公开 floor/target/150% hard limit、settled/reserved/uncertain、borrowed 和剩余额度。 |
+| P0-2 问题级预算与借用门槛 | 已实现 | claim_gap.v2 持久化 question/claim/gap/conflict 的 open/mitigating/blocked/resolved 生命周期、风险分数、独立来源缺口和 verification state；借用同时要求首轮完成、未解决高风险、可执行风险状态、收益门槛、低收益 streak 未触发，并受 150% hard limit/P1 高风险例外约束。REPLAN 会显式重开目标风险状态，动态问题会重平衡问题级 Token 池。 |
+| P0-3 logical/provider 请求拆分 | 已实现 | logical_queries、search_provider_requests、timeout/fallback/latency 分别记录，provider_request 有独立硬上限；hedged fallback 只发起一次后备请求，被内部吞掉的 timeout 也会计账。 |
+| P0-4 deadline 硬检查 | 已实现 | run 创建 deadline_at；prepare_target、搜索、页面读取、抽取、Planner、Writer、模型预算和 finish_iteration 均按剩余时间检查/封顶，停止原因为 deadline_exhausted。 |
+| P0-5 QueryFamily 边界 | 已实现 | scope/authoritative/alternate/contradiction 由 family 调度；仅真实发起过 provider request 的 family 才算已执行，缓存命中和临时 yield 不再推进 family 或提前触发 exhausted。 |
+| P0-6 无效动作计费 | 已实现 | scheduler_actions、productive_iterations、technical_retries、zero_yield 分离；zero_results/unreadable/no_evidence 仍计动作、请求/页面/时间成本，持久化搜索任务重新入队也计 technical retry。 |
+| P1-1 cheap triage | 已实现 | fetch → cheap triage → extract；正文、主题、维度、source role、可追溯性、登录/导航/注入和重复页检查不调用模型。 |
+| P1-2 成本归一化调度 | 部分实现 | expected_utility、gain/token、gain/page、gain/provider request、gain/second 及 query family/source type/owner 在线统计已落快照；候选选择仍未完整融合来源类型、时效和历史收益模型。 |
+| P1-3 来源可靠性 | 部分实现 | owner 已归并到注册域，角色、可追溯性、作者/机构/发布时间等文本特征参与评分；转载相似度、母子公司和共同数据源识别仍不完整。 |
+| P1-4 Claim 级质量门 | 部分实现 | exact quote、词法 entailment、dimension、单位/地区/范围标记、source-role、发布时间新鲜度和冲突指标已接入；真正语义蕴含及高风险独立验证链仍未完成。 |
+| P1-5 真实性能评测 | 部分实现 | 配对样本、失败保留、case-cluster bootstrap、30 case 门槛和比较脚本已完成；真实 provider+模型的 30×3 运行需外部凭据/网络/费用授权，不能用 deterministic replay 冒充。 |
+
+阶段验收：
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| Phase 0 观测闭环 | 部分实现 | 单次运行的完整资源池、延迟、失败、收益、owner、模型 reservation 和风险状态已记录；跨运行聚合指标仍不完整。 |
+| Phase 1 硬边界 | 已实现 | split budgets、全链路 deadline wrapper、精确 stop reason、QueryFamily、五个模型 Token 池及全部非 Token 硬池已接入；旧字段仅保留为显式 derived_display。 |
+| Phase 2 漏斗提速 | 部分实现 | cheap triage、页面/抽取拆分、并行读取、跨问题缓存和可用结果判断的 hedged fallback 已接入；抽取并发仍是串行。 |
+| Phase 3 自适应调度 | 部分实现 | utility、floor、P1 保护、严格借用门槛、冻结和 family/source/owner stats 已接入；候选排序尚未完成全量 cost-adjusted 特征融合。 |
+| Phase 4 可信度增强 | 部分实现 | Claim 门、单位/地区/范围检查、角色匹配、发布时间新鲜度、owner 归并、冲突和引用校验已接入；语义 entailment、转载检测和独立验证链仍不足。 |
+| Phase 5 A/B 校准 | 部分实现 | 离线验证和 live A/B harness 已具备；live 结果需在真实 Provider 条件下执行。 |
+
+本轮实际修改：
+
+- 修复最小模型调用预算 guard，低于 assembled minimum 时不读取页面、不 reserve、不调用抽取器。
+- 修复页面 reservation 的 worker 归属结算；每次实际抓取（含失败和抓取后判重）均扣减 fetched-page 槽位，只有进入抽取才扣 extraction，异常清理不会误释放其他 worker 槽位。
+- 修复 QueryFamily 耗尽边界：按真实 provider request 持久记录已执行 family，缓存循环不再提前耗尽四类策略。
+- 修复 hedged search 计数：后备策略不会重复发起，内部 timeout 不会从 provider timeout 指标中消失。
+- 修复 durable search 重新入队未计 technical_retries 的缺口。
+- Writer 模型调用接入原子 Token reservation；拒绝时直接走确定性报告，成功/已知失败/未知失败分别 settle 或标记 uncertain；确定性 verification 明确记录为 no-model 并释放 Token reserve。
+- 接入 1.8 秒 hedged fallback，并保留实际 provider request、timeout、fallback 计数。
+- 将数字/角色/发布时间新鲜度/高风险冲突指标从固定占位值改为基于 accepted Evidence、Claim、Source Snapshot 的计算值。
+- 补充 owner 在线收益统计、验证调用计数、剩余 deadline、首条证据/完成耗时/Token per evidence 和失败/限流指标。
+- 增加 source_space_exhausted 的逐问题记录和终止原因。
+- 增加跨子域 owner 归并及单位/地区/统计范围回归测试。
+- 将 Planner/Writer 模型调用纳入 run deadline 的剩余时间封顶。
+- 预算 ledger 记录 Planner、Extractor、Writer、Verification、Safety 的分配与结算。
+- 将预算契约升级为 resource_pools.v3：所有可执行池统一公开 limit、committed、reserved、remaining 和状态；模型池额外区分 settled/uncertain，终态未使用 Writer/Verification reserve 明确标记 released。
+- 删除旧分配字段的执行语义，将 research_searches、report_pages、validation_iterations、writer_tokens 收口到 allocation.derived_display；调度器不再读取这些字段。
+- 增加 question_token_pools 子账本，逐问题记录 floor、target、hard limit、settled/reserved/uncertain、borrowed、P1 高风险例外和当前池状态。
+- 风险快照升级为 claim_gap.v2：不再只保存未解决对象；Claim、Gap、Conflict 的 resolved 历史仍可审计，并聚合 Question 生命周期、verification state、独立来源缺口及 borrow_eligible。
+- 借用被冲突或无可执行动作阻断时立即持久化 blocked 转移；定向 REPLAN 显式转回 open，动态新增问题会创建初始风险状态并按新计划重平衡问题 Token 目标。
+
+验证记录（最近更新 2026-09-13）：
+
+- `.venv\\Scripts\\python.exe -m compileall -q apps/api/app scripts`：通过。
+- `.venv\\Scripts\\ruff.exe check apps/api/app scripts tests`：通过。
+- `scripts/replay_recall_benchmark.py`：仅作为确定性 selector 回放，不作为真实网络 A/B 结果。
+- `.venv\\Scripts\\python.exe -m mypy apps/api/app`：通过，115 个源文件。
+- P0 针对性测试：新增完整资源池 reservation 计算、Claim 独立来源缺口、冲突阻断借用、Gap resolved/blocked 生命周期及旧字段 derived_display 回归；与既有 QueryFamily、页面计费、hedged fallback、durable retry、Writer reservation 和 deterministic verification 账本测试一并通过。
+- `.venv\\Scripts\\python.exe -m pytest -q`：通过，7 项跳过；仍不包含真实 Provider/模型 30×3 A/B 和人工审计。
+
+
+十三、P0-1/P0-2 完成态契约
+---------------------------
+
+1. 完整预算池
+
+- budget_snapshot 是不可变限额来源；usage_snapshot.resource_pools 是运行态唯一汇总视图。
+- 每个 resource_pools 项必须具备 unit、limit、committed、reserved、uncertain、remaining、status、limit_key、usage_key；不存在运行时消费者的字段不得进入该集合。
+- 模型 Token 分 planner、research、verification、writer、safety 五池。settled 表示已知实际用量，reserved 表示在途调用，uncertain 表示计费结果未知且继续保守占用；released 表示终态不再可花费的剩余保留额。
+- 非模型池包括 logical_queries、provider_requests、pages_fetched、pages_extracted、extraction_calls、verification_calls、scheduler_actions、productive_iterations；deadline_at 独立作为时间硬边界。
+- question_token_pools 是 research Token 池的子账本，不增加全局额度。target 是软目标，hard_limit 默认为 target 的 150%；P1 且仍有未解决高风险缺口时可越过该局部 hard limit，但仍不能突破 research/global 池。
+- 所有额度判断必须使用 committed（已结算）+ reserved + uncertain；过期的普通 reservation 可返还，在途计费不确定项不得静默释放。
+
+2. 风险状态模型
+
+- Question、Claim、Gap 使用 open → mitigating → resolved 的正常路径；存在未解决冲突、来源空间耗尽、问题硬预算耗尽或借用门拒绝时进入 blocked。REPLAN 只能显式重开指定问题，不得清空其他问题的风险历史。
+- Claim 风险至少由 claim type、importance、独立来源数、required source 数和 open conflict 决定；rejected Claim 为终态且不继续申请预算，supported 且独立来源/冲突条件满足时才是 verified/resolved。
+- Gap 风险保留 severity、resolution_attempts、blocked 原因和 resolved 历史；不能因只查询 open gap 而从审计快照消失。
+- Question 聚合必须公开 unresolved_high_risk、verification_state、independent_source_deficit、lifecycle 和 borrow_eligible。冲突为 blocked 时普通 research 借用关闭，应转入 verification/反证动作。
+- 借用判定顺序固定为：问题 target 内直接允许；否则保护所有问题首轮；再检查 150% hard limit/P1 例外；再检查风险可执行性、连续低收益和 expected utility。每次拒绝或借用均写事件与问题子账本。
+- risk_state.version 固定为 claim_gap.v2，并带 plan_version、questions、claims、gaps、conflicts、summary；动态问题与定向 REPLAN 必须同步更新 plan_version 和风险状态。

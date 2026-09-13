@@ -83,7 +83,7 @@ async def test_extractor_repairs_schema_once_and_combines_usage() -> None:
         encrypted_secret=encrypted,
     )
     page = ReadPage(
-        final_url="https://vendor.example.com/product",
+        final_url="https://agency.gov/product",
         title="Product",
         clean_text=(
             "The platform supports electronics inspection on production lines. "

@@ -118,11 +118,13 @@ async def test_planner_regenerates_schema_invalid_plan_once() -> None:
     assert len(gateway.calls) == 2
     first_request = gateway.calls[0]["request"]
     assert first_request.generation_parameters["temperature"] == 0.0  # type: ignore[union-attr]
+    assert first_request.generation_parameters["reasoning_enabled"] is False  # type: ignore[union-attr]
     assert first_request.max_output_tokens == 4000  # type: ignore[union-attr]
     assert "goal" not in first_request.response_contract["properties"]  # type: ignore[union-attr,index]
     assert gateway.calls[0]["allow_regeneration"] is False
     assert gateway.calls[1]["allow_regeneration"] is False
     repair_request = gateway.calls[1]["request"]
+    assert repair_request.generation_parameters["reasoning_enabled"] is False  # type: ignore[union-attr]
     assert repair_request.metadata["retry_mode"] == "compact_invalid_or_schema"  # type: ignore[union-attr]
     assert repair_request.max_output_tokens == 1200  # type: ignore[union-attr]
     assert repair_request.response_contract["properties"]["questions"]["maxItems"] == 5  # type: ignore[union-attr,index]
@@ -167,9 +169,9 @@ async def test_planner_never_exceeds_two_calls_after_schema_failure() -> None:
 
     assert len(gateway.calls) == 2
     assert raised.value.detail_code is not None
-    assert raised.value.detail_code.startswith(
-        "SCHEMA_INVALID_JSON_MODE_FINISH_STOP_ISSUES_"
-    )
+    assert raised.value.detail_code.startswith("SCHEMA_INVALID_JSON_MODE_FINISH_STOP_ISSUES_")
+    assert raised.value.usage is not None
+    assert raised.value.usage.total_tokens == 66
 
 
 @pytest.mark.asyncio
@@ -222,10 +224,11 @@ async def test_planner_uses_independent_compact_contract_after_length() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compact_length_failure_becomes_plan_budget_error() -> None:
+@pytest.mark.parametrize("first_code", ["MODEL_OUTPUT_TRUNCATED", "MODEL_OUTPUT_INVALID"])
+async def test_compact_length_failure_becomes_plan_budget_error(first_code: str) -> None:
     binding, cipher = dependencies()
     first = ModelGatewayError(
-        "MODEL_OUTPUT_TRUNCATED",
+        first_code,
         retryable=False,
         usage=TokenUsage(
             input_tokens=10,
@@ -233,7 +236,9 @@ async def test_compact_length_failure_becomes_plan_budget_error() -> None:
             total_tokens=4010,
             accuracy=UsageAccuracy.EXACT,
         ),
-        diagnostics={"finish_reason": "length"},
+        diagnostics={
+            "finish_reason": "length" if first_code == "MODEL_OUTPUT_TRUNCATED" else "stop"
+        },
     )
     second = ModelGatewayError(
         "MODEL_OUTPUT_TRUNCATED",
@@ -261,7 +266,13 @@ async def test_compact_length_failure_becomes_plan_budget_error() -> None:
     with pytest.raises(ModelGatewayError, match="PLAN_OUTPUT_BUDGET_EXCEEDED") as raised:
         await service.generate(binding.run_id)
 
-    assert raised.value.diagnostics["retry_mode"] == "compact_length"
+    assert raised.value.diagnostics["retry_mode"] == (
+        "compact_length" if first_code == "MODEL_OUTPUT_TRUNCATED" else "compact_invalid_or_schema"
+    )
+    assert raised.value.diagnostics["first_error_code"] == first_code
+    assert raised.value.diagnostics["first_finish_reason"] == (
+        "length" if first_code == "MODEL_OUTPUT_TRUNCATED" else "stop"
+    )
     assert raised.value.diagnostics["output_tokens"] == 1200
     assert raised.value.usage is not None
     assert raised.value.usage.output_tokens == 5200

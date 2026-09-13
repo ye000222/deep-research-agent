@@ -195,3 +195,182 @@ Deep Research Agent V1.1 第三阶段执行记录
 - 本地 `main` 已 `pull --ff-only` 快进到 `0d5e99f`，与 `origin/main` 一致，工作区无未提交修改。
 - 复核过期 `running` 任务为 0；真实 Provider 连接/结构化输出 Smoke 已通过。
 - GitHub Tags 与 Releases 页面均未发现 `v1.1.0`。当前唯一发布阻塞项是：完成一个最小端到端研究 Smoke（建议门禁），然后创建并发布 `v1.1.0` Tag/Release。
+
+### 2026-09-07 18:47:28：端到端 Smoke 暴露 Token 预算与 Worker 失败污染问题
+
+- 失败 Run `01a07b4d-4736-7da5-a5d2-b03197469e50` 已获得 8 条 accepted Evidence、5 个独立来源，证明搜索、阅读和证据链已经工作；失败发生在进入报告写作前的 State 同步。
+- 数据库确认 Planner 使用 6,647 Token，Evidence Extractor 使用 140,120 Token，总计 146,767，已超过 Standard 上限 100,000；旧前端却读取不存在的顶层 `model_tokens`，错误显示为 0。
+- Worker 在处理原始“model token budget exceeded”异常时，失败状态同步再次触发同一 State 校验，二次异常覆盖了原始异常，因此用户最终只看到 `WORKER_EXECUTION_FAILED / UNKNOWN`。
+- 已创建 `codex/v1.1-budget-guard`，实现证据模型调用前预算保护、Writer Token 预留、Extractor 输入/输出上限、显式紧凑重试、失败调用 Usage 累计、终态真实超额快照和 Worker 二次异常隔离。
+- 前端改为兼容读取 Planner、Evidence、Writer 的真实 Token 总和；未来运行不再显示错误的 `0 / 100,000`。
+- 验证：Ruff、MyPy、全量 Pytest、4 项真实 PostgreSQL Integration、PostgreSQL Recovery Smoke、Web TypeScript/Vite Build 全部通过；Strict Release Gate 报告 `artifacts/release_gate_budget_guard.json` 为 `passed=true`。
+- `v1.1.0` 继续保持未发布；必须先把本修复加载到 API/Worker，并再次完成最小端到端研究 Smoke。
+
+### 2026-09-07 22:04:28：Worker UNKNOWN 修复完成并通过真实恢复 Smoke
+
+- 旧失败 Run `01a07b4d-4736-7da5-a5d2-b03197469e50` 已从 `WORKER_EXECUTION_FAILED / UNKNOWN` 恢复为 `completed_with_limitations / terminal`。
+- 根因修复包括：模型调用前 Token Guard、Writer 额度预留、Extractor 有界输入/输出与显式紧凑重试、失败 Usage 累计、原始异常保护、历史超额恢复标记。
+- 恢复过程未新增模型调用：`llm_calls` 保持 17；已生成 1 份 verified 报告和 5 条引用，引用完整率/数字引用率/语义支持率均为 100%。
+- 最终严格 Release Gate 报告 `artifacts/release_gate_budget_guard_final.json` 为 `passed=true`；PostgreSQL Integration 4/4，无跳过；Ruff、MyPy、Pytest、Web Build、Golden Eval、Secret Scan 全部通过。
+- 当前分支为 `codex/v1.1-budget-guard`，尚未提交和推送。下一步：审阅 diff → commit/push → 修复 PR → GitHub 五项 CI 全绿 → 合并 main → 检查 stale running → 发布 v1.1.0。
+- 2026-09-07 22:07:20 运行态复核：stale running=0；另有 4 条未过期 active running，保持原状。
+
+### 2026-09-07 22:22:01：低覆盖任务审查与质量改进计划（尚未实施）
+
+- 新任务 01a07c34-dbb7-73e0-a0fd-52a322a384d6 执行结束但覆盖仅 14.29%、1/5 问题满足，5 条证据集中于一个来源。不能将执行 100% 当作质量完成。
+- 数据库确认所有问题均为 P2/P3、critical_gaps=0、plan_version=1；生产 REPLAN 条件仅接受 P1 缺口，所以本次未补研究。
+- 事件确认 8 次 SEARCH_PROVIDER_DEGRADED 和 2 次抽取 CONNECT_ERROR；实际进入报告原因 sources_exhausted。研究/搜索/页面/Token 尚有余额，墙钟余额未核验。
+- 另发现重试耗尽即放弃 Gap、维度覆盖回退到问题级证据、市场预测单来源验收等问题，需统一真实覆盖与完成状态。
+- 已新建《研究完成度提升方案与续接记录.txt》，详细给出 COV-1 调度停止、COV-2 搜索恢复、COV-3 维度验收、COV-4 增益预算、COV-5 E2E 与展示的顺序和验收。
+- 本轮只读诊断及文档更新，没有实施上述功能或新增 Provider 调用。下一步先冻结失败 Fixture，再从 COV-1 开始；上一轮预算修复及其通过的门禁必须保留。
+- 更正后续发布判断：Worker 恢复成功和 CI 通过还不足以证明研究质量达标，应补健康来源题集的覆盖/质量验收再考虑发布。
+
+### 2026-09-07 22:50:37：低覆盖改进 COV-1 至 COV-4 基础实现
+
+- 已实现所有未满足维度驱动 REPLAN；P1 仅控制顺序和硬质量门，不再阻止 P2/P3 缺口补研究。
+- 已修正无候选路径：读取质量快照，只有全部硬门槛满足才记为 `quality_met`；否则以 `sources_exhausted` 生成受限报告。
+- 已修正 Gap 生命周期：验收未满足时保持 `open`，不再用 `abandoned` 隐藏未解决问题；快照新增 `unresolved_gap_count`。
+- 已将候选调度改为优先处理低 Coverage 维度，技术重试优先，避免资源集中在单个已覆盖问题。
+- SearXNG 可重试超时/网络故障现在会继续独立回退策略，保留部分结果，并记录受限策略诊断元数据。
+- 复合问题不再把任意问题级证据铺满每个维度；市场/份额/预测/趋势/比较类标准默认要求独立来源。
+- 验证：目标单元测试 23 项、全量 `tests/unit`、Ruff 和 MyPy `apps/api/app`（103 文件）均通过。
+- 仍待实施：熔断退避和 Snapshot 复用、完整 Claim 语义范围校验、预算份额冻结、30 案例生产 Graph 评测及前端漏斗展示。尚未提交/推送/发布。
+
+### 2026-09-07 23:01:54：COV-5 基础诊断面板
+
+- 前端进度区新增 Evidence Funnel：候选 URL、读取页面、抽取候选、接受证据四级计数，帮助定位覆盖率低的具体漏斗环节。
+- 执行完成与质量达标继续分开显示；`completed_with_limitations` 不会被当作质量完成，也未降低任何质量门槛。
+- 验证：Web TypeScript typecheck 和 Vite production build 通过。
+- COV-5 尚未完成：未跑 30 案例生产 Graph 指标，尚无真实健康来源题集的覆盖中位数/达标率证据；候选 Snapshot 复用、退避熔断、完整语义验收仍待实现。
+
+### 2026-09-07 23:07:07：PostgreSQL 回归验证
+
+- 使用真实 PostgreSQL 环境运行 `tests/integration`，4 项全部通过、无跳过。
+- 未重跑旧 Provider 任务，未新增付费模型调用；当前改动尚未提交。
+
+### 2026-09-07 23:15:37：搜索熔断与维度绑定收紧
+
+- SearXNG 连续三次全策略可重试失败后短时熔断 15 秒，返回可恢复诊断；成功请求自动复位。
+- Evidence 必须显式映射到验收维度；零语义重叠 Claim 不再提升其他维度 Coverage。
+- 验证：全量单元测试、PostgreSQL 集成 4/4、Ruff、MyPy 后端 103 文件均通过。
+- 候选复用、完整范围语义校验、预算份额冻结和 30 案例生产评测仍未完成。
+
+### 2026-09-07 23:25:39：SearchResult 候选复用
+
+- `ResearchTarget` 携带同一任务/问题的未读取候选 URL；重试和 REPLAN 优先复用，避免重复搜索。
+- 复用记录 `search.reused` 和 `search_reuses`，不扣减外部搜索预算；仍经过网页读取、Evidence Schema 和维度绑定。
+- 目前只复用候选 URL，尚未直接复用 Source Snapshot/Artifact 正文；30 案例生产 Graph 评测仍待完成。
+
+### 2026-09-07 23:30:38：搜索结果增量写入
+
+- 已修复重复 normalized query 的结果更新：新回退结果按 URL 去重并追加落库，保持唯一 rank，避免首次空/部分结果导致后续候选丢失。
+- 验证：全量单元测试、PostgreSQL 集成 4/4、Ruff、MyPy 后端 103 文件均通过。
+- Snapshot/Artifact 正文复用和 30 案例生产 Graph 评测仍待完成。
+
+### 2026-09-07 23:34:59：候选复用回归测试
+
+- 新增测试确认存在未读取候选时不调用搜索 Provider，仍执行网页读取和证据验证。
+- 目标研究循环/搜索测试 24 项通过，Ruff 通过。
+
+### 2026-09-07 23:41:00：本轮对话续接记录
+
+- 已完成：缺口驱动 REPLAN、质量停止判断、Gap 生命周期、低覆盖优先调度、搜索回退/熔断、维度绑定、高风险 Claim 独立来源、Evidence Funnel、候选 URL 复用和重复查询增量写入。
+- 验证：全量单元测试、目标回归 24 项、PostgreSQL 集成 4/4、Ruff、MyPy 后端 103 文件、Web typecheck/build 均通过。
+- 当前分支 `codex/v1.1-budget-guard`，HEAD `ddf5df1`，工作区有未提交修改，禁止丢弃。
+- 待续任务：Snapshot/Artifact 正文复用、时间/地区/单位语义校验、预算份额冻结、30 案例生产 Graph 评测、真实健康来源指标、提交推送和发布。
+
+### 2026-09-08 08:27:13：Source Snapshot/Artifact 正文复用
+
+- `ResearchTarget` 携带同一 Run 中尚未被当前问题接受的快照引用；研究循环可直接从本地 Artifact 构造 `ReadPage`，无需重复 HTTP。
+- Artifact URI 强制相对路径且必须位于配置根目录；读取后重新计算 SHA-256，Hash 不一致时禁止复用并回退网页读取。
+- 复用正文仍经过模型抽取、原文定位、Evidence Schema、验收维度绑定和证据图校验，不会把 Snippet 当 Evidence。
+- 新增 Snapshot 复用单元测试；Ruff、MyPy 后端 103 文件和研究循环测试通过。
+- 后续：时间/地区/单位语义校验、预算份额冻结、30 案例生产 Graph 评测及真实健康来源指标。
+
+### 2026-09-08 08:39:34：Evidence 范围语义校验第一步
+
+- Evidence Extractor 对绑定维度中的明确年份、单位/币种和地区 Token 做确定性检查；候选 Claim/Exact Quote 缺少范围标记时以 `scope_mismatch` 拒绝。
+- 校验不绑定则不推断，避免模型常识补全；新增回归测试，Ruff 和 MyPy 通过。
+- 后续需补日期精度、跨语言单位别名和持久化范围字段。
+
+### 2026-09-08 08:48:04：预算份额冻结
+
+- Run 创建时新增确定性 `allocation` 快照，冻结 research/report/validation 迭代份额、搜索/页面份额和 Writer Token 预留。
+- 追加边界测试验证负预算拒绝、迭代份额求和；Ruff、MyPy 通过。
+- 后续将实际 Tool Reservation 与 allocation 字段绑定，并开展 30 案例生产 Graph 评测。
+
+### 2026-09-08 08:51:18：Release Gate 本地基线
+
+- 本地 Release Gate（跳过 Compose/Integration/Web）通过：静态检查、单元测试、Golden 30 案例、动态 Migration Head、Secret Scan 和 MySQL 检查均通过。
+- 结果保存至 `evals/reports/current_release_gate.json`；由于跳过真实 PostgreSQL/Compose/Web，仍不能作为完整发布结论。
+
+### 2026-09-08 08:57:18：完整本地 Release Gate 通过
+
+- 不跳过 Compose、PostgreSQL Integration、Web Build 运行 Release Gate，所有检查通过：Ruff、MyPy、pytest、真实 PostgreSQL 4 项集成、Compose、Web 构建、Golden 30 案例、Secret/MySQL 检查。
+- 机器可读结果保存至 `evals/reports/current_release_gate_full.json`；仍需提交后等待 GitHub CI，并补生产 Graph 30 案例评测。
+
+### 2026-09-08 08:54:13：正文复用结果判定修复
+
+- 修复仅有 Artifact 复用页时因原始搜索结果为空而误报 `zero_results` 的边界错误；现在依据最终待处理页列表，成功复用正确记为 `evidence_gained`。
+- 新增断言；Ruff、MyPy 和相关单元测试通过。
+
+### 2026-09-08 09:25:07：Planner 空正文与思考预算专项修复
+
+- 对官方 DeepSeek V4 的 Planner 关闭 thinking，保持 4000/1200 输出预算；其余兼容服务不注入专有参数。
+- 新增正文长度/推理计数诊断、首轮失败原因；length 即使 JSON 可解析也拒绝；修正 Compact Schema 失败时 Usage 重复累加。
+- 145 项单元/API 测试、Ruff、MyPy 103 文件、Web typecheck 通过；API/Worker 已重启，readyz 返回 200。
+- 真实 Provider Smoke 尚未执行（具体研究目标外发授权被安全检查阻止）。不能据此宣称真实 Planner 已验收；未提交/发布。
+- 详细依据、修改清单和下次授权/验证步骤见 Planner截断修复与续接记录.txt。
+
+### 2026-09-08 10:18:25：页面预算原子预留与 Worker 错误收敛
+
+- 已修复真实失败根因：单轮最多3页但未按剩余预算裁剪，造成 pages=31/max_pages=30，随后 State 同步和失败同步连续 ValidationError。
+- ResearchToolRepository 增加行锁页面槽位预留；ResearchLoop 按授权槽位读取并结算/释放；Worker 映射 PAGE_BUDGET_OVERRUN；前端归类到证据评估。
+- 验证：148 项单元/API 通过，Ruff/MyPy 通过；API/Worker 已重启。
+- Windows PostgreSQL 集成直接运行受 ProactorEventLoop 和缺少 TEST_DATABASE_URL 影响，CI/Linux Docker 仍待重跑。
+
+### 2026-09-08 10:29:56：本轮回归验证完成
+
+- 目标修复回归通过：`tests/unit + tests/api`、Ruff、MyPy 103 文件、Web typecheck/build 全部通过。
+- Release Gate（`--skip-integration`）通过；Compose、Golden Eval、Secret Scan、MySQL 检查均通过。
+- Docker 服务已确认运行；真实 PostgreSQL 集成仍以 GitHub Linux CI 为最终依据。
+
+### 2026-09-08 10:37:34：Docker PostgreSQL 集成复核
+
+- `tests/integration` 在当前 Docker PostgreSQL/Checkpoint 数据库上 4 项全部通过。
+- Windows Selector 事件循环兼容 AsyncPostgresSaver；此前 Proactor 错误不再复现。
+- GitHub Linux CI、Celery reservation 崩溃恢复和真实 Provider Smoke 仍是后续验证项。
+
+### 2026-09-08 10:41:02：PostgreSQL 恢复烟测
+
+- `scripts/verify_postgres_recovery.py` 通过，数据库扩展、回滚、Outbox 幂等、事件唯一性和 Checkpoint 表均正常。
+- 尚待 Celery reservation/commit 间崩溃故障注入及 GitHub Linux CI 最终确认。
+
+### 2026-09-08 10:46:08：运行中任务清理检查
+
+- Docker PostgreSQL 中过期 `running` 任务数为 0；未发现孤儿租约。
+
+### 2026-09-08 18:25:13：模型网络持久化恢复与稳定性查漏补缺
+
+- 已从数据库 llm_calls/agent_events 复核：最新 Planner 失败均为 CONNECT_ERROR/CONNECT_TIMEOUT，旧版三次调用集中在约 35 秒，之后错误地永久终止 Run；当前 Endpoint 已恢复连通。
+- Worker 增加连接建立级重试；短时重试耗尽后通过事务型 PostgreSQL Outbox 在 30/120/600/1800 秒后跨进程恢复。
+- Run 进入 queued/model_transport_retry_pending，保留 phase/Checkpoint，释放 Lease/页面预留；状态投影 stop_reason=None。
+- 前端显示预计恢复时间和重试次数；非暂时性鉴权、请求和结构错误不进入恢复循环。
+- 验证：152 项单元/API、Ruff、MyPy、Web build、PostgreSQL Integration 4/4、完整 Strict Release Gate、readyz 全部通过；过期 running=0。
+- 机器报告：`evals/reports/current_release_gate_network_recovery_full.json`；详细续接：`模型网络持久化恢复与稳定性查漏补缺记录.txt`。
+- 尚未 git commit/push；下一步为真实 Provider Smoke、提交、GitHub CI。
+
+### 2026-09-08 18:33:54：ValidationError 诊断盲区收敛
+
+- 非页面/Token 预算类 Pydantic 错误统一为 STATE_VALIDATION_FAILED，并记录不含输入值的字段位置/校验类型。
+- 前端提供明确状态不变量提示，避免再次出现 WORKER_EXECUTION_FAILED/VALIDATIONERROR/UNKNOWN。
+- 目标测试、Ruff、MyPy 103 文件和 Web build 通过；不会降低 State Invariant。
+
+### 2026-09-08 22:14:17：研究依赖故障持久化恢复查漏补缺
+
+- Evidence Extractor 的网络/超时/限流/服务不可用不再被吞成“无证据”；已读取 Snapshot 保存后由模型持久化 Outbox 恢复。
+- SearXNG 的 retryable 全局故障使用独立搜索 Outbox 恢复，不再快速耗尽所有研究问题。
+- 凭据解密错误和失败阶段均有安全明确诊断，不再显示 INVALIDTAG/UNKNOWN。
+- 154 项单元/API、PostgreSQL Integration 4/4、Ruff、MyPy、Web build、完整 Strict Release Gate 全部通过。
+- API/Worker/Dispatcher/Beat 已重启，readyz 全部 ready，过期 running=0。
+- 工作区尚未提交；详细续接文件：研究依赖故障持久化恢复与最终查漏补缺记录.txt。
