@@ -52,7 +52,12 @@ def build_family_query(
             "失败 局限 反例 争议" if chinese else "failure limitations counterexample contradiction"
         ),
     }
-    parts = (base, question, criterion.strip(), suffixes[family])
+    # Hints already carry the topic anchor. Appending the full question as
+    # well made production queries needlessly long and brittle (especially
+    # for CJK text), while the criterion and family suffix provide the useful
+    # missing-dimension and source-shape signal. Keep one compact topic,
+    # one acceptance criterion and one family modifier instead.
+    parts = (base, criterion.strip(), suffixes[family])
     seen: set[str] = set()
     unique: list[str] = []
     for part in parts:
@@ -60,7 +65,7 @@ def build_family_query(
         if normalized and normalized not in seen:
             unique.append(part)
             seen.add(normalized)
-    return " ".join(unique)[:500]
+    return " ".join(unique)[:320]
 
 
 @dataclass(frozen=True, slots=True)

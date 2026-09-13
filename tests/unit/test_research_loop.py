@@ -16,6 +16,7 @@ from app.infrastructure.db.research_tools import (
     ResearchTarget,
     _budget_exhaustion_reason,
     _executed_query_families,
+    _fair_provider_request_allowance,
     _mark_query_family_executed,
     _quality_enrichment_needed,
     _quality_gate_met_from_snapshot,
@@ -53,6 +54,13 @@ def test_quality_gate_snapshot_requires_all_hard_thresholds() -> None:
 
 def test_quality_gate_snapshot_does_not_treat_empty_metrics_as_success() -> None:
     assert _quality_gate_met_from_snapshot({}) is False
+
+
+def test_provider_requests_are_shared_across_untouched_questions() -> None:
+    assert _fair_provider_request_allowance(24, 8) == 3
+    assert _fair_provider_request_allowance(2, 8) == 1
+    # Once every question has had a first pass, a retry is still bounded.
+    assert _fair_provider_request_allowance(16, 0) == 3
 
 
 def test_source_quality_or_cross_validation_gap_requires_enrichment() -> None:

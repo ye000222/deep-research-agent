@@ -128,6 +128,10 @@ _MODEL_RESERVATION_LEASE = timedelta(minutes=15)
 # compact contract when the available call budget is small.
 _MIN_EVIDENCE_MODEL_CALL_TOKENS = 3_000
 _MAX_REPORT_WRITER_RESERVE_TOKENS = 15_000
+# SearXNG may fan one logical query out to several engine groups. A per-target
+# cap prevents one empty/unstable query from consuming the entire run-wide
+# provider pool before untouched questions receive their first search.
+_MAX_PROVIDER_REQUESTS_PER_QUERY = 3
 _NON_CONSUMING_ITERATION_OUTCOMES = frozenset(
     {
         "yield_question",
@@ -141,6 +145,26 @@ _NON_CONSUMING_ITERATION_OUTCOMES = frozenset(
         "budget_exhausted",
     }
 )
+
+
+def _fair_provider_request_allowance(
+    remaining_requests: int,
+    unattempted_questions: int,
+    *,
+    per_query_cap: int = _MAX_PROVIDER_REQUESTS_PER_QUERY,
+) -> int:
+    """Share remaining upstream capacity across untouched questions first."""
+
+    remaining = max(0, int(remaining_requests))
+    if remaining == 0:
+        return 0
+    untouched = max(0, int(unattempted_questions))
+    fair_share = (
+        max(1, remaining // untouched)
+        if untouched
+        else remaining
+    )
+    return min(remaining, max(1, int(per_query_cap)), fair_share)
 
 
 def _research_attempt_consumes_iteration(
@@ -1463,6 +1487,15 @@ class ResearchToolRepository:
                 )
                 for candidate in candidates
             }
+            unattempted_questions = sum(
+                1
+                for candidate in candidates
+                if candidate.question_id not in exhausted_questions
+                and candidate.question_id not in strategy_exhausted_questions
+                and candidate.question_id not in frozen_questions
+                and candidate.status != "researched"
+                and executed_family_attempts.get(candidate.question_id, 0) == 0
+            )
             for candidate in candidates:
                 if (
                     candidate.question_id in exhausted_questions
@@ -2027,6 +2060,15 @@ class ResearchToolRepository:
             )
             action_usage["deadline_remaining"] = _deadline_remaining_seconds(run)
             run.usage_snapshot = action_usage
+            remaining_provider_requests = max(
+                0,
+                _as_int(run.budget_snapshot.get("max_provider_requests", 0))
+                - _as_int(run.usage_snapshot.get("search_provider_requests", 0)),
+            )
+            provider_request_allowance = _fair_provider_request_allowance(
+                remaining_provider_requests,
+                unattempted_questions,
+            )
             dimensions = tuple(
                 (f"{question.question_id}:d{index}", str(criterion))
                 for index, criterion in enumerate(question.evidence_requirements, start=1)
@@ -2050,11 +2092,7 @@ class ResearchToolRepository:
                 query_already_executed=query_already_executed,
                 search_budget_exhausted=search_budget_exhausted,
                 query_family=query_family.value,
-                provider_request_allowance=max(
-                    0,
-                    _as_int(run.budget_snapshot.get("max_provider_requests", 0))
-                    - _as_int(run.usage_snapshot.get("search_provider_requests", 0)),
-                ),
+                provider_request_allowance=provider_request_allowance,
                 baseline_model_tokens=_model_tokens(run),
                 baseline_pages_fetched=_as_int(
                     run.usage_snapshot.get("pages_fetched", run.usage_snapshot.get("pages", 0))
