@@ -60,6 +60,17 @@ _MAX_ACADEMIC_RESULTS_PER_QUERY = 4
 _MAX_EXCLUDED_DOMAINS = 6
 _PROVIDER_NAME = "SearXNG"
 _FALLBACK_PROVIDER_NAME = "Bing"
+_PROVIDER_HEALTHY = "healthy"
+_PROVIDER_DEGRADED = "degraded"
+_PROVIDER_COOLDOWN = "cooldown"
+
+
+def _state_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _state_float(value: object) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 _GENERAL_FIRST_QUERY_MARKERS = (
     "厂商",
     "厂家",
@@ -199,6 +210,20 @@ class SearXNGSearchProvider:
         self._last_fallback_success_count = 0
         self._last_circuit_open_count = 0
         self._failure_events: list[dict[str, object]] = []
+        self._events: list[dict[str, object]] = []
+        self._provider_states: dict[str, dict[str, object]] = {
+            _PROVIDER_NAME: {
+                "state": _PROVIDER_HEALTHY,
+                "failure_streak": 0,
+                "cooldown_until": 0.0,
+            },
+            _FALLBACK_PROVIDER_NAME: {
+                "state": _PROVIDER_HEALTHY,
+                "failure_streak": 0,
+                "cooldown_until": 0.0,
+            },
+        }
+        self._last_failure_type: str | None = None
         self._strategy_circuit_open_until: dict[str, float] = {}
 
     @property
@@ -254,6 +279,35 @@ class SearXNGSearchProvider:
     @property
     def last_circuit_open_count(self) -> int:
         return self._last_circuit_open_count
+
+    @property
+    def state(self) -> str:
+        return str(self._provider_states[_PROVIDER_NAME]["state"])
+
+    @state.setter
+    def state(self, value: str) -> None:
+        self._provider_states[_PROVIDER_NAME]["state"] = value
+
+    @property
+    def failure_streak(self) -> int:
+        return _state_int(self._provider_states[_PROVIDER_NAME]["failure_streak"])
+
+    @property
+    def cooldown_until(self) -> float:
+        return _state_float(self._provider_states[_PROVIDER_NAME]["cooldown_until"])
+
+    @cooldown_until.setter
+    def cooldown_until(self, value: float) -> None:
+        self._provider_states[_PROVIDER_NAME]["cooldown_until"] = float(value)
+        self._circuit_open_until = float(value)
+
+    @property
+    def last_failure_type(self) -> str | None:
+        return self._last_failure_type
+
+    @property
+    def events(self) -> list[dict[str, object]]:
+        return list(self._events)
 
     async def search(
         self,
@@ -517,13 +571,8 @@ class SearXNGSearchProvider:
                 if len(direct_results) >= limit:
                     break
             if direct_results:
-                self._failure_streak = 0
-                self._circuit_open_until = 0.0
                 self._last_productive_response_count += 1
                 return direct_results
-            self._failure_streak += 1
-            if self._failure_streak >= _CIRCUIT_FAILURE_THRESHOLD:
-                self._circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
             raise ToolExecutionError(
                 "SEARCH_PROVIDER_DEGRADED",
                 retryable=True,
@@ -570,6 +619,24 @@ class SearXNGSearchProvider:
         # turning an arbitrary configured provider into a Bing dependency.
         host = (urlsplit(self._base_url).hostname or "").casefold()
         if host not in {"searxng", "localhost", "127.0.0.1"}:
+            return []
+
+        bing_state = self._provider_states[_FALLBACK_PROVIDER_NAME]
+        now = time.monotonic()
+        if (
+            bing_state["state"] == _PROVIDER_COOLDOWN
+            and _state_float(bing_state["cooldown_until"]) > now
+        ):
+            self._last_circuit_open_count += 1
+            self._record_failure(
+                provider=_FALLBACK_PROVIDER_NAME,
+                failure_type="circuit_open",
+                strategy="direct_bing_fallback",
+                query=query,
+                fallback_attempted=True,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
             return []
 
         self._last_fallback_attempt_count += 1
@@ -678,6 +745,16 @@ class SearXNGSearchProvider:
                 break
         if results:
             self._last_fallback_success_count += 1
+            self._mark_provider_healthy(_FALLBACK_PROVIDER_NAME)
+            self._events.append(
+                {
+                    "event_type": "provider.fallback_succeeded",
+                    "provider": _FALLBACK_PROVIDER_NAME,
+                    "primary_provider": _PROVIDER_NAME,
+                    "primary_provider_state": self.state,
+                    "fallback_success": True,
+                }
+            )
         else:
             self._record_failure(
                 provider=_FALLBACK_PROVIDER_NAME,
@@ -771,6 +848,69 @@ class SearXNGSearchProvider:
         # requests only observe that already-recorded error and must not count
         # it a second time.
         del exc
+
+    async def recovery_probe(self, query: str) -> list[SearchResult]:
+        """Probe SearXNG once after cooldown without invoking fallback paths."""
+
+        now = time.monotonic()
+        if self.state != _PROVIDER_COOLDOWN or now < self.cooldown_until:
+            raise ToolExecutionError(
+                "SEARCH_PROVIDER_COOLDOWN",
+                retryable=True,
+                details={
+                    "provider": _PROVIDER_NAME,
+                    "failure_type": "circuit_open",
+                    "context": {
+                        "strategy": "recovery_probe",
+                        "query": " ".join(query.split())[:500],
+                        "fallback_attempted": False,
+                        "fallback_provider": _FALLBACK_PROVIDER_NAME,
+                        "fallback_success": False,
+                    },
+                },
+            )
+        self._events.append(
+            {
+                "event_type": "provider.probe_started",
+                "provider": _PROVIDER_NAME,
+                "failure_type": None,
+            }
+        )
+        try:
+            payload = await self._request(query, strategy={})
+            unresponsive = payload.get("unresponsive_engines")
+            if isinstance(unresponsive, list) and unresponsive:
+                raise ToolExecutionError(
+                    "SEARCH_PROVIDER_DEGRADED",
+                    retryable=True,
+                    details=self._failure_details(
+                        {
+                            "provider": _PROVIDER_NAME,
+                            "failure_type": "unresponsive_response",
+                            "context": {
+                                "strategy": "recovery_probe",
+                                "query": " ".join(query.split())[:500],
+                                "fallback_attempted": False,
+                                "fallback_provider": _FALLBACK_PROVIDER_NAME,
+                                "fallback_success": False,
+                            },
+                        }
+                    ),
+                )
+            self._mark_provider_healthy(_PROVIDER_NAME)
+            raw_results = payload.get("results")
+            if not isinstance(raw_results, list):
+                return []
+            return [
+                mapped
+                for rank, raw in enumerate(raw_results, start=1)
+                if isinstance(raw, dict)
+                and (mapped := _map_result(raw, rank=rank)) is not None
+            ]
+        except ToolExecutionError as exc:
+            failure_type = str(exc.details.get("failure_type", exc.code))
+            self._extend_provider_cooldown(_PROVIDER_NAME, failure_type)
+            raise
 
     async def _request(self, query: str, *, strategy: dict[str, str]) -> dict[str, Any]:
         self._last_request_count += 1
@@ -891,8 +1031,18 @@ class SearXNGSearchProvider:
         raw_results = payload.get("results")
         if isinstance(unresponsive, list) and unresponsive:
             self._last_unresponsive_response_count += 1
+            self._record_failure(
+                provider=_PROVIDER_NAME,
+                failure_type="unresponsive_response",
+                strategy=_strategy_key(strategy),
+                query=query,
+                fallback_attempted=False,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
         else:
             self._last_healthy_response_count += 1
+            self._mark_provider_healthy(_PROVIDER_NAME)
         usable = _payload_has_usable_results(query, payload)
         if not raw_results and not (isinstance(unresponsive, list) and unresponsive):
             self._record_failure(
@@ -948,8 +1098,99 @@ class SearXNGSearchProvider:
             "failure_type": failure_type,
             "context": context,
         }
+        self._last_failure_type = failure_type
         self._failure_events.append(telemetry)
+        self._events.append(
+            {
+                "event_type": "provider.failure",
+                "provider": provider,
+                "failure_type": failure_type,
+                "context": context,
+            }
+        )
+        if failure_type != "circuit_open":
+            self._mark_provider_degraded(provider, failure_type)
         return telemetry
+
+    def _mark_provider_degraded(self, provider: str, failure_type: str) -> None:
+        state = self._provider_states[provider]
+        now = time.monotonic()
+        if (
+            state["state"] == _PROVIDER_COOLDOWN
+            and _state_float(state["cooldown_until"]) > now
+        ):
+            return
+        streak = _state_int(state["failure_streak"]) + 1
+        state["failure_streak"] = streak
+        previous = str(state["state"])
+        state["state"] = _PROVIDER_DEGRADED
+        if provider == _PROVIDER_NAME:
+            self._failure_streak = streak
+        if streak < _CIRCUIT_FAILURE_THRESHOLD:
+            if previous != _PROVIDER_DEGRADED:
+                self._events.append(
+                    {
+                        "event_type": "provider.degraded",
+                        "provider": provider,
+                        "failure_type": failure_type,
+                    }
+                )
+            return
+        cooldown_until = max(
+            now + _CIRCUIT_COOLDOWN_SECONDS,
+            _state_float(state["cooldown_until"]),
+        )
+        state["state"] = _PROVIDER_COOLDOWN
+        state["cooldown_until"] = cooldown_until
+        if provider == _PROVIDER_NAME:
+            self._circuit_open_until = cooldown_until
+        self._events.append(
+            {
+                "event_type": "provider.cooldown_started",
+                "provider": provider,
+                "failure_type": failure_type,
+                "cooldown_until": cooldown_until,
+            }
+        )
+
+    def _mark_provider_healthy(self, provider: str, *, emit_recovered: bool = True) -> None:
+        state = self._provider_states[provider]
+        previous = str(state["state"])
+        state["state"] = _PROVIDER_HEALTHY
+        state["failure_streak"] = 0
+        state["cooldown_until"] = 0.0
+        if provider == _PROVIDER_NAME:
+            self._failure_streak = 0
+            self._circuit_open_until = 0.0
+        if emit_recovered and previous != _PROVIDER_HEALTHY:
+            self._events.append(
+                {
+                    "event_type": "provider.recovered",
+                    "provider": provider,
+                    "failure_type": None,
+                }
+            )
+
+    def _extend_provider_cooldown(self, provider: str, failure_type: str) -> None:
+        state = self._provider_states[provider]
+        now = time.monotonic()
+        previous_until = _state_float(state["cooldown_until"])
+        cooldown_until = max(
+            now + _CIRCUIT_COOLDOWN_SECONDS,
+            previous_until + _CIRCUIT_COOLDOWN_SECONDS,
+        )
+        state["state"] = _PROVIDER_COOLDOWN
+        state["cooldown_until"] = cooldown_until
+        if provider == _PROVIDER_NAME:
+            self._circuit_open_until = cooldown_until
+        self._events.append(
+            {
+                "event_type": "provider.cooldown_extended",
+                "provider": provider,
+                "failure_type": failure_type,
+                "cooldown_until": cooldown_until,
+            }
+        )
 
     def _telemetry_snapshot(self) -> dict[str, int]:
         return {
