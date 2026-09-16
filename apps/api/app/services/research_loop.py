@@ -462,10 +462,11 @@ class ResearchLoopService:
                     latency_ms=search_latency_ms,
                 )
                 if exc.retryable:
-                    # SearXNG is a run-wide dependency and its internal fallback
-                    # strategies are already exhausted. Preserve the checkpoint
-                    # instead of burning every question in one outage window.
-                    raise
+                    # SearXNG's internal fallback strategies are exhausted, but
+                    # this remains an evaluable research outcome. Preserve the
+                    # provider telemetry and let the evaluator decide whether
+                    # existing evidence is sufficient to write or must fail.
+                    return ResearchAttemptResult(0, 0, "provider_error")
                 return ResearchAttemptResult(0, 0, "provider_error")
 
             # Only results actually returned for this query belong to its audit

@@ -1260,7 +1260,7 @@ def test_budget_stop_reason_identifies_the_actual_limit(
 
 
 @pytest.mark.asyncio
-async def test_retryable_search_failure_preserves_run_for_durable_retry() -> None:
+async def test_retryable_search_failure_becomes_an_evaluable_provider_error() -> None:
     repository = FakeRepository()
     repository.allow_search_failure = True
     service = ResearchLoopService(  # type: ignore[arg-type]
@@ -1271,12 +1271,12 @@ async def test_retryable_search_failure_preserves_run_for_durable_retry() -> Non
         FakeArtifacts(),
     )
 
-    with pytest.raises(ToolExecutionError) as raised:
-        await service.run_one_iteration(uuid4(), worker_task_id="worker-1")
+    result = await service.run_one_iteration(uuid4(), worker_task_id="worker-1")
 
-    assert raised.value.code == "SEARCH_PROVIDER_DEGRADED"
-    assert repository.last_attempt_outcome is None
-    assert repository.finished is False
+    assert result.decision == "ready_to_write"
+    assert result.continue_research is False
+    assert repository.last_attempt_outcome == "provider_error"
+    assert repository.finished is True
 
 
 @pytest.mark.asyncio

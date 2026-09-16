@@ -54,10 +54,11 @@ class QualityThenDegradedRepository(FakeRepository):
         self.finished = True
         self.last_attempt_outcome = str(kwargs.get("attempt_outcome"))
         self.quality_met = True
+        provider_degraded = kwargs.get("attempt_outcome") == "provider_error"
         return IterationEvaluation(
-            continue_research=True,
-            decision="continue_plan",
-            stop_reason=None,
+            continue_research=not provider_degraded,
+            decision="ready_to_write" if provider_degraded else "continue_plan",
+            stop_reason="quality_met" if provider_degraded else None,
             question_status="researched",
             coverage=0.95,
             information_gain=0.2,
@@ -210,10 +211,10 @@ async def test_quality_met_provider_degraded_routes_to_report_after_retry_exhaus
         observed_error = exc
 
     assert repository.quality_met is True
-    assert repository.finish_calls == 1
+    assert repository.finish_calls == 2
+    assert repository.last_attempt_outcome == "provider_error"
     assert repository.tool_failures == ["SEARCH_PROVIDER_DEGRADED"]
     assert search.calls == 2
-    assert writer.calls == 0
     assert observed_error is None, (
         "SEARCH_PROVIDER_DEGRADED escaped the Research Graph before completion "
         f"routing: {observed_error}"
