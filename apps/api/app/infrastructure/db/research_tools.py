@@ -2611,6 +2611,22 @@ class ResearchToolRepository:
                 usable_results=len(results),
                 latency_ms=latency_ms,
             )
+            _update_provider_observability_usage(
+                usage,
+                {
+                    "provider_requests": provider_requests,
+                    "healthy_responses": provider_healthy,
+                    "unresponsive_responses": provider_unresponsive,
+                    "timeout_count": provider_timeouts,
+                    "network_error_count": 0,
+                    "http_error_count": 0,
+                    "empty_response_count": 0,
+                    "invalid_response_count": 0,
+                    "fallback_attempts": provider_fallbacks,
+                    "fallback_successes": max(provider_productive - provider_healthy, 0),
+                    "circuit_open_count": 0,
+                },
+            )
             usage["candidate_urls"] = _as_int(usage.get("candidate_urls", 0)) + len(results)
             run.usage_snapshot = _usage_with_resource_pools(run, usage)
             await self._append_event(
@@ -2623,6 +2639,7 @@ class ResearchToolRepository:
                     "question_id": target.question_id,
                 },
                 metrics={
+                    "provider": "SearXNG",
                     "result_count": len(results),
                     "query_family": target.query_family,
                     "provider_requests": provider_requests,
@@ -2631,6 +2648,8 @@ class ResearchToolRepository:
                     "healthy_responses": provider_healthy,
                     "unresponsive_responses": provider_unresponsive,
                     "productive_responses": provider_productive,
+                    "fallback_attempts": provider_fallbacks,
+                    "fallback_successes": max(provider_productive - provider_healthy, 0),
                     "latency_ms": latency_ms,
                 },
             )
@@ -2680,6 +2699,25 @@ class ResearchToolRepository:
                 unresponsive=provider_unresponsive,
                 productive=provider_productive,
             )
+            raw_failure_metrics = details.get("metrics") if details else None
+            failure_metrics = (
+                raw_failure_metrics
+                if isinstance(raw_failure_metrics, Mapping)
+                else {
+                    "provider_requests": provider_requests,
+                    "healthy_responses": provider_healthy,
+                    "unresponsive_responses": provider_unresponsive,
+                    "timeout_count": provider_timeouts,
+                    "network_error_count": 0,
+                    "http_error_count": 0,
+                    "empty_response_count": 0,
+                    "invalid_response_count": 0,
+                    "fallback_attempts": provider_fallbacks,
+                    "fallback_successes": max(provider_productive - provider_healthy, 0),
+                    "circuit_open_count": 0,
+                }
+            )
+            _update_provider_observability_usage(usage_snapshot, failure_metrics)
             # A transport-only failure must remain retryable.  Counting its
             # family as executed would make the scheduler report source-space
             # exhaustion even though no healthy provider response was seen.
@@ -5174,6 +5212,34 @@ def _update_provider_health_usage(
     usage["search_provider_productive_responses"] = _as_int(
         usage.get("search_provider_productive_responses", 0)
     ) + max(0, productive)
+
+
+_PROVIDER_OBSERVABILITY_FIELDS = (
+    "provider_requests",
+    "healthy_responses",
+    "unresponsive_responses",
+    "timeout_count",
+    "network_error_count",
+    "http_error_count",
+    "empty_response_count",
+    "invalid_response_count",
+    "fallback_attempts",
+    "fallback_successes",
+    "circuit_open_count",
+)
+
+
+def _update_provider_observability_usage(
+    usage: dict[str, object], metrics: Mapping[str, object]
+) -> None:
+    """Accumulate typed search-provider telemetry without changing control flow."""
+
+    raw_snapshot = usage.get("provider_observability", {})
+    snapshot = dict(raw_snapshot) if isinstance(raw_snapshot, Mapping) else {}
+    for field in _PROVIDER_OBSERVABILITY_FIELDS:
+        value = _as_int(metrics.get(field, 0))
+        snapshot[field] = _as_int(snapshot.get(field, 0)) + max(0, value)
+    usage["provider_observability"] = snapshot
 
 
 def _query_family_order(*, prefer_authoritative: bool) -> tuple[QueryFamily, ...]:

@@ -58,6 +58,8 @@ _MAX_RESULTS_PER_OWNER = 2
 _TARGET_RESULTS_PER_QUERY = 8
 _MAX_ACADEMIC_RESULTS_PER_QUERY = 4
 _MAX_EXCLUDED_DOMAINS = 6
+_PROVIDER_NAME = "SearXNG"
+_FALLBACK_PROVIDER_NAME = "Bing"
 _GENERAL_FIRST_QUERY_MARKERS = (
     "厂商",
     "厂家",
@@ -189,6 +191,14 @@ class SearXNGSearchProvider:
         self._last_healthy_response_count = 0
         self._last_unresponsive_response_count = 0
         self._last_productive_response_count = 0
+        self._last_network_error_count = 0
+        self._last_http_error_count = 0
+        self._last_empty_response_count = 0
+        self._last_invalid_response_count = 0
+        self._last_fallback_attempt_count = 0
+        self._last_fallback_success_count = 0
+        self._last_circuit_open_count = 0
+        self._failure_events: list[dict[str, object]] = []
         self._strategy_circuit_open_until: dict[str, float] = {}
 
     @property
@@ -217,6 +227,34 @@ class SearXNGSearchProvider:
     def last_productive_response_count(self) -> int:
         return self._last_productive_response_count
 
+    @property
+    def last_network_error_count(self) -> int:
+        return self._last_network_error_count
+
+    @property
+    def last_http_error_count(self) -> int:
+        return self._last_http_error_count
+
+    @property
+    def last_empty_response_count(self) -> int:
+        return self._last_empty_response_count
+
+    @property
+    def last_invalid_response_count(self) -> int:
+        return self._last_invalid_response_count
+
+    @property
+    def last_fallback_attempt_count(self) -> int:
+        return self._last_fallback_attempt_count
+
+    @property
+    def last_fallback_success_count(self) -> int:
+        return self._last_fallback_success_count
+
+    @property
+    def last_circuit_open_count(self) -> int:
+        return self._last_circuit_open_count
+
     async def search(
         self,
         query: str,
@@ -233,6 +271,14 @@ class SearXNGSearchProvider:
         self._last_healthy_response_count = 0
         self._last_unresponsive_response_count = 0
         self._last_productive_response_count = 0
+        self._last_network_error_count = 0
+        self._last_http_error_count = 0
+        self._last_empty_response_count = 0
+        self._last_invalid_response_count = 0
+        self._last_fallback_attempt_count = 0
+        self._last_fallback_success_count = 0
+        self._last_circuit_open_count = 0
+        self._failure_events = []
         normalized = " ".join(query.split())
         normalized_alternate = " ".join((alternate_query or "").split()) or normalized
         normalized_excluded_owners = frozenset(
@@ -256,13 +302,26 @@ class SearXNGSearchProvider:
             raise ToolExecutionError("SEARCH_QUERY_INVALID", retryable=False)
         now = time.monotonic()
         if now < self._circuit_open_until:
+            self._last_circuit_open_count += 1
             raise ToolExecutionError(
                 "SEARCH_PROVIDER_DEGRADED",
                 retryable=True,
-                details={
-                    "circuit": "open",
-                    "retry_after_seconds": round(self._circuit_open_until - now, 1),
-                },
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="circuit_open",
+                        strategy="global",
+                        query=normalized,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                        extra={
+                            "retry_after_seconds": round(
+                                self._circuit_open_until - now, 1
+                            )
+                        },
+                    )
+                ),
             )
 
         results_by_url: dict[str, SearchResult] = {}
@@ -275,6 +334,16 @@ class SearXNGSearchProvider:
                 continue
             strategy_key = _strategy_key(strategy)
             if now < self._strategy_circuit_open_until.get(strategy_key, 0.0):
+                self._last_circuit_open_count += 1
+                self._record_failure(
+                    provider=_PROVIDER_NAME,
+                    failure_type="circuit_open",
+                    strategy=strategy_key,
+                    query=normalized,
+                    fallback_attempted=False,
+                    fallback_provider=_FALLBACK_PROVIDER_NAME,
+                    fallback_success=False,
+                )
                 continue
             strategy_query = _query_for_strategy(
                 strategy,
@@ -335,8 +404,6 @@ class SearXNGSearchProvider:
                     else:
                         payload = await self._request(strategy_query, strategy=strategy)
                 except ToolExecutionError as exc:
-                    if exc.code == "SEARCH_TIMEOUT":
-                        self._last_timeout_count += 1
                     if not exc.retryable:
                         raise
                     failures.append(
@@ -364,7 +431,21 @@ class SearXNGSearchProvider:
 
                 raw_results = payload.get("results")
                 if not isinstance(raw_results, list):
-                    raise ToolExecutionError("SEARCH_RESPONSE_INVALID", retryable=False)
+                    raise ToolExecutionError(
+                        "SEARCH_RESPONSE_INVALID",
+                        retryable=False,
+                        details=self._failure_details(
+                            self._record_failure(
+                                provider=_PROVIDER_NAME,
+                                failure_type="invalid_response",
+                                strategy=strategy_key,
+                                query=strategy_query,
+                                fallback_attempted=False,
+                                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                                fallback_success=False,
+                            )
+                        ),
+                    )
                 for raw in raw_results:
                     if not isinstance(raw, dict):
                         continue
@@ -446,7 +527,22 @@ class SearXNGSearchProvider:
             raise ToolExecutionError(
                 "SEARCH_PROVIDER_DEGRADED",
                 retryable=True,
-                details={"attempts": failures},
+                details=self._failure_details(
+                    {
+                        "provider": _PROVIDER_NAME,
+                        "failure_type": "fallback_failure"
+                        if self._last_fallback_attempt_count
+                        else "empty_response",
+                        "context": {
+                            "strategy": "direct_bing_fallback",
+                            "query": normalized[:500],
+                            "fallback_attempted": bool(self._last_fallback_attempt_count),
+                            "fallback_provider": _FALLBACK_PROVIDER_NAME,
+                            "fallback_success": False,
+                        },
+                        "failures": failures,
+                    }
+                ),
             )
         self._failure_streak = 0
         self._circuit_open_until = 0.0
@@ -476,6 +572,9 @@ class SearXNGSearchProvider:
         if host not in {"searxng", "localhost", "127.0.0.1"}:
             return []
 
+        self._last_fallback_attempt_count += 1
+        self._last_fallback_count += 1
+
         try:
             response = await self._fallback_client.get(
                 "https://www.bing.com/search",
@@ -492,11 +591,52 @@ class SearXNGSearchProvider:
                 },
                 timeout=20.0,
             )
-        except (httpx.TimeoutException, httpx.RequestError):
+        except httpx.TimeoutException:
+            self._record_failure(
+                provider=_FALLBACK_PROVIDER_NAME,
+                failure_type="timeout",
+                strategy="direct_bing_fallback",
+                query=query,
+                fallback_attempted=True,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
+            return []
+        except httpx.RequestError:
+            self._record_failure(
+                provider=_FALLBACK_PROVIDER_NAME,
+                failure_type="network_error",
+                strategy="direct_bing_fallback",
+                query=query,
+                fallback_attempted=True,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
             return []
         if response.status_code >= 400:
+            self._record_failure(
+                provider=_FALLBACK_PROVIDER_NAME,
+                failure_type="http_error",
+                strategy="direct_bing_fallback",
+                query=query,
+                fallback_attempted=True,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+                extra={"http_status": response.status_code},
+            )
             return []
         body = response.text
+        if not body.strip():
+            self._record_failure(
+                provider=_FALLBACK_PROVIDER_NAME,
+                failure_type="empty_response",
+                strategy="direct_bing_fallback",
+                query=query,
+                fallback_attempted=True,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
+            return []
         rows = re.findall(
             # Bing changes attribute order and adds classes to h2/a nodes
             # between locales. Match the semantic nodes instead of assuming
@@ -536,6 +676,18 @@ class SearXNGSearchProvider:
             results.append(candidate)
             if len(results) >= limit:
                 break
+        if results:
+            self._last_fallback_success_count += 1
+        else:
+            self._record_failure(
+                provider=_FALLBACK_PROVIDER_NAME,
+                failure_type="empty_response",
+                strategy="direct_bing_fallback",
+                query=query,
+                fallback_attempted=True,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
         return results
 
     async def _request_hedged(
@@ -588,7 +740,23 @@ class SearXNGSearchProvider:
                         first_success = payload
             if first_success is not None:
                 return first_success
-            raise ToolExecutionError("SEARCH_PROVIDER_DEGRADED", retryable=True)
+            raise ToolExecutionError(
+                "SEARCH_PROVIDER_DEGRADED",
+                retryable=True,
+                details=self._failure_details(
+                    {
+                        "provider": _PROVIDER_NAME,
+                        "failure_type": "fallback_failure",
+                        "context": {
+                            "strategy": _strategy_key(primary),
+                            "query": query[:500],
+                            "fallback_attempted": True,
+                            "fallback_provider": _strategy_key(fallback),
+                            "fallback_success": False,
+                        },
+                    }
+                ),
+            )
         finally:
             cleanup_tasks: list[asyncio.Task[dict[str, Any]]] = [primary_task]
             if fallback_task is not None:
@@ -599,8 +767,10 @@ class SearXNGSearchProvider:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
     def _record_hedged_error(self, exc: ToolExecutionError) -> None:
-        if exc.code == "SEARCH_TIMEOUT":
-            self._last_timeout_count += 1
+        # ``_request`` records transport failures before raising.  Hedged
+        # requests only observe that already-recorded error and must not count
+        # it a second time.
+        del exc
 
     async def _request(self, query: str, *, strategy: dict[str, str]) -> dict[str, Any]:
         self._last_request_count += 1
@@ -618,25 +788,122 @@ class SearXNGSearchProvider:
                 timeout=20.0,
             )
         except httpx.TimeoutException as exc:
-            raise ToolExecutionError("SEARCH_TIMEOUT", retryable=True) from exc
+            raise ToolExecutionError(
+                "SEARCH_TIMEOUT",
+                retryable=True,
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="timeout",
+                        strategy=_strategy_key(strategy),
+                        query=query,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                    )
+                ),
+            ) from exc
         except httpx.RequestError as exc:
-            raise ToolExecutionError("SEARCH_NETWORK_ERROR", retryable=True) from exc
+            raise ToolExecutionError(
+                "SEARCH_NETWORK_ERROR",
+                retryable=True,
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="network_error",
+                        strategy=_strategy_key(strategy),
+                        query=query,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                    )
+                ),
+            ) from exc
         if response.status_code >= 500:
-            raise ToolExecutionError("SEARCH_PROVIDER_UNAVAILABLE", retryable=True)
+            raise ToolExecutionError(
+                "SEARCH_PROVIDER_UNAVAILABLE",
+                retryable=True,
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="http_error",
+                        strategy=_strategy_key(strategy),
+                        query=query,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                        extra={"http_status": response.status_code},
+                    )
+                ),
+            )
         if response.status_code >= 400:
-            raise ToolExecutionError("SEARCH_REQUEST_REJECTED", retryable=False)
+            raise ToolExecutionError(
+                "SEARCH_REQUEST_REJECTED",
+                retryable=False,
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="http_error",
+                        strategy=_strategy_key(strategy),
+                        query=query,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                        extra={"http_status": response.status_code},
+                    )
+                ),
+            )
         try:
             payload: object = response.json()
         except ValueError as exc:
-            raise ToolExecutionError("SEARCH_RESPONSE_INVALID", retryable=False) from exc
+            raise ToolExecutionError(
+                "SEARCH_RESPONSE_INVALID",
+                retryable=False,
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="invalid_response",
+                        strategy=_strategy_key(strategy),
+                        query=query,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                    )
+                ),
+            ) from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-            raise ToolExecutionError("SEARCH_RESPONSE_INVALID", retryable=False)
+            raise ToolExecutionError(
+                "SEARCH_RESPONSE_INVALID",
+                retryable=False,
+                details=self._failure_details(
+                    self._record_failure(
+                        provider=_PROVIDER_NAME,
+                        failure_type="invalid_response",
+                        strategy=_strategy_key(strategy),
+                        query=query,
+                        fallback_attempted=False,
+                        fallback_provider=_FALLBACK_PROVIDER_NAME,
+                        fallback_success=False,
+                    )
+                ),
+            )
         unresponsive = payload.get("unresponsive_engines")
+        raw_results = payload.get("results")
         if isinstance(unresponsive, list) and unresponsive:
             self._last_unresponsive_response_count += 1
         else:
             self._last_healthy_response_count += 1
         usable = _payload_has_usable_results(query, payload)
+        if not raw_results and not (isinstance(unresponsive, list) and unresponsive):
+            self._record_failure(
+                provider=_PROVIDER_NAME,
+                failure_type="empty_response",
+                strategy=_strategy_key(strategy),
+                query=query,
+                fallback_attempted=False,
+                fallback_provider=_FALLBACK_PROVIDER_NAME,
+                fallback_success=False,
+            )
         if usable:
             self._last_productive_response_count += 1
         elif isinstance(unresponsive, list) and unresponsive:
@@ -644,6 +911,66 @@ class SearXNGSearchProvider:
                 time.monotonic() + _STRATEGY_CIRCUIT_COOLDOWN_SECONDS
             )
         return payload
+
+    def _record_failure(
+        self,
+        *,
+        provider: str,
+        failure_type: str,
+        strategy: str,
+        query: str,
+        fallback_attempted: bool,
+        fallback_provider: str,
+        fallback_success: bool,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        counter_by_type = {
+            "timeout": "_last_timeout_count",
+            "network_error": "_last_network_error_count",
+            "http_error": "_last_http_error_count",
+            "empty_response": "_last_empty_response_count",
+            "invalid_response": "_last_invalid_response_count",
+        }
+        counter_name = counter_by_type.get(failure_type)
+        if counter_name is not None:
+            setattr(self, counter_name, getattr(self, counter_name) + 1)
+        context: dict[str, object] = {
+            "strategy": strategy,
+            "query": " ".join(query.split())[:500],
+            "fallback_attempted": fallback_attempted,
+            "fallback_provider": fallback_provider,
+            "fallback_success": fallback_success,
+        }
+        if extra:
+            context.update(extra)
+        telemetry: dict[str, object] = {
+            "provider": provider,
+            "failure_type": failure_type,
+            "context": context,
+        }
+        self._failure_events.append(telemetry)
+        return telemetry
+
+    def _telemetry_snapshot(self) -> dict[str, int]:
+        return {
+            "provider_requests": self._last_request_count,
+            "healthy_responses": self._last_healthy_response_count,
+            "unresponsive_responses": self._last_unresponsive_response_count,
+            "timeout_count": self._last_timeout_count,
+            "network_error_count": self._last_network_error_count,
+            "http_error_count": self._last_http_error_count,
+            "empty_response_count": self._last_empty_response_count,
+            "invalid_response_count": self._last_invalid_response_count,
+            "fallback_attempts": self._last_fallback_attempt_count,
+            "fallback_successes": self._last_fallback_success_count,
+            "circuit_open_count": self._last_circuit_open_count,
+        }
+
+    def _failure_details(self, primary: dict[str, object]) -> dict[str, object]:
+        details = dict(primary)
+        details["metrics"] = self._telemetry_snapshot()
+        details["failure_events"] = self._failure_events[-20:]
+        return details
 
 
 def _strategy_key(strategy: dict[str, str]) -> str:

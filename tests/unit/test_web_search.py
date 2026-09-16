@@ -673,3 +673,106 @@ async def test_hedged_fallback_is_not_requested_twice(monkeypatch: pytest.Monkey
     assert requests.count("sogou") == 1
     assert provider.last_request_count == 3
     assert provider.last_fallback_count == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_preserves_typed_failure_telemetry() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("provider timed out", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider.search("industrial inspection")
+
+    assert caught.value.code == "SEARCH_PROVIDER_DEGRADED"
+    assert caught.value.details["provider"] == "SearXNG"
+    events = caught.value.details["failure_events"]
+    assert any(event["failure_type"] == "timeout" for event in events)
+    assert caught.value.details["metrics"]["timeout_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_provider_http_error_preserves_status_code() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider._request("industrial inspection", strategy={"engines": "default"})
+
+    details = caught.value.details
+    assert details["provider"] == "SearXNG"
+    assert details["failure_type"] == "http_error"
+    assert details["context"]["http_status"] == 503
+    assert details["context"]["fallback_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_empty_provider_response_is_not_classified_as_network_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider.search("industrial inspection")
+
+    details = caught.value.details
+    assert any(
+        event["failure_type"] == "empty_response"
+        for event in details["failure_events"]
+    )
+    assert details["metrics"]["empty_response_count"] >= 1
+    assert details["metrics"]["network_error_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_records_success_and_failure() -> None:
+    bing_html = (
+        '<li class="b_algo"><h2><a href="https://example.org/inspection">'
+        "Industrial inspection source</a></h2><p>industrial inspection</p></li>"
+    )
+
+    async def successful_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "searxng":
+            return httpx.Response(
+                200,
+                json={"results": [], "unresponsive_engines": [["engine", "down"]]},
+            )
+        return httpx.Response(200, text=bing_html)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(successful_handler)
+    ) as client:
+        provider = SearXNGSearchProvider(client, "http://searxng")
+        results = await provider.search(
+            "industrial inspection", limit=1, max_provider_requests=1
+        )
+
+    assert results
+    assert provider.last_fallback_attempt_count == 1
+    assert provider.last_fallback_success_count == 1
+
+    async def failed_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "searxng":
+            return httpx.Response(
+                200,
+                json={"results": [], "unresponsive_engines": [["engine", "down"]]},
+            )
+        return httpx.Response(502)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(failed_handler)) as client:
+        provider = SearXNGSearchProvider(client, "http://searxng")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider.search("industrial inspection", limit=1, max_provider_requests=1)
+
+    details = caught.value.details
+    assert details["failure_type"] == "fallback_failure"
+    assert any(
+        event["provider"] == "Bing" and event["failure_type"] == "http_error"
+        for event in details["failure_events"]
+    )
+    assert details["metrics"]["fallback_attempts"] >= 1
+    assert details["metrics"]["fallback_successes"] == 0
