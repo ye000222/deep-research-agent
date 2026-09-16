@@ -154,16 +154,29 @@ def _public_fallback_url(url: str) -> str | None:
         if match:
             return f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={match.group(1)}"
     if host == "www.mdpi.com" and not path.endswith("/pdf"):
-        return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/") + "/pdf", parsed.query, ""))
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, path.rstrip("/") + "/pdf", parsed.query, "")
+        )
     if host in {"ieeexplore.ieee.org", "www.ieeexplore.ieee.org"}:
         match = re.search(r"/document/(\d+)", path)
         if match:
             return f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={match.group(1)}"
     if host == "dl.acm.org" and "/doi/abs/" in path:
-        return urlunsplit((parsed.scheme, parsed.netloc, path.replace("/doi/abs/", "/doi/pdf/"), parsed.query, ""))
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                path.replace("/doi/abs/", "/doi/pdf/"),
+                parsed.query,
+                "",
+            )
+        )
     if host == "academic.oup.com" and "/article/" in path and not parsed.query:
         return urlunsplit((parsed.scheme, parsed.netloc, path, "download=1", ""))
-    if host in {"www.spiedigitallibrary.org", "proceedings.spiedigitallibrary.org"} and path.endswith(".aspx"):
+    if host in {
+        "www.spiedigitallibrary.org",
+        "proceedings.spiedigitallibrary.org",
+    } and path.endswith(".aspx"):
         return urlunsplit((parsed.scheme, parsed.netloc, path[:-5] + ".full", parsed.query, ""))
     return None
 

@@ -131,10 +131,18 @@ def test_gap_resolution_hints_preserve_compact_bilingual_topic_anchors() -> None
 def test_gap_resolution_hints_do_not_accumulate_previous_search_suffixes() -> None:
     question = _question("q5").model_copy(
         update={
-            "question": "工业视觉缺陷检测领域有哪些代表性厂商与代表产品？",
+            "question": (
+                "工业视觉缺陷检测领域有哪些代表性厂商与代表产品？"  # noqa: RUF001
+            ),
             "search_hints": [
-                "工业视觉缺陷检测 厂商 产品 方案 industry outlook adoption statistics manufacturer product page deployment",
-                "machine vision defect detection vendors products technical specification customer case field trial evaluation report",
+                (
+                    "工业视觉缺陷检测 厂商 产品 方案 industry outlook adoption statistics "
+                    "manufacturer product page deployment"
+                ),
+                (
+                    "machine vision defect detection vendors products technical specification "
+                    "customer case field trial evaluation report"
+                ),
             ],
         }
     )
@@ -153,7 +161,7 @@ def test_gap_resolution_hints_do_not_accumulate_previous_search_suffixes() -> No
 def test_gap_resolution_hints_strip_all_replan_audit_banks() -> None:
     question = _question("q2").model_copy(
         update={
-            "question": "全球工业视觉缺陷检测市场规模是多少？",
+            "question": "全球工业视觉缺陷检测市场规模是多少？",  # noqa: RUF001
             "search_hints": [
                 "全球工业视觉缺陷检测市场规模 2024 2026 government forecast primary data "
                 "government forecast primary data independent market report methodology"

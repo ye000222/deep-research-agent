@@ -74,7 +74,12 @@ class ResearchGraphService:
                 template_plan = None
                 if template_raw:
                     try:
-                        template_version = int(budget_snapshot.get("plan_template_plan_version", 1))
+                        template_version = int(
+                            cast(
+                                str | int,
+                                budget_snapshot.get("plan_template_plan_version", 1),
+                            )
+                        )
                         template_plan = await self._runs.get_plan_for_execution(
                             UUID(str(template_raw)), plan_version=template_version
                         )

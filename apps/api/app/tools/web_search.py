@@ -8,6 +8,7 @@ import html
 import os
 import re
 import time
+from collections.abc import Set
 from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -459,8 +460,8 @@ class SearXNGSearchProvider:
         query: str,
         *,
         limit: int,
-        excluded_urls: set[str],
-        excluded_owners: set[str],
+        excluded_urls: Set[str],
+        excluded_owners: Set[str],
     ) -> list[SearchResult]:
         """Read a small set of Bing HTML results when SearXNG is unavailable.
 

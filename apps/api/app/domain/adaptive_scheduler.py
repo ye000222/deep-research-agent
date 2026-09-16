@@ -374,8 +374,20 @@ def classify_source_role(url: str, *, text: str = "") -> str:
     # own title/body explicitly carries both a market-report signal and a
     # quantitative market signal; generic news/blog pages remain publishers.
     if (
-        any(marker in sample for marker in ("market report", "market research", "行业报告", "研究报告", "研究机构"))
-        and any(marker in sample for marker in ("market size", "cagr", "市场规模", "增长率", "年复合"))
+        any(
+            marker in sample
+            for marker in (
+                "market report",
+                "market research",
+                "行业报告",
+                "研究报告",
+                "研究机构",
+            )
+        )
+        and any(
+            marker in sample
+            for marker in ("market size", "cagr", "市场规模", "增长率", "年复合")
+        )
     ):
         return "independent_research"
     # Some publishers expose numeric market pages whose body omits the
@@ -384,8 +396,23 @@ def classify_source_role(url: str, *, text: str = "") -> str:
     # independent research source; this remains narrower than promoting every
     # ordinary .com publisher and works for arbitrary market questions.
     if (
-        any(marker in f"{host}{path}" for marker in ("market", "forecast", "industry-report"))
-        and any(marker in sample for marker in ("cagr", "market size", "market share", "forecast", "%", "亿美元", "million", "billion"))
+        any(
+            marker in f"{host}{path}"
+            for marker in ("market", "forecast", "industry-report")
+        )
+        and any(
+            marker in sample
+            for marker in (
+                "cagr",
+                "market size",
+                "market share",
+                "forecast",
+                "%",
+                "亿美元",
+                "million",
+                "billion",
+            )
+        )
     ):
         return "independent_research"
     if host.endswith(".com") or host.endswith(".cn"):

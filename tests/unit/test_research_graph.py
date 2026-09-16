@@ -46,6 +46,11 @@ class FakeRuns:
     async def get_plan_for_execution(self, run_id: UUID) -> ResearchPlan | None:
         return self.plan
 
+    async def get_budget_snapshot_for_execution(
+        self, run_id: UUID
+    ) -> dict[str, object]:
+        return {}
+
     async def save_generated_plan(self, run_id: UUID, **kwargs: object) -> bool:
         self.plan = kwargs["plan"]  # type: ignore[assignment]
         self.saved += 1

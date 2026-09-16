@@ -1416,8 +1416,11 @@ class ResearchToolRepository:
                 "p1_high_risk_exception": p1_exception,
                 "status": (
                     "hard_exhausted"
-                    if recovery_limit > 0 and projected >= recovery_limit
-                    or hard_limit > 0 and projected >= hard_limit and not p1_exception
+                    if (
+                        recovery_limit > 0 and projected >= recovery_limit
+                    ) or (
+                        hard_limit > 0 and projected >= hard_limit and not p1_exception
+                    )
                     else "borrowing"
                     if projected > target
                     else "target_exhausted"

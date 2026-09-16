@@ -48,7 +48,9 @@ def main() -> int:
     parser.add_argument("--profile-run-id", type=UUID, required=True)
     parser.add_argument("--query", required=True)
     parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--run-label", default="", help="Unique label for a repeated acceptance run")
+    parser.add_argument(
+        "--run-label", default="", help="Unique label for a repeated acceptance run"
+    )
     args = parser.parse_args()
     result = asyncio.run(start(**vars(args)))
     print(json.dumps(result, ensure_ascii=False))
