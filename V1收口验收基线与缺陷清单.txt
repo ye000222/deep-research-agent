@@ -1,0 +1,120 @@
+DeepResearch Agent V1 收口验收基线与缺陷清单
+============================================
+记录时间：2026-09-14（Asia/Shanghai）
+
+一、收口原则
+------------
+在真实端到端验收通过前冻结新功能和大范围调度/预算重构。后续每次修改必须同时提供：
+1. 一个可复现的失败输入；
+2. 一个同边界回归测试；
+3. 一次同配置端到端复验；
+4. 对覆盖率、P1 覆盖率、交叉验证和关键缺口的前后对比。
+单元测试、Golden 合成数据或页面显示为绿色，不能单独宣称 V1 通过。
+
+二、当前代码基线
+----------------
+分支：codex/p1-search-coverage-fix
+HEAD：c1c0095（2026-09-13，balance provider requests across research questions）
+工作树：25 个既有修改文件，约 1152 行新增、114 行删除；尚未形成新的稳定提交。
+该状态视为候选基线，禁止再混入无关功能。
+
+三、已通过的本地检查
+--------------------
+1. pytest：317 passed，7 skipped。
+2. PostgreSQL 集成：7 passed；使用 127.0.0.1 验证。Windows 下 localhost 会使异步
+   checkpoint 连接池 30 秒超时，这是本机运行前置条件，不应修改业务逻辑掩盖它。
+3. Ruff：通过。
+4. MyPy：115 个源文件，无错误。
+5. Web typecheck/build：通过。
+6. Golden evaluation：通过。
+7. release_gate.py 静态/Golden/Web 子集：passed=true。
+
+四、已知阻断项（P0）
+--------------------
+P0-1 已定位并修复：Worker 之前把 SearXNG 内网直连客户端复用于公共网页读取，导致
+“搜索成功、页面全部失败”。现在拆为模型代理、SearXNG 直连、公共网页代理三个客户端。
+真实 Run 已证明网页快照与证据可以产出。
+P0-2 已定位并修复：300 秒执行租约与长同步段存在边界竞态，Worker 会返回 lease_lost，
+运行暂时保持 researching，待 reconciler 接管。保留 30 秒心跳并将 Worker 执行租约提高到
+900 秒；第二轮在 392 秒内无 lease_lost 完成。第三轮是在旧 Worker 尚未重启前触发，仍经历
+一次接管后完成，不能作为新租约配置的验证。
+P0-3 旧失败 Run 01a09de1-3785-71c5-92c6-a2573d40747c 是终态，不能通过改代码恢复；
+必须使用新 Run 验证模型别名推理控制。该项已由三次新 Run 验证 Planner 成功返回。
+
+五、待验证的 P1 项
+------------------
+P1-1 总体覆盖率达到 85% 以上。
+P1-2 P1 最低覆盖度达到 80% 以上。
+P1-3 交叉验证达到 70% 以上。
+P1-4 关键缺口为 0，且不能以 completed_with_limitations 伪装成质量门通过。
+P1-5 本轮信息增益应记录真实数值和低增益原因；不能只显示百分比而不区分无新证据、
+     重复来源、抽取失败、评估失败和预算让出。
+
+六、最新已修复的模型问题
+------------------------
+官方 api.deepseek.com 下的 DeepSeek 模型名称不再硬编码为两个版本；所有大小写无关的
+deepseek-* 别名都会把 Planner 的 reasoning_enabled=False 转成 thinking={type:disabled}。
+这修复了 deepseek-flash 造成的 Planner 隐藏推理耗尽输出预算问题，但必须用新 Run 做
+真实确认。兼容地址和其他模型不会注入 DeepSeek 专有参数。
+
+七、V1 通过条件
+---------------
+在同一模型、代理、研究目标和预算配置下，连续 3 次新 Run：
+- 不出现 MODEL_NETWORK_ERROR、MODEL_TIMEOUT、MODEL_OUTPUT_TRUNCATED、
+  PLAN_OUTPUT_BUDGET_EXCEEDED、SEARCH_TRANSPORT_RETRY_PENDING；
+- 进入报告阶段并生成可追溯报告；
+- 总体覆盖率 >= 85%；P1 覆盖率 >= 80%；交叉验证 >= 70%；关键缺口 = 0；
+- 失败/重试/预算让出均有可解释事件，且没有早停吞掉未处理问题。
+
+八、真实验收授权边界
+--------------------
+真实 Run 会把用户研究目标和检索词发送到已配置的 DeepSeek 与搜索服务，并消耗调用额度。
+在用户明确确认之前，只进行本地检查和合成端到端测试，不擅自发起该外部调用。
+
+九、授权后的真实验收记录（2026-09-14）
+--------------------------------------
+同一 DeepSeek 配置、同一研究目标、standard 预算下创建三次新 Run：
+
+Run 01a09e14-7881-75bf-957e-34fb5374be6e：报告 verified，completed_with_limitations；
+网页快照 12、证据 16、接受证据 5，覆盖率 19.74%，P1 0%，交叉验证 0%。首次暴露
+公共网页客户端未走代理，以及 300 秒租约边界问题；经 reconciler 接管后安全完成。
+
+Run 01a09e21-3367-7215-8717-99d35d84cee9：报告 verified，completed_with_limitations；
+网页快照 19、证据 27、接受证据 18，覆盖率 53.95%，P1 25%，交叉验证 38.46%，
+模型 Token 54,278；Worker 日志无 lease_lost。
+
+Run 01a09e28-27fe-7060-b44f-6630ac22ab29：报告 verified，completed_with_limitations；
+网页快照 18、证据 25、接受证据 18（数据库证据行），覆盖率 43.42%，P1 0%，
+交叉验证 44.44%，模型 Token 49,652；该轮在旧 Worker 进程上运行，曾发生 lease_lost，
+随后由 reconciler 接管并完成。
+
+结论：网络/Planner/报告链路已恢复且可重复，当前仍未达到 V1 质量门（85% 总覆盖、
+80% P1、70% 交叉验证、关键缺口 0）。剩余缺口是检索策略的来源独立性与问题级覆盖分配，
+不能再归因于模型网络不可用。
+
+十、额度恢复后的最终租约复验
+----------------------------
+最终 Run 01a09f08-d6ea-7650-820b-8d48f8f4496a 在加载 900 秒租约的新 Worker 上执行。
+它跨过 5 分钟边界后仍保持同一研究上下文，最终由报告阶段完成并生成 verified 报告；
+覆盖率 48.75%，P1 0%，交叉验证 60%，信息增益峰值约 84.3%，19 次搜索、19 个网页
+快照、30 条证据。初始任务在 360 秒处曾返回 lease_lost，但租约未过期，随后由
+reconcile:20 从 Checkpoint 恢复并在 30 秒内完成报告，未出现网络错误或数据丢失。
+因此：恢复链路已验证，但“初始任务为何在未过期租约下丢失所有权”仍是 P1/P0 边界
+诊断项，不能宣称租约问题已完全根除；后续应保留异常类型日志并增加针对该竞态的回归测试。
+
+十一、真实三连收口门禁（已实现，待授权运行）
+----------------------------------------------
+新增 scripts/verify_v1_real_runs.py，并接入 scripts/release_gate.py --v1-closeout。
+门禁只读取同一 owner 最新连续三次 Run，并要求研究目标、模型、凭据版本、预算、评分规则、
+Prompt、图结构和 source_revision 完全相同；source_revision 不允许 development/unknown。
+每次 Run 必须是 completed/terminal/quality_met，恰有一份 verified 报告，报告开始、验证、
+运行完成事件齐全且无 run.failed，同时满足覆盖率 >=85%、P1 >=80%、交叉验证 >=70%、
+关键缺口 = 0。静态 Release Gate 明确标记为 static_release_checks，不能冒充真实收口。
+真实收口模式禁止所有 --skip-* 参数，并强制提供非 development/unknown 的候选代码版本，
+避免跳过本地门禁或用旧版本运行替当前代码背书。
+
+以当前数据库最新三次运行反向验证时，门禁按预期失败：三次虽均已生成 verified 报告，
+但 termination_reason 不是 quality_met，覆盖率、P1、交叉验证和关键缺口均未同时达标，
+且旧运行没有可识别 source_revision。这证明门禁不会把旧的受限报告误判为 V1 通过。
+
+启动三次新的真实验收仍需用户单独明确授权；授权前不调用 DeepSeek 或搜索服务。

@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     )
     redis_url: str = "redis://localhost:6379/0"
     searxng_base_url: str = "http://localhost:8080"
+    # Optional Docker-reachable egress proxy for external model providers.
+    # Search traffic has its own SearXNG proxy configuration.
+    model_http_proxy: str | None = None
+    # Optional Docker-reachable egress proxy for public page reads.  Keep this
+    # separate from model_http_proxy: model and web traffic may intentionally
+    # use different routes (for example, direct model access plus proxied web).
+    public_web_http_proxy: str | None = None
     artifact_root: Path = Path("artifacts")
 
     langgraph_strict_msgpack: bool = True

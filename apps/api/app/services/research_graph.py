@@ -11,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.domain.memory import MemoryItemView
 from app.domain.planning import ResearchPlan
-from app.domain.providers import TokenUsage
+from app.domain.providers import TokenUsage, UsageAccuracy
 from app.infrastructure.db.research_runs import ResearchRunRepository
 from app.infrastructure.db.state_runtime import ResearchStateRuntimeRepository
 from app.llm.adapters import ModelGatewayError
@@ -69,14 +69,32 @@ class ResearchGraphService:
             plan = await self._runs.get_plan_for_execution(run_id)
             if plan is None:
                 memory_leads: tuple[MemoryItemView, ...] = ()
-                if self._memories is not None:
-                    memory_result = await self._memories.retrieve_for_run(run_id)
-                    memory_leads = memory_result.items
-                plan, usage = await self._generate_plan_with_retry(
-                    run_id,
-                    worker_task_id=worker_task_id,
-                    memory_leads=memory_leads,
-                )
+                budget_snapshot = await self._runs.get_budget_snapshot_for_execution(run_id)
+                template_raw = budget_snapshot.get("plan_template_run_id")
+                template_plan = None
+                if template_raw:
+                    try:
+                        template_version = int(budget_snapshot.get("plan_template_plan_version", 1))
+                        template_plan = await self._runs.get_plan_for_execution(
+                            UUID(str(template_raw)), plan_version=template_version
+                        )
+                    except (TypeError, ValueError):
+                        template_plan = None
+                if template_plan is not None:
+                    # The acceptance harness uses a fixed, previously audited
+                    # plan so ordinal runs measure execution stability rather
+                    # than planner sampling variance.  No model call is needed.
+                    plan = template_plan
+                    usage = TokenUsage(accuracy=UsageAccuracy.UNAVAILABLE)
+                else:
+                    if self._memories is not None:
+                        memory_result = await self._memories.retrieve_for_run(run_id)
+                        memory_leads = memory_result.items
+                    plan, usage = await self._generate_plan_with_retry(
+                        run_id,
+                        worker_task_id=worker_task_id,
+                        memory_leads=memory_leads,
+                    )
                 saved = await self._runs.save_generated_plan(
                     run_id,
                     worker_task_id=worker_task_id,

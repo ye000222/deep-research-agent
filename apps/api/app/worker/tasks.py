@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from uuid import UUID
 
 import httpx
@@ -12,6 +13,7 @@ from pydantic import ValidationError
 
 from app.context.manager import ContextBudgetManager, ContextManifestPersistenceError
 from app.core.config import Settings
+from app.domain.research_runs import EXECUTION_LEASE_SECONDS
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.checkpoints.lifecycle import CheckpointRuntime
 from app.infrastructure.db.extraction_cache import ExtractionCacheRepository
@@ -106,13 +108,31 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         min_size=settings.checkpoint_pool_min_size,
         max_size=settings.checkpoint_pool_max_size,
     )
-    client = httpx.AsyncClient(
+    model_client = httpx.AsyncClient(
         timeout=httpx.Timeout(90.0, connect=10.0),
         # Retry connection establishment locally before consuming one of the
         # wider, durable Outbox retry windows. HTTP responses and read failures
         # are not replayed by the transport.
         transport=httpx.AsyncHTTPTransport(retries=2),
         follow_redirects=False,
+        proxy=settings.model_http_proxy or None,
+        trust_env=False,
+    )
+    search_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(90.0, connect=10.0),
+        transport=httpx.AsyncHTTPTransport(retries=2),
+        follow_redirects=False,
+        trust_env=False,
+    )
+    # SearXNG is an internal Docker service and must stay direct, while the
+    # worker's public-page reader may need a separate host proxy to reach the
+    # same internet destinations returned by SearXNG.  Do not reuse the model
+    # route: model and web traffic are independently configurable.
+    public_web_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(90.0, connect=10.0),
+        transport=httpx.AsyncHTTPTransport(retries=2),
+        follow_redirects=False,
+        proxy=settings.public_web_http_proxy or None,
         trust_env=False,
     )
     repository = ResearchRunRepository(database.session_factory)
@@ -136,8 +156,11 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         # boundary below; still release runtimes created for this task.
         await checkpoints.close()
         await database.close()
+        await model_client.aclose()
+        await search_client.aclose()
+        await public_web_client.aclose()
         raise
-    gateway = LLMGateway(client, call_recorder=llm_calls.record)
+    gateway = LLMGateway(model_client, call_recorder=llm_calls.record)
     planner = PlannerService(
         bindings,
         cipher,
@@ -147,8 +170,12 @@ async def _execute(run_id: UUID, task_id: str) -> str:
     )
     research_loop = ResearchLoopService(
         research_repository,
-        SearXNGSearchProvider(client, settings.searxng_base_url),
-        PublicWebReader(client),
+        SearXNGSearchProvider(
+            search_client,
+            settings.searxng_base_url,
+            fallback_client=public_web_client,
+        ),
+        PublicWebReader(public_web_client),
         EvidenceExtractorService(bindings, cipher, gateway, contexts, extraction_cache),
         LocalArtifactStore(settings.artifact_root),
         controlled_tools,
@@ -175,16 +202,37 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         acquired = await repository.acquire_for_execution(
             run_id,
             worker_task_id=task_id,
+            lease_seconds=EXECUTION_LEASE_SECONDS,
         )
         if not acquired:
             return "skipped"
+        lease_stop = asyncio.Event()
+        lease_heartbeat = asyncio.create_task(
+            _renew_worker_lease(
+                repository,
+                run_id,
+                worker_task_id=task_id,
+                stop_event=lease_stop,
+                lease_seconds=EXECUTION_LEASE_SECONDS,
+            ),
+            name=f"research-lease-heartbeat-{run_id}",
+        )
         saver = await checkpoints.open()
         return await graph.execute(
             run_id,
             worker_task_id=task_id,
             checkpointer=saver,
         )
-    except (ResearchLeaseLostError, ReportWritingLeaseLostError, StateRuntimeLeaseLostError):
+    except (ResearchLeaseLostError, ReportWritingLeaseLostError, StateRuntimeLeaseLostError) as exc:
+        logger.warning(
+            "Research execution lost its worker lease: %s",
+            type(exc).__name__,
+            extra={
+                "run_id": str(run_id),
+                "worker_task_id": task_id,
+                "lease_error_type": type(exc).__name__,
+            },
+        )
         return "lease_lost"
     except ModelGatewayError as exc:
         if _should_defer_model_error(exc):
@@ -283,16 +331,62 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         await _synchronize_failure_state(state_repository, run_id)
         raise
     finally:
+        if "lease_heartbeat" in locals():
+            lease_stop.set()
+            lease_heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await lease_heartbeat
         # Close every runtime even if one backend's shutdown raises. A
         # partial cleanup used to leak the checkpoint pool and keep subsequent
         # retries stuck behind exhausted connections.
         try:
-            await client.aclose()
+            await model_client.aclose()
+            await search_client.aclose()
+            await public_web_client.aclose()
         finally:
             try:
                 await checkpoints.close()
             finally:
                 await database.close()
+
+
+async def _renew_worker_lease(
+    repository: ResearchRunRepository,
+    run_id: UUID,
+    *,
+    worker_task_id: str,
+    stop_event: asyncio.Event,
+    lease_seconds: int = EXECUTION_LEASE_SECONDS,
+) -> None:
+    """Keep long LangGraph/checkpoint/report boundaries from looking stale."""
+
+    while True:
+        try:
+            # Renew well before the five-minute lease expires.  A 60-second
+            # interval can race with a long DB/model turn and miss the exact
+            # expiry boundary, forcing an unnecessary reconciler takeover.
+            await asyncio.wait_for(stop_event.wait(), timeout=30.0)
+            return
+        except TimeoutError:
+            pass
+        try:
+            renewed = await repository.renew_execution_lease(
+                run_id,
+                worker_task_id=worker_task_id,
+                lease_seconds=lease_seconds,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to renew research worker lease",
+                extra={"run_id": str(run_id)},
+            )
+            continue
+        if not renewed:
+            logger.warning(
+                "Research worker lease is no longer owned by this task",
+                extra={"run_id": str(run_id)},
+            )
+            return
 
 
 async def _synchronize_failure_state(

@@ -6,6 +6,17 @@ search:
     - html
     - json
 
+# Route search engines through Docker Desktop's container-only proxy. The
+# former host.docker.internal:7078 endpoint depended on a missing Windows port
+# forward; direct egress is also unreliable for public search engines here.
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 20.0
+  proxies:
+    all://:
+      - http://http.docker.internal:3128
+  extra_proxy_timeout: 5
+
 # Keep a Chinese general-web fallback available for the application-level
 # search strategy. The provider can still report a transient timeout; it must
 # not be silently disabled by SearXNG when the default engines are degraded.

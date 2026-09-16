@@ -59,6 +59,15 @@ def test_page_budget_validation_error_is_not_reported_as_unknown() -> None:
     assert detail_code == "PAGE_BUDGET_OVERRUN"
 
 
+def test_v2_fetched_page_limit_does_not_use_legacy_page_cap() -> None:
+    state = ResearchState(
+        run_id=uuid4(),
+        budget_limits=BudgetLimits(max_pages=40, max_pages_fetched=120),
+        budget_usage=BudgetUsage(pages=41, pages_fetched=41),
+    )
+    assert state.budget_usage.pages_fetched == 41
+
+
 def test_terminal_budget_overrun_can_be_projected_without_hiding_usage() -> None:
     state = ResearchState(
         run_id=uuid4(),

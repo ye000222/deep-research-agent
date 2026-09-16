@@ -18,6 +18,7 @@ from app.security.secrets import SecretCipher
 from app.services.evidence_extractor import (
     EvidenceExtractorService,
     _extraction_contract,
+    _normalize_quote,
     _scope_mismatch,
     source_reliability,
 )
@@ -37,6 +38,16 @@ class SequenceGateway:
         if isinstance(response, ModelGatewayError):
             raise response
         return response
+
+
+def test_pdf_quote_normalization_ignores_layout_punctuation_and_accents() -> None:
+    source = "The dataset contains non-defective images and 87 de\u00b4fective ones."
+    quote = "The dataset contains non defective images and 87 defective ones."
+
+    assert _normalize_quote(quote) in _normalize_quote(source)
+    assert _normalize_quote("The dataset contains 99 defective ones") not in _normalize_quote(
+        source
+    )
 
 
 def sequence_service(gateway: SequenceGateway) -> EvidenceExtractorService:

@@ -76,6 +76,8 @@ services:
       CHECKPOINT_DATABASE_URI: postgresql://deep_research:deep_research@postgres:5432/deep_research_checkpoint
       REDIS_URL: redis://redis:6379/0
       SEARXNG_BASE_URL: http://searxng:8080
+      MODEL_HTTP_PROXY: ${MODEL_HTTP_PROXY:-}
+      PUBLIC_WEB_HTTP_PROXY: ${PUBLIC_WEB_HTTP_PROXY:-}
       SEARXNG_PREFERRED_ENGINES: ${SEARXNG_PREFERRED_ENGINES:-}
       ARTIFACT_ROOT: /app/artifacts
       PERSIST_PROVIDER_CREDENTIALS: "true"
@@ -110,6 +112,8 @@ services:
       CHECKPOINT_DATABASE_URI: postgresql://deep_research:deep_research@postgres:5432/deep_research_checkpoint
       REDIS_URL: redis://redis:6379/0
       SEARXNG_BASE_URL: http://searxng:8080
+      MODEL_HTTP_PROXY: ${MODEL_HTTP_PROXY:-}
+      PUBLIC_WEB_HTTP_PROXY: ${PUBLIC_WEB_HTTP_PROXY:-}
       SEARXNG_PREFERRED_ENGINES: ${SEARXNG_PREFERRED_ENGINES:-}
       ARTIFACT_ROOT: /app/artifacts
       PERSIST_PROVIDER_CREDENTIALS: "true"

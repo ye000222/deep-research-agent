@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import unicodedata
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -881,7 +882,16 @@ def source_reliability(url: str, *, text: str = "", title: str = "") -> float:
 
 
 def _normalize_quote(value: str) -> str:
-    return " ".join(value.split())
+    # PDF text layers routinely alter whitespace, line breaks, hyphens and
+    # combining accents.  Preserve the exact alphanumeric sequence while
+    # ignoring those representation-only differences; word substitutions or
+    # reorderings still cannot pass this containment check.
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(
+        character
+        for character in decomposed
+        if character.isalnum() and not unicodedata.combining(character)
+    )
 
 
 def _contains_prompt_injection(value: str) -> bool:

@@ -1,4 +1,4 @@
-from app.domain.source_policy import normalize_source_url
+from app.domain.source_policy import normalize_source_url, source_owner_key
 
 
 def test_normalize_source_url_collapses_transport_tracking_and_order() -> None:
@@ -13,3 +13,7 @@ def test_normalize_source_url_does_not_merge_non_default_https_port() -> None:
 
 def test_normalize_source_url_is_stable_for_trailing_root_slash() -> None:
     assert normalize_source_url("https://example.com") == "https://example.com/"
+
+
+def test_source_owner_preserves_registrable_domain_for_chinese_public_suffix() -> None:
+    assert source_owner_key("https://www.aas.net.cn/article/1") == "aas.net.cn"

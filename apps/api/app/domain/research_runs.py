@@ -37,6 +37,11 @@ TERMINAL_RUN_STATUSES = {
     RunStatus.COMPLETED_WITH_LIMITATIONS,
 }
 
+# One durable execution lease must cover the complete standard research window.
+# Every persistence boundary imports this value so an iteration cannot silently
+# shorten the Worker lease and trigger a false stale-run takeover.
+EXECUTION_LEASE_SECONDS = 900
+
 
 @dataclass(frozen=True, slots=True)
 class ResearchRunView:

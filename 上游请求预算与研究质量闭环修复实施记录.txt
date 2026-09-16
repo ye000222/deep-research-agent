@@ -1,0 +1,156 @@
+上游请求预算与研究质量闭环修复实施记录
+====================================
+
+日期：2026-09-13（Asia/Shanghai）
+分支：codex/p1-search-coverage-fix
+基线提交：c1c0095 fix: balance provider requests across research questions
+问题样本运行：01a09ae3-ebb5-7aad-bb25-587a7b3326fa
+
+一、样本运行事实
+----------------
+
+1. 运行在 149/480 秒时结束，状态为 completed_with_limitations。
+2. Standard 档的上游原始请求 24/24 已耗尽，但逻辑查询仅执行 8/14。
+3. 8 个研究问题各拿到 3 次上游尝试，正好把 24 次预算全部均分完；因此每个问题只执行了第一组 scope 查询，后续英文、权威来源、替代词和交叉验证查询没有执行机会。
+4. 漏斗为：17 个候选 URL、6 次页面抓取、3 个抽取页面、6 条候选证据、2 条接受证据；两条接受证据均属于同一来源所有者（163.com）。
+5. q1/q3/q7 搜索结果为 0；q2 只读 1 页且 2 条证据被拒；q4 读 1 页并接受 2 条同源证据；q5 遇到超时和来源角色不匹配；q6/q8 各只有 1 个候选且页面读取失败。
+6. 最终总体覆盖度为 3/19=15.79%，P1 最低覆盖度为 0，交叉验证为 0。
+7. 上游故障包括 Sogou/DDG CAPTCHA、Brave 429 和 arXiv 超时。旧指标只记录请求次数，无法区分健康响应、部分失效响应和真正产出候选的响应。
+
+二、根因
+--------
+
+1. 预算口径失配：逻辑查询预算和原始 provider 请求预算绑定过紧；8×3 的公平首轮直接耗尽整个 Standard provider 池。
+2. 查询退化：首轮查询把中文主题提示与“原文列出/描述”等验收话术拼接，降低中文搜索召回；第二个英文搜索提示从未路由到学术引擎。
+3. 固定故障重复消耗：同一个已 CAPTCHA/限流/超时的引擎组会被后续问题继续调用，浪费全局原始请求预算。
+4. 候选未充分利用：P1 首轮也只允许读取 1 个页面；且搜索预算耗尽后，finish_iteration 立即停止，prepare_target 已支持的候选/页面缓存排空路径实际上无法执行。
+5. 交叉验证调度弱：再次补证时同一来源所有者的惩罚太小，也没有向搜索查询显式排除已用来源；高风险主张在最终质量门要求双来源，但问题完成判定仍可能按单来源提前结束。
+6. 来源所有者归一错误：aas.net.cn 等中国多级公共后缀被折叠为 net.cn，破坏独立来源计数。
+7. 指标语义不清：priority_one_coverage 实际是所有 P1 问题中的最低值，界面却显示为普通“P1 覆盖度”；因此只要一个 P1 为 0，整个指标就是 0，且看不到平均值和完成数。
+
+三、已完成修改
+--------------
+
+A. 预算与调度
+
+1. Quick/Standard/Deep 的 max_provider_requests 从 8/24/48 调整为 18/48/84，保证每个档位至少拥有 max_logical_queries×3 的原始请求容量。
+2. Standard 在 8 个问题各完成一次 3-provider 首轮后仍保留 24 次原始尝试，用于 P1、权威来源、替代词和交叉验证。
+3. 搜索/逻辑查询/provider 原始请求耗尽时，不再立刻写报告；进入 continue_cached，继续读取、抽取和评估已经发现或缓存的候选。页面、Token、截止时间等真正阻止处理的预算仍会立即停止。
+4. P1 首轮最多读取 2 个候选页面；P2/P3 首轮仍维持 1 页公平策略，避免高优先级增强挤占普通问题的首次机会。
+
+B. 查询与 provider 路由
+
+1. scope 查询在存在 planner hint 时仅使用紧凑主题提示，不再追加验收审计话术。
+2. 后续查询会剥离“原文、逐字、列出、描述、说明”等检索低价值词。
+3. 同时生成并审计默认查询与 alternate_query；学术策略使用第二个/英文提示，普通策略使用默认/中文提示。
+4. provider 顺序调整为：arXiv/OpenAIRE 学术索引、默认综合搜索、Sogou；每组单次尝试，不再在同一失效组上连续重试。
+5. 对无结果且存在 unresponsive_engines 的策略启用 120 秒运行级熔断，后续问题跳过该失效策略。
+6. 一次逻辑查询获得 8 条有用候选后停止扩张，避免为填满 20 条内部上限继续浪费 provider 请求。
+
+C. 证据效率、来源质量和交叉验证
+
+1. 候选排序同时使用中英文查询匹配度。
+2. 交叉验证查询最多追加 3 个 -site:已用来源所有者，并把同源候选惩罚从 18 提高到 60。
+3. 根据验收条件推断 claim 类型；来源角色不匹配的候选增加 28 分惩罚，官网/official 标题获得优先级加成。
+4. 补充 ac.cn、edu.cn、gov.cn、net.cn、org.cn 等多级后缀归一规则；www.aas.net.cn 现在正确归一为 aas.net.cn。
+5. 高风险主张维度在覆盖度、交叉验证分母和问题完成判定三个位置统一要求至少 2 个独立来源；消除“质量门要求补证、调度器却认为已完成”的矛盾。
+
+D. 可观测性和界面
+
+1. 新增并持久化：健康上游响应、失效上游响应、有效候选响应，以及有效响应率。
+2. search.completed 事件同时记录 provider 原始尝试、超时、fallback、健康、失效、有效和延迟。
+3. 界面将“上游请求”改为“上游原始尝试”，避免把一次逻辑查询误解为一次 HTTP 请求。
+4. “P1 覆盖度”改为“P1 最低覆盖度”，并增加 P1 平均覆盖度、P1 完成数和 P1 总数；质量门显示“完成数/总数”。
+5. 预算诊断增加健康响应、有效候选响应和失效响应三项。
+
+四、测试与验证结果
+------------------
+
+1. Python 单元测试：全部通过；新增覆盖预算保留、缓存排空、P1 双页读取、英文路由、provider 熔断、多级域名、高风险单来源不得提前完成等场景。
+2. 全部常规 pytest：通过；7 个需要显式 PostgreSQL 环境变量的测试在常规运行中按设计跳过。
+3. 隔离 PostgreSQL/Checkpoint 集成测试：7/7 通过；使用 deep_research_fixverify 与 deep_research_fixverify_checkpoint，不接触业务库；验证完成后两个隔离库均已删除。
+4. Ruff（所有本次修改文件）：通过。
+5. Mypy：115 个 Python 源文件通过，无类型错误。
+6. Web TypeScript typecheck：通过。
+7. Web Vite 生产构建：通过。
+8. 真实 SearXNG 冒烟：3 次原始上游尝试返回 6 条候选；1 次完全健康响应、2 次含部分失效但仍有 2 次有效候选响应，证明中英文路由和新健康口径已进入实际链路。
+9. API 与 Worker 已重启；/readyz 返回 ready，PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 四项均为 ready；Celery worker 已连接 Redis 并进入 ready。
+
+五、效果预期与边界
+------------------
+
+1. 本修复直接消除“8 个问题各 3 次首轮即耗尽 24 次请求”的确定性预算饥饿，P1 和交叉验证查询现在拥有真实执行空间。
+2. 覆盖率提升来自更高的有效候选率、P1 双页首轮和预算耗尽后的缓存排空，而不只是简单放大调用次数。
+3. 精度提升来自来源角色排序、独立来源排除/惩罚、正确的来源所有者归一，以及高风险双来源闭环。
+4. 外部搜索引擎仍可能 CAPTCHA、429 或超时；修复目标是快速绕开、度量并保留预算，而不是宣称能消除第三方故障。
+5. 未自动发起新的完整 LLM 研究任务，以避免未经确认消耗已配置模型账号和写入一条新的业务研究记录；搜索、数据库、调度、类型、构建和服务链路均已完成验证。
+
+六、修改文件
+------------
+
+apps/api/app/domain/adaptive_scheduler.py
+apps/api/app/domain/performance.py
+apps/api/app/domain/source_policy.py
+apps/api/app/infrastructure/db/research_tools.py
+apps/api/app/services/research_loop.py
+apps/api/app/services/research_runs.py
+apps/api/app/tools/web_search.py
+apps/web/src/App.tsx
+tests/unit/test_adaptive_scheduler.py
+tests/unit/test_research_loop.py
+tests/unit/test_research_runs.py
+tests/unit/test_source_policy.py
+tests/unit/test_web_search.py
+
+七、后续运行回归与第二轮修复（2026-09-13）
+------------------------------------------
+
+用户提供的新运行截图对应运行 ID：01a09b20-07d0-73a3-be83-41a6016c4be9。
+
+该运行已经证明前一轮版本确实进入页面和后端：上游预算显示 24/48、逻辑查询 13/14、页面抓取 15、接受证据 6、有效响应 8；相比基线覆盖度从 16% 提升到 21%。但最终仍为 P1 0%、交叉验证 0%。
+
+进一步审计发现：
+
+1. q1/q3 在保护页面预算分支中反复获得优先级，未执行首轮的 q8 一直没有搜索机会；因此 all_first_passes_complete 永远为假，q3/q4 的追加 Token 借用被 first_pass_floor_protected 拒绝。
+2. 研究节点在 14:18:52 已经完成并进入 no_pending_question，但 Worker 没有续租；14:23:54 被 reconciler 判定为 stale_worker_lease_recovered，恢复后剩余时间不足，报告以 deadline_exhausted 结束。这是运行时租约问题，不是网页显示问题。
+3. 英文 alternate_query 在非 scope family 中仍可能混入中文验收标准，削弱学术搜索召回。
+
+第二轮已完成的修复：
+
+1. 保护页面预算分支保留 attempts==0 的首轮公平轴，保证 q8 等未尝试问题先完成首轮，随后才允许 P1 变体和 Token 借用。
+2. ResearchRunRepository 新增 renew_execution_lease；Celery Worker 在 LangGraph、Checkpoint 和 Writer 整体执行期间每 60 秒续租，避免长边界被误判为死任务。
+3. alternate_query 按实际 alternate hint 的语言选择后缀；中英文不一致时移除中文验收标准，保证学术请求保持英文语义。
+4. 新增首轮公平排序和英文查询纯度测试；Ruff、Mypy、单元测试均已通过。
+
+八、第二轮后的容量调整
+----------------------
+
+1. Standard 从 14 个逻辑查询/48 次 provider 尝试/14 个抽取页面调整为 20/60/18；目标是容纳 8 个问题首轮和 P1 补证，而不是让少数零结果问题耗尽全部补证机会。
+2. 即使设置了 SEARXNG_PREFERRED_ENGINES，学术索引仍固定排在首位；配置的 360search/bing 作为普通综合搜索单次尝试，避免首轮再次被普通引擎抢走学术检索机会。
+
+九、严格修改验收与第三轮修复（2026-09-14）
+--------------------------------------------
+
+本轮不以“代码可以运行”为验收结论，而是逐项检查预算可达性、候选调度、低信息增益反馈、P1 恢复、交叉验证和停止条件是否形成闭环。发现并修复以下确定性漏洞：
+
+1. 零产出 P1 可能先开启 P1 专用通道，随后又被零产出过滤器移除，造成其他候选也被专用通道挡住，最终出现“仍有预算但无可调度目标”。现已统一候选资格判断，零产出问题不再制造空通道。
+2. 连续两个查询族零产出的目标曾被永久排除，这会让 q2/q4 无法尝试第三个 alternate/英文查询族并固化 0% 覆盖率。现改为降级排队：先让位给未尝试、已有产出和交叉验证目标，但预算仍有剩余时允许恢复。
+3. low_information_gain_streak_by_question 缺少当前问题键时会回退到上一问题的全局 streak，导致 q1 的低增益污染首次执行的 q2。现仅对完全没有分问题账本的旧快照使用兼容回退；新问题从 0 开始。
+4. P1 连续两次低增益后，问题 Token 借用策略会直接冻结目标，即使仍有未尝试查询族。现允许存在高风险缺口的 P1 使用一个尚未执行的恢复查询族；查询族真正耗尽后仍按低增益策略冻结。
+5. 已冻结或预算耗尽且从未执行的问题曾被 has_unattempted_question 计入，可能永久关闭 P1 恢复通道。现复用资格感知的未尝试计数，只统计当前确实可执行的目标。
+6. alternate family 选择英文 hint 后仍可能追加中文 criterion/后缀，产生中英混杂查询。现查询语言、criterion 和 family 后缀统一跟随实际选中的 hint。
+7. Standard 扩容后出现 Deep 的逻辑查询数反而更低，以及 Quick 的迭代数小于逻辑查询数两类预算倒挂。现统一为：Quick 8 轮/6 查询/18 provider；Standard 32/28/84；Deep 44/36/108。页面、抽取和调度动作上限继续保持档位单调。
+
+严格验收结果：
+
+1. 针对性调度、预算、查询与低增益回归测试全部通过。
+2. 全部常规 pytest 通过；7 个 PostgreSQL 用例在常规模式下按设计跳过。
+3. 使用 deep_research_acceptance_20260914 与 deep_research_acceptance_checkpoint_20260914 两个隔离临时库执行 PostgreSQL/Checkpoint 集成测试，7/7 通过；验收后两个临时库均已删除，未接触业务库。
+4. Ruff apps/api tests 全部通过。
+5. Mypy apps/api 共 139 个源文件通过，无类型错误。
+6. Web TypeScript typecheck 与 Vite 生产构建通过。
+7. git diff --check 通过。
+8. API、Worker、Dispatcher、Beat 已重启；/readyz 的 PostgreSQL、Checkpoint PostgreSQL、Redis、SearXNG 四项均为 ready。
+9. 运行进程实测加载的预算为 Quick=(8,6,18)、Standard=(32,28,84)、Deep=(44,36,108)；英文 alternate 查询不再混入中文词。
+
+剩余边界：上述验收证明确定性逻辑、持久化和运行时加载闭环已经成立，但最终覆盖率仍受真实搜索引擎返回、目标主题可检索性和模型证据判定影响。旧运行快照不会被回写；必须新建研究运行才能比较修复后的覆盖率、P1 最低覆盖度、交叉验证和最近 8 轮信息增益。

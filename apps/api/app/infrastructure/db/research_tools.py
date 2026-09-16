@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TypedDict, cast
@@ -54,7 +54,7 @@ from app.domain.research_budget import (
     model_token_pool_limits,
 )
 from app.domain.research_management import ResearchFactCounts, calculate_information_gain
-from app.domain.research_runs import RunPhase, RunStatus
+from app.domain.research_runs import EXECUTION_LEASE_SECONDS, RunPhase, RunStatus
 from app.domain.research_tools import (
     EvidenceView,
     ReadPage,
@@ -117,7 +117,12 @@ class ResearchLeaseLostError(RuntimeError):
 # counter) decide when research is terminal.
 # Four explicit QueryFamily actions replace the old implicit suffix cycle.
 _MAX_GAP_ATTEMPTS = 4
-_MAX_REPLANS = 8
+# Allow several genuinely different gap-resolution passes.  Query hashes remain
+# run-scoped, so this is bounded retry headroom rather than permission to replay
+# the same search.  Eight passes was too small once a polluted hint consumed a
+# family; after hint compaction, twelve gives both P1 corroboration and vendor
+# product gaps a fair recovery window.
+_MAX_REPLANS = 12
 _LOW_INFORMATION_GAIN_THRESHOLD = 0.10
 _LOW_INFORMATION_GAIN_STREAK_TO_STOP = 2
 _MAX_EVIDENCE_MODEL_CALL_TOKENS = 12_000
@@ -132,6 +137,20 @@ _MAX_REPORT_WRITER_RESERVE_TOKENS = 15_000
 # cap prevents one empty/unstable query from consuming the entire run-wide
 # provider pool before untouched questions receive their first search.
 _MAX_PROVIDER_REQUESTS_PER_QUERY = 3
+_GLOBAL_TRIAGE_FAILURE_REASONS = frozenset(
+    {
+        "body_too_short",
+        "login_or_navigation_page",
+        "prompt_injection_detected",
+    }
+)
+_NON_DETERMINISTIC_PAGE_FAILURE_SUFFIXES = (
+    "_DNS_FAILED",
+    "_NETWORK_ERROR",
+    "_PROVIDER_UNAVAILABLE",
+    "_TIMEOUT",
+)
+_FAILED_OWNER_EXCLUSION_THRESHOLD = 2
 _NON_CONSUMING_ITERATION_OUTCOMES = frozenset(
     {
         "yield_question",
@@ -145,6 +164,20 @@ _NON_CONSUMING_ITERATION_OUTCOMES = frozenset(
         "budget_exhausted",
     }
 )
+_SEARCH_ACQUISITION_BUDGET_REASONS = frozenset(
+    {
+        "search_budget_exhausted",
+        "logical_query_budget_exhausted",
+        "provider_request_budget_exhausted",
+        "page_fetch_attempt_budget_exhausted",
+    }
+)
+
+
+def _search_acquisition_budget_exhausted(reason: str | None) -> bool:
+    """Return whether new searches are blocked while cached work may continue."""
+
+    return reason in _SEARCH_ACQUISITION_BUDGET_REASONS
 
 
 def _fair_provider_request_allowance(
@@ -165,6 +198,57 @@ def _fair_provider_request_allowance(
         else remaining
     )
     return min(remaining, max(1, int(per_query_cap)), fair_share)
+
+
+def _source_failure_feedback(
+    events: Iterable[tuple[str, Mapping[str, object]]],
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Return run-wide failed URLs and repeatedly unusable source owners.
+
+    A URL that already failed reading should not consume another page slot in
+    the same run.  Domain-level exclusion is deliberately more conservative:
+    only deterministic failures count and an owner must fail twice before it
+    is removed from later search results.  Topic mismatch remains
+    question-local because the same page may answer another plan item.
+    """
+
+    failed_urls: set[str] = set()
+    deterministic_owner_failures: dict[str, int] = {}
+    for event_type, refs in events:
+        primary_url = refs.get("url")
+        if not isinstance(primary_url, str) or not primary_url.strip():
+            continue
+        if event_type == "source.triage_rejected":
+            reason = str(refs.get("reason") or "")
+            if reason not in _GLOBAL_TRIAGE_FAILURE_REASONS:
+                continue
+            deterministic = True
+        elif event_type == "source.rejected":
+            error_code = str(refs.get("error_code") or "")
+            deterministic = not error_code.endswith(
+                _NON_DETERMINISTIC_PAGE_FAILURE_SUFFIXES
+            )
+        else:
+            continue
+        failed_urls.add(normalize_source_url(primary_url))
+        requested_url = refs.get("requested_url")
+        if isinstance(requested_url, str) and requested_url.strip():
+            failed_urls.add(normalize_source_url(requested_url))
+        if not deterministic:
+            continue
+        owner = source_owner_key(primary_url)
+        if owner != "unknown":
+            deterministic_owner_failures[owner] = (
+                deterministic_owner_failures.get(owner, 0) + 1
+            )
+    excluded_owners = tuple(
+        sorted(
+            owner
+            for owner, count in deterministic_owner_failures.items()
+            if count >= _FAILED_OWNER_EXCLUSION_THRESHOLD
+        )
+    )
+    return frozenset(failed_urls), excluded_owners
 
 
 def _research_attempt_consumes_iteration(
@@ -191,10 +275,14 @@ class ResearchTarget:
     gap_id: UUID
     tool_call_id: UUID
     source_id_seed: UUID
+    alternate_query: str = ""
+    priority: int = 2
     attempt_index: int = 0
     gap_attempt_index: int = 0
     acceptance_dimensions: tuple[tuple[str, str], ...] = ()
     used_source_owner_keys: tuple[str, ...] = ()
+    search_excluded_owner_keys: tuple[str, ...] = ()
+    search_excluded_urls: tuple[str, ...] = ()
     reusable_results: tuple[SearchResult, ...] = ()
     reusable_pages: tuple[ReusablePageRef, ...] = ()
     first_pass: bool = False
@@ -489,8 +577,15 @@ class ResearchToolRepository:
             )
             usage = dict(run.usage_snapshot)
             committed = max(0, _as_int(usage.get("pages_fetched", usage.get("pages", 0))))
+            committed_attempts = max(
+                0, _as_int(usage.get("page_fetch_attempts", committed))
+            )
             reserved = max(0, _as_int(usage.get("page_slots_reserved", 0)))
             remaining = max(0, maximum - committed - reserved)
+            attempt_maximum = int(
+                run.budget_snapshot.get("max_page_fetch_attempts", maximum) or maximum
+            )
+            attempt_remaining = max(0, attempt_maximum - committed_attempts - reserved)
             # A fresh search has already been counted by record_search_results
             # before this reservation is requested. Keep one page slot for
             # every still-available fresh search, so the page budget cannot
@@ -501,7 +596,7 @@ class ResearchToolRepository:
                 max(0, maximum_searches - used_searches) if fresh_search else 0
             )
             current_search_capacity = max(0, remaining - remaining_fresh_searches)
-            granted = min(requested, current_search_capacity)
+            granted = min(requested, current_search_capacity, attempt_remaining)
             if granted:
                 usage["page_slots_reserved"] = reserved + granted
                 owners_raw = usage.get("page_slots_reserved_by_worker", {})
@@ -614,6 +709,7 @@ class ResearchToolRepository:
         score: float,
         reason: str,
         source_role: str,
+        requested_url: str | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -645,6 +741,11 @@ class ResearchToolRepository:
                 refs={
                     "question_id": target.question_id,
                     "url": url[:1000],
+                    **(
+                        {"requested_url": requested_url[:1000]}
+                        if requested_url and requested_url != url
+                        else {}
+                    ),
                     "reason": reason[:100],
                     "source_role": source_role[:50],
                 },
@@ -897,6 +998,17 @@ class ResearchToolRepository:
                             target_tokens=question_limit,
                             expected_utility=utility,
                             low_gain_streak=low_streak,
+                            has_untried_query_family=(
+                                len(
+                                    _executed_query_families(
+                                        run.usage_snapshot,
+                                        question_id,
+                                    )
+                                )
+                                < _query_strategy_limit(
+                                    current_item.question if current_item is not None else ""
+                                )
+                            ),
                         )
                         if not borrow_decision.allowed:
                             usage = dict(run.usage_snapshot)
@@ -1282,6 +1394,11 @@ class ResearchToolRepository:
                 and risk.get("unresolved_high_risk")
             )
             hard_limit = int(target * 1.5)
+            # High-risk P1 recovery may cross the normal 150% envelope only
+            # within the same bounded two-target ceiling enforced by
+            # decide_question_borrow().  Never render an exception as an
+            # unlimited borrowing state in the dashboard.
+            recovery_limit = int(target * 2.0)
             result[key] = {
                 "floor_tokens": floor,
                 "target_tokens": target,
@@ -1294,10 +1411,13 @@ class ResearchToolRepository:
                 "borrowed_tokens": max(0, projected - target),
                 "remaining_to_target_tokens": max(0, target - projected),
                 "remaining_to_hard_limit_tokens": max(0, hard_limit - projected),
+                "recovery_limit_tokens": recovery_limit,
+                "remaining_to_recovery_limit_tokens": max(0, recovery_limit - projected),
                 "p1_high_risk_exception": p1_exception,
                 "status": (
                     "hard_exhausted"
-                    if hard_limit > 0 and projected >= hard_limit and not p1_exception
+                    if recovery_limit > 0 and projected >= recovery_limit
+                    or hard_limit > 0 and projected >= hard_limit and not p1_exception
                     else "borrowing"
                     if projected > target
                     else "target_exhausted"
@@ -1355,11 +1475,9 @@ class ResearchToolRepository:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             budget_stop_reason = _budget_exhaustion_reason(run)
-            search_budget_exhausted = budget_stop_reason in {
-                "search_budget_exhausted",
-                "logical_query_budget_exhausted",
-                "provider_request_budget_exhausted",
-            }
+            search_budget_exhausted = _search_acquisition_budget_exhausted(
+                budget_stop_reason
+            )
             if budget_stop_reason is not None and not search_budget_exhausted:
                 await self._enter_writing(
                     session,
@@ -1400,6 +1518,33 @@ class ResearchToolRepository:
                 if isinstance(raw_quality_repair_targets, dict)
                 else {}
             )
+            # Recompute corroboration targets from the live dimension map as
+            # well.  The persisted quality-repair projection can lag one
+            # extraction behind (especially across a replan), which otherwise
+            # lets zero-yield P1 retries outrank claims that already need a
+            # second independent source.
+            corroboration_targets: set[str] = set(quality_repair_targets)
+            accepted_by_question: dict[str, int] = {}
+            for entry in coverage_entries:
+                if not isinstance(entry, dict):
+                    continue
+                question_id = str(entry.get("dimension_key", ""))
+                if not question_id:
+                    continue
+                accepted_by_question[question_id] = _as_int(
+                    entry.get("accepted_evidence", 0)
+                )
+                statuses = entry.get("requirement_statuses", [])
+                if not isinstance(statuses, list):
+                    continue
+                if any(
+                    isinstance(status, dict)
+                    and _as_int(status.get("accepted_evidence", 0)) > 0
+                    and _as_int(status.get("independent_sources", 0))
+                    < max(1, _as_int(status.get("required_sources", 1)))
+                    for status in statuses
+                ):
+                    corroboration_targets.add(question_id)
             # Keep a small tail of the page budget available for unresolved
             # priority-one dimensions and quality-gate repair. Without this,
             # low-priority questions can consume every page before source
@@ -1445,10 +1590,13 @@ class ResearchToolRepository:
                     candidate.status == "partial"
                     and coverage_by_question.get(candidate.question_id, 0.0) >= 1.0
                     and candidate.question_id not in quality_repair_targets
+                    and candidate.question_id not in corroboration_targets
                 ):
                     # Repair stale state produced by the former global-anchor
                     # policy. A complete question without an actionable gate
-                    # dimension is terminal for this plan version.
+                    # dimension is terminal for this plan version.  A question
+                    # that still needs an independent source is actionable even
+                    # when its coverage score has reached 1.0.
                     candidate.status = "researched"
             historical_attempts = {
                 question_id: int(attempts)
@@ -1487,6 +1635,22 @@ class ResearchToolRepository:
                 )
                 for candidate in candidates
             }
+            zero_yield_deprioritized_questions = {
+                candidate.question_id
+                for candidate in candidates
+                if _zero_yield_retry_deprioritized(
+                    search_budget_exhausted=search_budget_exhausted,
+                    attempts=executed_family_attempts.get(
+                        candidate.question_id,
+                        historical_attempts.get(candidate.question_id, 0),
+                    ),
+                    coverage=coverage_by_question.get(candidate.question_id, 0.0),
+                    accepted_evidence=accepted_by_question.get(candidate.question_id, 0),
+                    is_corroboration_target=(
+                        candidate.question_id in corroboration_targets
+                    ),
+                )
+            }
             unattempted_questions = sum(
                 1
                 for candidate in candidates
@@ -1501,6 +1665,11 @@ class ResearchToolRepository:
                     candidate.question_id in exhausted_questions
                     or candidate.question_id in strategy_exhausted_questions
                     or candidate.question_id in frozen_questions
+                    or (
+                        candidate.question_id in zero_yield_deprioritized_questions
+                        and candidate.priority != 1
+                        and candidate.question_id not in corroboration_targets
+                    )
                     or candidate.status == "researched"
                     or (
                         search_budget_exhausted and candidate.question_id not in cached_question_ids
@@ -1512,7 +1681,12 @@ class ResearchToolRepository:
                     historical_attempts.get(candidate.question_id, 0),
                 )
                 candidate_coverage = coverage_by_question.get(candidate.question_id, 0.0)
-                if candidate.priority == 1 and candidate_coverage < 1.0 and attempts < 3:
+                if (
+                    candidate.priority == 1 or candidate.question_id in corroboration_targets
+                ) and candidate_coverage < 1.0 and _query_family_capacity_remaining(
+                    question=candidate.question,
+                    attempted_families=attempts,
+                ):
                     unfinished_p1_variants.append(candidate.question_id)
             p1_variant_mode = bool(unfinished_p1_variants)
             # A P1 variant must not starve the first pass of other questions.
@@ -1521,10 +1695,10 @@ class ResearchToolRepository:
             # the scheduler boundary as well. Once every question has had a
             # first attempt, unresolved P1 items regain the protected variant
             # lane and can receive their bounded follow-up searches.
-            has_unattempted_question = any(
-                (executed_family_attempts.get(candidate.question_id, 0) == 0)
-                for candidate in candidates
-            )
+            # Reuse the eligibility-aware count above. A frozen or exhausted
+            # question with zero attempts must not keep the P1 recovery lane
+            # disabled for the rest of the run.
+            has_unattempted_question = unattempted_questions > 0
             p1_variant_mode = p1_variant_mode and not has_unattempted_question
             for candidate in candidates:
                 if (
@@ -1543,8 +1717,8 @@ class ResearchToolRepository:
                 )
                 candidate_coverage = coverage_by_question.get(candidate.question_id, 0.0)
                 if p1_variant_mode and candidate.question_id not in unfinished_p1_variants:
-                    # Give every unfinished P1 three distinct query variants
-                    # before ordinary P2/P3 work can compete for pages.
+                # Give every unfinished P1 every bounded query family
+                # before ordinary P2/P3 work can compete for pages.
                     continue
                 effective_priority = candidate.priority
                 if protected_page_mode and candidate.priority > 1 and candidate_coverage >= 1.0:
@@ -1578,9 +1752,24 @@ class ResearchToolRepository:
                         provider_requests=1,
                     ),
                 )
+                utility_rank = -int(utility * 1_000_000)
+                if attempts > 0 and candidate.question_id in corroboration_targets:
+                    # Corroboration is a quality-gate action, not an ordinary
+                    # retry. Give it a dedicated lane and rotate by attempt
+                    # count so one already-covered P1 cannot monopolize it.
+                    utility_rank = -1_000_000_000 + attempts * 1_000_000 - int(
+                        utility * 1_000
+                    )
+                elif attempts > 0 and candidate_coverage > 0.0:
+                    utility_rank -= 500_000_000
+                elif candidate.question_id in zero_yield_deprioritized_questions:
+                    # Two empty families should yield to untouched and
+                    # productive work, but must remain recoverable: the third
+                    # alternate-language family may be the first useful one.
+                    utility_rank += 500_000_000
                 schedule_key = (
                     0 if attempts == 0 else 1,
-                    0 if attempts == 0 else -int(utility * 1_000_000),
+                    0 if attempts == 0 else utility_rank,
                     candidate_coverage,
                     effective_priority,
                     candidate.question_id,
@@ -1596,16 +1785,29 @@ class ResearchToolRepository:
                         # Once the reserve zone is reached, do not spend its
                         # slots on already-covered ordinary P2/P3 questions.
                         continue
-                    # The ordinary round-robin key gives an untouched P2
-                    # item precedence over a retried unresolved P1 because it
-                    # sorts by attempt count first. In the reserve tail,
-                    # explicitly move protected work ahead of that axis.
-                    schedule_key = (
-                        0,
-                        0,
-                        candidate_coverage,
-                        effective_priority,
-                        candidate.question_id,
+                if p1_variant_mode:
+                    # The P1 gate is a minimum across all P1 questions.  An
+                    # already productive 50% item must therefore not outrank
+                    # a 0% P1 merely because its next extraction is likelier
+                    # to succeed.  Lowest coverage wins; attempts only rotate
+                    # candidates tied at the same coverage.
+                    schedule_key = _p1_variant_schedule_key(
+                        attempts=attempts,
+                        coverage=candidate_coverage,
+                        priority=effective_priority,
+                        question_id=candidate.question_id,
+                    )
+                elif protected_page_mode:
+                    # Keep the first-pass fairness axis even in the protected
+                    # tail. Without it, an unresolved P1 could repeatedly win
+                    # by priority and prevent untouched questions from ever
+                    # completing their first pass; the borrow gate would then
+                    # remain closed forever for every follow-up attempt.
+                    schedule_key = _protected_page_schedule_key(
+                        attempts=attempts,
+                        coverage=candidate_coverage,
+                        priority=effective_priority,
+                        question_id=candidate.question_id,
                     )
                 eligible.append(
                     (
@@ -1617,6 +1819,29 @@ class ResearchToolRepository:
             if selected_entry is None:
                 quality_snapshot = cast(dict[str, object], run.quality_snapshot or {})
                 quality_met = _quality_gate_met_from_snapshot(quality_snapshot)
+                unresolved_gap_count = _as_int(quality_snapshot.get("unresolved_gap_count", 0))
+                replans_used = _as_int(run.usage_snapshot.get("replans", 0))
+                if (
+                    not search_budget_exhausted
+                    and not quality_met
+                    and unresolved_gap_count > 0
+                    and replans_used < _MAX_REPLANS
+                ):
+                    # No currently eligible candidate is not equivalent to
+                    # source exhaustion: frozen/strategy-exhausted questions
+                    # may still be recoverable through a targeted REPLAN.
+                    usage = dict(run.usage_snapshot)
+                    usage["replan_requested"] = True
+                    run.usage_snapshot = _usage_with_resource_pools(run, usage)
+                    run.phase = RunPhase.RESEARCHING.value
+                    await self._append_event(
+                        session,
+                        run,
+                        event_type="research.replan_requested",
+                        public_summary="当前候选均不可执行但仍有开放验收缺口; 转入定向 REPLAN。",
+                        refs={"unresolved_gap_count": unresolved_gap_count},
+                    )
+                    return None
                 stop_reason = (
                     budget_stop_reason or "logical_query_budget_exhausted"
                     if search_budget_exhausted
@@ -1697,27 +1922,24 @@ class ResearchToolRepository:
                 None,
             )
             unmet_criterion: str | None = None
+            unmet_dimension_key: str | None = None
             repair_reasons = quality_repair_targets.get(question.question_id, [])
             if current_coverage is not None:
                 requirement_statuses = current_coverage.get("requirement_statuses", [])
                 if isinstance(requirement_statuses, list):
-                    unmet_criterion = next(
-                        (
-                            str(status.get("criterion"))
-                            for status in requirement_statuses
-                            if isinstance(status, dict)
-                            and float(status.get("coverage", 0.0) or 0.0) < 1.0
-                            and status.get("criterion")
-                        ),
-                        None,
-                    )
+                    unmet = _select_unmet_requirement(requirement_statuses)
+                    if unmet is not None:
+                        unmet_dimension_key, unmet_criterion = unmet
                     if unmet_criterion is None and repair_reasons:
                         repair_dimensions = {
                             reason.split(":", 1)[1] for reason in repair_reasons if ":" in reason
                         }
-                        unmet_criterion = next(
+                        repair_target = next(
                             (
-                                str(status.get("criterion"))
+                                (
+                                    str(status.get("dimension_key")),
+                                    str(status.get("criterion")),
+                                )
                                 for status in requirement_statuses
                                 if isinstance(status, dict)
                                 and str(status.get("dimension_key")) in repair_dimensions
@@ -1725,6 +1947,8 @@ class ResearchToolRepository:
                             ),
                             None,
                         )
+                        if repair_target is not None:
+                            unmet_dimension_key, unmet_criterion = repair_target
             executed_query_hashes = set(
                 (
                     await session.scalars(
@@ -1738,19 +1962,33 @@ class ResearchToolRepository:
             )
             query = ""
             query_family: QueryFamily | None = None
-            prefer_authoritative = any(
-                reason.startswith("source_quality:") for reason in repair_reasons
+            prefer_authoritative = (
+                any(reason.startswith("source_quality:") for reason in repair_reasons)
+                or question.question_id in corroboration_targets
             )
             family_order = _query_family_order(prefer_authoritative=prefer_authoritative)
             for family in family_order:
-                if family.value in executed_families:
-                    continue
+                # A replan may deliberately keep the same query family while
+                # changing the gap-specific search hint.  Treating the family
+                # itself as exhausted made every replan a no-op: all four
+                # families had already been used by the parent plan, so the
+                # new hints were never materialized into a query.  Duplicate
+                # protection is query-hash scoped below, which still prevents
+                # replaying an identical successful query while allowing a
+                # genuinely new angle in the same family.
                 candidate_query = build_family_query(
                     question=question.question,
                     criterion=(unmet_criterion or "").strip(),
                     hints=tuple(str(value) for value in question.search_hints),
                     family=family,
                 )
+                if unmet_criterion and family is not QueryFamily.SCOPE:
+                    candidate_query = " ".join(
+                        (
+                            candidate_query,
+                            _source_hint_for_requirement(unmet_criterion),
+                        )
+                    )[:400]
                 candidate_hash = hashlib.sha256(
                     normalize_search_query(candidate_query).encode()
                 ).hexdigest()
@@ -1793,6 +2031,15 @@ class ResearchToolRepository:
             normalized_query = normalize_search_query(query)
             if query_family is None:  # pragma: no cover - guarded by ``query`` above
                 query_family = query_family_for_attempt(attempt_index) or QueryFamily.SCOPE
+            alternate_query = build_family_query(
+                question=question.question,
+                criterion=(unmet_criterion or "").strip(),
+                hints=tuple(str(value) for value in question.search_hints),
+                family=query_family,
+                prefer_alternate_hint=True,
+            )
+            if normalize_search_query(alternate_query) == normalized_query:
+                alternate_query = ""
             # Query idempotency is run-scoped, not plan-version-scoped. A
             # replan may change the search angle, but it must never authorize
             # replaying a query that already succeeded in an older plan.
@@ -1817,6 +2064,7 @@ class ResearchToolRepository:
                     status="running",
                     arguments={
                         "query": query,
+                        "alternate_query": alternate_query,
                         "limit": 10,
                         "query_family": query_family.value,
                     },
@@ -1834,6 +2082,7 @@ class ResearchToolRepository:
                 tool_call.arguments = {
                     **(tool_call.arguments or {}),
                     "query": query,
+                    "alternate_query": alternate_query,
                     "query_family": query_family.value,
                 }
             if created_gap:
@@ -1940,19 +2189,21 @@ class ResearchToolRepository:
                 if cross_question_rows:
                     query_already_executed = True
                     reusable_rows = [*reusable_rows, *cross_question_rows]
-            rejected_urls = {
-                str(refs.get("url"))
-                for refs in (
-                    await session.scalars(
-                        select(AgentEventRow.refs).where(
-                            AgentEventRow.run_id == run_id,
-                            AgentEventRow.event_type == "source.rejected",
-                            AgentEventRow.refs["question_id"].as_string() == question.question_id,
-                        )
+            failure_event_rows = (
+                await session.execute(
+                    select(AgentEventRow.event_type, AgentEventRow.refs).where(
+                        AgentEventRow.run_id == run_id,
+                        AgentEventRow.event_type.in_(
+                            ("source.rejected", "source.triage_rejected")
+                        ),
                     )
-                ).all()
-                if isinstance(refs, dict) and refs.get("url")
-            }
+                )
+            ).all()
+            rejected_urls, failed_owner_keys = _source_failure_feedback(
+                (event_type, refs)
+                for event_type, refs in failure_event_rows
+                if isinstance(refs, dict)
+            )
             reusable_results = tuple(
                 SearchResult(
                     title=row.title,
@@ -1964,8 +2215,7 @@ class ResearchToolRepository:
                 for row in reusable_rows
                 if (
                     normalize_source_url(row.url) not in read_urls
-                    and normalize_source_url(row.url)
-                    not in {normalize_source_url(url) for url in rejected_urls}
+                    and normalize_source_url(row.url) not in rejected_urls
                 )
             )
             source_searched_for_question = exists(
@@ -2069,9 +2319,15 @@ class ResearchToolRepository:
                 remaining_provider_requests,
                 unattempted_questions,
             )
-            dimensions = tuple(
+            all_dimensions = tuple(
                 (f"{question.question_id}:d{index}", str(criterion))
                 for index, criterion in enumerate(question.evidence_requirements, start=1)
+            )
+            dimensions = tuple(
+                sorted(
+                    all_dimensions,
+                    key=lambda item: (item[0] != unmet_dimension_key, item[0]),
+                )
             )
             return ResearchTarget(
                 plan_version=run.plan_version,
@@ -2081,12 +2337,18 @@ class ResearchToolRepository:
                 gap_id=gap.id,
                 tool_call_id=tool_call.id,
                 source_id_seed=uuid7(),
+                alternate_query=alternate_query,
+                priority=question.priority,
                 attempt_index=attempt_index,
                 gap_attempt_index=gap.resolution_attempts,
                 first_pass=not executed_families
                 and len(eligible) > 1,
                 acceptance_dimensions=dimensions,
                 used_source_owner_keys=used_owner_keys,
+                search_excluded_owner_keys=tuple(
+                    sorted(set(used_owner_keys) | set(failed_owner_keys))
+                ),
+                search_excluded_urls=tuple(sorted(rejected_urls)),
                 reusable_results=reusable_results,
                 reusable_pages=reusable_pages,
                 query_already_executed=query_already_executed,
@@ -2124,6 +2386,31 @@ class ResearchToolRepository:
                 ),
             )
 
+    async def research_phase_active(
+        self, run_id: UUID, *, worker_task_id: str
+    ) -> bool:
+        """Return whether an empty scheduler pass should advance, not write.
+
+        ``prepare_target`` can retire one query-exhausted question without
+        selecting another target in the same transaction. In that case the
+        durable run is still researching and the graph must take another
+        scheduler step. Budget/source exhaustion paths enter writing before
+        returning ``None``.
+        """
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            return RunPhase(run.phase) == RunPhase.RESEARCHING
+
+    async def replan_requested(
+        self, run_id: UUID, *, worker_task_id: str
+    ) -> bool:
+        """Return whether the scheduler requested a gap-repair replan."""
+
+        async with self._sessions() as session:
+            run = await self._locked_run(session, run_id, worker_task_id)
+            return bool(run.usage_snapshot.get("replan_requested"))
+
     async def record_search_results(
         self,
         run_id: UUID,
@@ -2135,6 +2422,9 @@ class ResearchToolRepository:
         provider_requests: int = 0,
         provider_timeouts: int = 0,
         provider_fallbacks: int = 0,
+        provider_healthy: int = 0,
+        provider_unresponsive: int = 0,
+        provider_productive: int = 0,
         latency_ms: int = 0,
     ) -> None:
         async with self._sessions() as session, session.begin():
@@ -2188,6 +2478,12 @@ class ResearchToolRepository:
                 usage["search_provider_requests"] = _as_int(
                     usage.get("search_provider_requests", 0)
                 ) + max(0, provider_requests)
+                _update_provider_health_usage(
+                    usage,
+                    healthy=provider_healthy,
+                    unresponsive=provider_unresponsive,
+                    productive=provider_productive,
+                )
                 _update_query_family_usage(
                     usage,
                     family=target.query_family,
@@ -2288,7 +2584,15 @@ class ResearchToolRepository:
             usage["search_provider_requests"] = _as_int(
                 usage.get("search_provider_requests", 0)
             ) + max(0, provider_requests)
-            if provider_requests > 0:
+            _update_provider_health_usage(
+                usage,
+                healthy=provider_healthy,
+                unresponsive=provider_unresponsive,
+                productive=provider_productive,
+            )
+            if provider_requests > 0 and (
+                provider_healthy > 0 or provider_productive > 0 or bool(results)
+            ):
                 _mark_query_family_executed(
                     usage,
                     question_id=target.question_id,
@@ -2321,6 +2625,9 @@ class ResearchToolRepository:
                     "provider_requests": provider_requests,
                     "timeouts": provider_timeouts,
                     "fallbacks": provider_fallbacks,
+                    "healthy_responses": provider_healthy,
+                    "unresponsive_responses": provider_unresponsive,
+                    "productive_responses": provider_productive,
                     "latency_ms": latency_ms,
                 },
             )
@@ -2337,6 +2644,9 @@ class ResearchToolRepository:
         provider_requests: int = 0,
         provider_timeouts: int = 0,
         provider_fallbacks: int = 0,
+        provider_healthy: int = 0,
+        provider_unresponsive: int = 0,
+        provider_productive: int = 0,
         latency_ms: int = 0,
     ) -> None:
         async with self._sessions() as session, session.begin():
@@ -2361,7 +2671,18 @@ class ResearchToolRepository:
             usage_snapshot["search_provider_requests"] = _as_int(
                 usage_snapshot.get("search_provider_requests", 0)
             ) + max(0, provider_requests)
-            if provider_requests > 0:
+            _update_provider_health_usage(
+                usage_snapshot,
+                healthy=provider_healthy,
+                unresponsive=provider_unresponsive,
+                productive=provider_productive,
+            )
+            # A transport-only failure must remain retryable.  Counting its
+            # family as executed would make the scheduler report source-space
+            # exhaustion even though no healthy provider response was seen.
+            if provider_requests > 0 and (
+                provider_healthy > 0 or provider_productive > 0
+            ):
                 _mark_query_family_executed(
                     usage_snapshot,
                     question_id=target.question_id,
@@ -3045,14 +3366,11 @@ class ResearchToolRepository:
             usage_snapshot["page_slots_reserved"] = max(
                 0, _as_int(usage_snapshot.get("page_slots_reserved", 0)) - settled
             )
-            # A failed HTTP attempt still consumed network capacity, latency,
-            # and one fetched-page reservation. Count it against the hard fetch
-            # budget even though it did not yield a readable page.
+            # A failed HTTP attempt consumes the separate attempt pool, but
+            # does not consume the successful-page evidence budget. This keeps
+            # transient 403/timeout failures from starving readable sources.
             usage_snapshot["page_fetch_attempts"] = (
                 _as_int(usage_snapshot.get("page_fetch_attempts", 0)) + 1
-            )
-            usage_snapshot["pages_fetched"] = (
-                _as_int(usage_snapshot.get("pages_fetched", usage_snapshot.get("pages", 0))) + 1
             )
             usage_snapshot["page_fetch_latency_ms"] = _as_int(
                 usage_snapshot.get("page_fetch_latency_ms", 0)
@@ -3218,11 +3536,23 @@ class ResearchToolRepository:
                 str(dimension_key): (int(evidence_count), int(owner_count))
                 for dimension_key, evidence_count, owner_count in target_dimension_counts
             }
+            target_claims = (
+                await session.scalars(
+                    select(ResearchClaimRow).where(
+                        ResearchClaimRow.run_id == run_id,
+                        ResearchClaimRow.question_id == target.question_id,
+                    )
+                )
+            ).all()
+            target_high_risk_dimension_keys = {
+                claim.dimension_key for claim in target_claims if _claim_is_high_risk(claim)
+            }
             requirements_met = _requirements_satisfied(
                 target.question_id,
                 [str(value) for value in (plan_item.evidence_requirements if plan_item else [])],
                 target_counts_by_dimension,
                 accepted_for_question=accepted_for_question,
+                high_risk_dimension_keys=target_high_risk_dimension_keys,
             )
             usage = dict(run.usage_snapshot)
             technical_failures = dict(usage.get("technical_failures_by_question", {}))
@@ -3351,6 +3681,14 @@ class ResearchToolRepository:
                     max_reliability,
                 ) in dimension_counts
             }
+            all_claims = (
+                await session.scalars(
+                    select(ResearchClaimRow).where(ResearchClaimRow.run_id == run_id)
+                )
+            ).all()
+            high_risk_dimension_keys = {
+                claim.dimension_key for claim in all_claims if _claim_is_high_risk(claim)
+            }
             coverage_map: list[_CoverageMapEntry] = []
             weighted_coverage = 0.0
             total_weight = 0.0
@@ -3374,7 +3712,12 @@ class ResearchToolRepository:
                             (0, 0, 0.0),
                         )
                     )
-                    required_sources = 2 if _requires_independent_sources(criterion) else 1
+                    required_sources = (
+                        2
+                        if _requires_independent_sources(criterion)
+                        or dimension_key in high_risk_dimension_keys
+                        else 1
+                    )
                     score = (
                         1.0
                         if dimension_evidence > 0 and dimension_sources >= required_sources
@@ -3511,6 +3854,7 @@ class ResearchToolRepository:
                 for item in plan_items
                 for index, criterion in enumerate(item.evidence_requirements, start=1)
                 if _requires_independent_sources(str(criterion))
+                or f"{item.question_id}:d{index}" in high_risk_dimension_keys
             ]
             corroborated_dimensions = sum(
                 1
@@ -3563,9 +3907,9 @@ class ResearchToolRepository:
                 if isinstance(previous_streaks_raw, dict)
                 else {}
             )
-            previous_low_gain_streak = previous_streaks.get(
+            previous_low_gain_streak = _question_low_gain_streak(
+                previous_quality,
                 target.question_id,
-                _as_int(previous_quality.get("low_information_gain_streak", 0)),
             )
             low_information_gain_streak = (
                 previous_low_gain_streak
@@ -3674,6 +4018,12 @@ class ResearchToolRepository:
                 if int(dimension["priority"]) == 1
             ]
             priority_one_coverage = min(priority_one_coverages) if priority_one_coverages else 0.0
+            priority_one_average_coverage = (
+                sum(priority_one_coverages) / len(priority_one_coverages)
+                if priority_one_coverages
+                else 0.0
+            )
+            priority_one_completed = sum(value >= 1.0 for value in priority_one_coverages)
             recent_distinct: list[dict[str, object]] = []
             for item in reversed(question_outcomes):
                 if not recent_distinct or recent_distinct[-1].get("family") != item.get("family"):
@@ -3686,6 +4036,10 @@ class ResearchToolRepository:
                 and len(recent_distinct) == 2
                 and all(_as_int(item.get("accepted_evidence", 0)) == 0 for item in recent_distinct)
                 and all(_as_float(item.get("utility", 0.0)) < 0.01 for item in recent_distinct)
+                and _query_space_exhausted_for_freeze(
+                    executed_families=executed_families,
+                    question=target.question,
+                )
             ):
                 frozen_raw = usage.get("frozen_questions", [])
                 frozen = list(frozen_raw) if isinstance(frozen_raw, list) else []
@@ -3770,11 +4124,6 @@ class ResearchToolRepository:
                 if freshness_scores
                 else 1.0
             )
-            all_claims = (
-                await session.scalars(
-                    select(ResearchClaimRow).where(ResearchClaimRow.run_id == run_id)
-                )
-            ).all()
             unresolved_claims = [
                 claim
                 for claim in all_claims
@@ -3967,6 +4316,9 @@ class ResearchToolRepository:
                 "source_quality": round(source_quality, 4),
                 "independent_source_count": owner_count,
                 "priority_one_coverage": round(priority_one_coverage, 4),
+                "priority_one_average_coverage": round(priority_one_average_coverage, 4),
+                "priority_one_completed": priority_one_completed,
+                "priority_one_total": len(priority_one_coverages),
                 "source_independence": round(owner_count / source_count, 4)
                 if source_count
                 else 0.0,
@@ -4189,12 +4541,22 @@ class ResearchToolRepository:
             if attempt_outcome == "deadline_exhausted":
                 decision = "stop_budget"
                 stop_reason = "deadline_exhausted"
-            elif budget_stop_reason is not None:
+            elif (
+                budget_stop_reason is not None
+                and not _search_acquisition_budget_exhausted(budget_stop_reason)
+            ):
                 decision = "stop_budget"
                 stop_reason = budget_stop_reason
             elif quality_met:
                 decision = "ready_to_write"
                 stop_reason = "quality_met"
+            elif _search_acquisition_budget_exhausted(budget_stop_reason):
+                # Search acquisition is exhausted, but already-discovered
+                # candidates and fetched artifacts may still yield evidence.
+                # prepare_target owns the cache-drain decision and enters
+                # writing only when no reusable work remains.
+                decision = "continue_cached"
+                stop_reason = None
             elif replan_needed:
                 decision = "replan"
                 stop_reason = None
@@ -4303,7 +4665,7 @@ class ResearchToolRepository:
                 run.status = RunStatus.RUNNING.value
                 run.phase = RunPhase.RESEARCHING.value
                 run.termination_reason = None
-                run.lease_until = now + timedelta(seconds=300)
+                run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
                 await self._append_event(
                     session,
                     run,
@@ -4333,7 +4695,7 @@ class ResearchToolRepository:
             run.status = RunStatus.RUNNING.value
             run.phase = RunPhase.WRITING.value
             run.termination_reason = stop_reason
-            run.lease_until = now + timedelta(seconds=300)
+            run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
             await self._append_event(
                 session,
                 run,
@@ -4346,7 +4708,7 @@ class ResearchToolRepository:
                         if stop_reason == "stagnation"
                         else (
                             "计划已遍历但仍有未满足的验收条件; 使用现有证据生成带限制报告。"
-                            if stop_reason == "sources_exhausted"
+                            if stop_reason in {"sources_exhausted", "source_space_exhausted"}
                             else "全部质量门已满足; 自动进入报告写作。"
                         )
                     )
@@ -4591,7 +4953,7 @@ class ResearchToolRepository:
         run.status = RunStatus.RUNNING.value
         run.phase = RunPhase.WRITING.value
         run.termination_reason = reason
-        run.lease_until = now + timedelta(seconds=300)
+        run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
         run.updated_at = now
         run.state_version += 1
         await self._append_event(
@@ -4791,6 +5153,26 @@ def _update_query_family_usage(
     usage["query_family_stats"] = stats
 
 
+def _update_provider_health_usage(
+    usage: dict[str, object],
+    *,
+    healthy: int,
+    unresponsive: int,
+    productive: int,
+) -> None:
+    """Keep transport attempts separate from useful provider responses."""
+
+    usage["search_provider_healthy_responses"] = _as_int(
+        usage.get("search_provider_healthy_responses", 0)
+    ) + max(0, healthy)
+    usage["search_provider_unresponsive_responses"] = _as_int(
+        usage.get("search_provider_unresponsive_responses", 0)
+    ) + max(0, unresponsive)
+    usage["search_provider_productive_responses"] = _as_int(
+        usage.get("search_provider_productive_responses", 0)
+    ) + max(0, productive)
+
+
 def _query_family_order(*, prefer_authoritative: bool) -> tuple[QueryFamily, ...]:
     """Return every applicable family exactly once in the preferred order."""
 
@@ -4865,6 +5247,16 @@ def _budget_exhaustion_reason(run: ResearchRunRow) -> str | None:
             "fetched_page_budget_exhausted" if has_split_page_budget else "page_budget_exhausted",
             _as_int(usage.get("pages_fetched", usage.get("pages", 0))),
             _as_int(budget.get("max_pages_fetched", budget.get("max_pages", 0))),
+        ),
+        (
+            "page_fetch_attempt_budget_exhausted",
+            _as_int(usage.get("page_fetch_attempts", usage.get("pages_fetched", 0))),
+            _as_int(
+                budget.get(
+                    "max_page_fetch_attempts",
+                    budget.get("max_pages_fetched", budget.get("max_pages", 0)),
+                )
+            ),
         ),
         (
             "extracted_page_budget_exhausted" if has_split_page_budget else "page_budget_exhausted",
@@ -4942,6 +5334,7 @@ def _budget_stop_summary(reason: str) -> str:
         "logical_query_budget_exhausted": "逻辑查询预算已耗尽",
         "provider_request_budget_exhausted": "上游搜索请求预算已耗尽",
         "fetched_page_budget_exhausted": "页面抓取预算已耗尽",
+        "page_fetch_attempt_budget_exhausted": "页面读取尝试预算已耗尽",
         "extracted_page_budget_exhausted": "页面抽取预算已耗尽",
         "extraction_call_budget_exhausted": "证据抽取调用预算已耗尽",
         "verification_call_budget_exhausted": "验证调用预算已耗尽",
@@ -4967,6 +5360,7 @@ def _requirements_satisfied(
     counts_by_dimension: Mapping[str, tuple[int, int]],
     *,
     accepted_for_question: int,
+    high_risk_dimension_keys: set[str] | frozenset[str] = frozenset(),
 ) -> bool:
     """Determine completion from the planned dimensions and their source policy."""
 
@@ -4977,10 +5371,110 @@ def _requirements_satisfied(
             f"{question_id}:d{index}",
             (0, 0),
         )
-        required_sources = 2 if _requires_independent_sources(criterion) else 1
+        dimension_key = f"{question_id}:d{index}"
+        required_sources = (
+            2
+            if _requires_independent_sources(criterion)
+            or dimension_key in high_risk_dimension_keys
+            else 1
+        )
         if evidence_count < 1 or owner_count < required_sources:
             return False
     return True
+
+
+def _protected_page_schedule_key(
+    *,
+    attempts: int,
+    coverage: float,
+    priority: int,
+    question_id: str,
+) -> tuple[int, int, float, int, str]:
+    """Keep untouched questions ahead of retries while protecting open gaps."""
+
+    return (
+        0 if attempts == 0 else 1,
+        0,
+        coverage,
+        priority,
+        question_id,
+    )
+
+
+def _p1_variant_schedule_key(
+    *,
+    attempts: int,
+    coverage: float,
+    priority: int,
+    question_id: str,
+) -> tuple[int, int, float, int, str]:
+    """Prioritize the weakest P1 before expected-yield optimizations."""
+
+    return (
+        1,
+        int(max(0.0, min(1.0, coverage)) * 1_000_000),
+        float(max(0, attempts)),
+        priority,
+        question_id,
+    )
+
+
+def _zero_yield_retry_deprioritized(
+    *,
+    search_budget_exhausted: bool,
+    attempts: int,
+    coverage: float,
+    accepted_evidence: int,
+    is_corroboration_target: bool,
+) -> bool:
+    """Move a fruitless retry behind useful work without making it terminal."""
+
+    return (
+        not search_budget_exhausted
+        and attempts >= 2
+        and coverage <= 0.0
+        and accepted_evidence <= 0
+        and not is_corroboration_target
+    )
+
+
+def _query_space_exhausted_for_freeze(
+    *,
+    executed_families: Iterable[str],
+    question: str,
+) -> bool:
+    """Freeze a zero-yield question only after every bounded family ran.
+
+    The two-low-gain threshold is useful for scheduling priority, but it must
+    not turn into a terminal decision while alternate-language and
+    contradiction searches remain untried.
+    """
+
+    valid_families = {family.value for family in QUERY_FAMILIES}
+    attempted = {str(value) for value in executed_families} & valid_families
+    return len(attempted) >= _query_strategy_limit(question)
+
+
+def _query_family_capacity_remaining(*, question: str, attempted_families: int) -> bool:
+    """Keep protected scheduling aligned with the configured family count."""
+
+    return max(0, attempted_families) < _query_strategy_limit(question)
+
+
+def _question_low_gain_streak(
+    quality_snapshot: Mapping[str, object], question_id: str
+) -> int:
+    """Read a per-question streak without leaking another question's value."""
+
+    raw_streaks = quality_snapshot.get("low_information_gain_streak_by_question")
+    if isinstance(raw_streaks, Mapping):
+        if question_id in raw_streaks:
+            return max(0, _as_int(raw_streaks.get(question_id, 0)))
+        if raw_streaks:
+            return 0
+    # Legacy snapshots did not have the per-question ledger. Preserve their
+    # active question's streak only until the first keyed entry is written.
+    return max(0, _as_int(quality_snapshot.get("low_information_gain_streak", 0)))
 
 
 def _search_query_for_attempt(
@@ -5083,6 +5577,33 @@ def _quality_repair_targets(
     return targets
 
 
+def _select_unmet_requirement(
+    requirement_statuses: list[object],
+) -> tuple[str, str] | None:
+    """Choose the least-covered atomic dimension, not merely the first one."""
+
+    candidates: list[tuple[float, int, int, str, str]] = []
+    for raw in requirement_statuses:
+        if not isinstance(raw, dict) or not raw.get("criterion"):
+            continue
+        coverage = _as_float(raw.get("coverage", 0.0))
+        if coverage >= 1.0:
+            continue
+        candidates.append(
+            (
+                coverage,
+                _as_int(raw.get("accepted_evidence", 0)),
+                _as_int(raw.get("independent_sources", 0)),
+                str(raw.get("dimension_key", "")),
+                str(raw.get("criterion")),
+            )
+        )
+    if not candidates:
+        return None
+    _coverage, _accepted, _sources, dimension_key, criterion = min(candidates)
+    return dimension_key, criterion
+
+
 def _source_hint_for_requirement(criterion: str) -> str:
     """Map an unmet dimension to a source genre before repeating a search.
 
@@ -5126,6 +5647,15 @@ def _source_hint_for_requirement(criterion: str) -> str:
         for token in ("原理", "principle", "算法", "algorithm", "技术", "technology")
     ):
         return "官方技术文档 技术论文" if chinese else "official technical paper application note"
+    if any(
+        token in normalized
+        for token in ("厂商", "厂家", "产品", "vendor", "manufacturer", "product")
+    ):
+        return (
+            "厂商官网 产品页 客户案例"
+            if chinese
+            else "manufacturer official product page customer case study"
+        )
     if any(
         token in normalized
         for token in ("案例", "部署", "deployment", "case", "应用", "application")
@@ -5222,6 +5752,9 @@ def _evaluation_summary(decision: str, question_id: str) -> str:
             f"问题 {question_id} 遇到临时搜索服务故障; 不消耗研究尝试并调度技术重试。"
         ),
         "continue_plan": f"问题 {question_id} 已完成评估; 自动推进下一个研究问题。",
+        "continue_cached": (
+            "新搜索预算已耗尽; 继续读取和抽取已发现候选, 避免遗失可用证据。"
+        ),
         "replan": "连续低信息增益或预算进入预留区; 对原问题执行定向补证。",
         "ready_to_write": "全部研究质量门已满足; 进入报告写作。",
         "write_with_limitations": (

@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from app.domain.adaptive_scheduler import cheap_triage
+from app.domain.adaptive_scheduler import (
+    cheap_triage,
+    classify_source_role,
+    infer_claim_type,
+    source_role_fits_claim,
+)
 from app.domain.controlled_tools import ControlledToolName, EvidenceSearchInput, ToolDecisionRequest
 from app.domain.identifiers import uuid7
 from app.domain.research_tools import ReadPage, SearchResult
@@ -239,10 +244,27 @@ class ResearchLoopService:
             worker_task_id=worker_task_id,
         )
         if target is None:
+            replan_checker = getattr(self._repository, "replan_requested", None)
+            replan_requested = (
+                await replan_checker(run_id, worker_task_id=worker_task_id)
+                if replan_checker is not None
+                else False
+            )
+            continue_research = await self._repository.research_phase_active(
+                run_id,
+                worker_task_id=worker_task_id,
+            )
+            decision = (
+                "replan"
+                if replan_requested
+                else "scheduler_advanced"
+                if continue_research
+                else "no_pending_question"
+            )
             return ResearchIterationResult(
-                outcome=self._outcome("no_pending_question", 0, 0, 0),
-                continue_research=False,
-                decision="no_pending_question",
+                outcome=self._outcome(decision, 0, 0, 0),
+                continue_research=continue_research,
+                decision=decision,
                 pages_read=0,
                 accepted_evidence=0,
                 coverage=0.0,
@@ -363,6 +385,9 @@ class ResearchLoopService:
         provider_requests = 0
         provider_timeouts = 0
         provider_fallbacks = 0
+        provider_healthy = 0
+        provider_unresponsive = 0
+        provider_productive = 0
         search_latency_ms = 0
         if reuse_only:
             results = list(target.reusable_results)
@@ -381,6 +406,9 @@ class ResearchLoopService:
                             target.query,
                             limit=_MAX_SEARCH_RESULTS,
                             max_provider_requests=target.provider_request_allowance,
+                            alternate_query=target.alternate_query or None,
+                            exclude_domains=target.search_excluded_owner_keys,
+                            exclude_urls=target.search_excluded_urls,
                         ),
                         timeout=remaining,
                     )
@@ -393,6 +421,15 @@ class ResearchLoopService:
                 provider_requests = _provider_request_count(self._search, default=1)
                 provider_timeouts = _provider_metric(self._search, "last_timeout_count")
                 provider_fallbacks = _provider_metric(self._search, "last_fallback_count")
+                provider_healthy = _provider_metric(
+                    self._search, "last_healthy_response_count"
+                )
+                provider_unresponsive = _provider_metric(
+                    self._search, "last_unresponsive_response_count"
+                )
+                provider_productive = _provider_metric(
+                    self._search, "last_productive_response_count"
+                )
             except TimeoutError:
                 return ResearchAttemptResult(0, 0, "deadline_exhausted")
             except ToolExecutionError as exc:
@@ -400,6 +437,15 @@ class ResearchLoopService:
                 provider_requests = _provider_request_count(self._search, default=0)
                 provider_timeouts = _provider_metric(self._search, "last_timeout_count")
                 provider_fallbacks = _provider_metric(self._search, "last_fallback_count")
+                provider_healthy = _provider_metric(
+                    self._search, "last_healthy_response_count"
+                )
+                provider_unresponsive = _provider_metric(
+                    self._search, "last_unresponsive_response_count"
+                )
+                provider_productive = _provider_metric(
+                    self._search, "last_productive_response_count"
+                )
                 await self._repository.record_tool_failure(
                     run_id,
                     worker_task_id=worker_task_id,
@@ -410,6 +456,9 @@ class ResearchLoopService:
                     provider_requests=provider_requests,
                     provider_timeouts=provider_timeouts,
                     provider_fallbacks=provider_fallbacks,
+                    provider_healthy=provider_healthy,
+                    provider_unresponsive=provider_unresponsive,
+                    provider_productive=provider_productive,
                     latency_ms=search_latency_ms,
                 )
                 if exc.retryable:
@@ -459,6 +508,9 @@ class ResearchLoopService:
             provider_requests=provider_requests,
             provider_timeouts=provider_timeouts,
             provider_fallbacks=provider_fallbacks,
+            provider_healthy=provider_healthy,
+            provider_unresponsive=provider_unresponsive,
+            provider_productive=provider_productive,
             latency_ms=search_latency_ms,
         )
         if not page_results:
@@ -469,12 +521,23 @@ class ResearchLoopService:
         page_reservation = await self._repository.reserve_page_slots(
             run_id,
             worker_task_id=worker_task_id,
-            requested=1 if target.first_pass else min(_MAX_PAGE_ATTEMPTS, _MAX_PAGES_READ),
+            requested=(
+                _MAX_PAGES_READ
+                if target.first_pass and target.priority == 1
+                else 1
+                if target.first_pass
+                else min(_MAX_PAGE_ATTEMPTS, _MAX_PAGES_READ)
+            ),
             fresh_search=not reuse_only,
         )
         if page_reservation.granted == 0:
             return ResearchAttemptResult(0, 0, "budget_exhausted")
-        page_limit = min(page_reservation.granted, _MAX_PAGES_READ)
+        desired_page_limit = (
+            _MAX_PAGES_READ
+            if not target.first_pass or target.priority == 1
+            else 1
+        )
+        page_limit = min(page_reservation.granted, desired_page_limit)
         prefetched: dict[str, ReadPage] = {}
         batch_urls: list[str] = []
         settled_slots = 0
@@ -482,12 +545,14 @@ class ResearchLoopService:
             batch_sample = _prioritize_search_results(
                 page_results,
                 query=target.query,
+                alternate_query=target.alternate_query,
+                acceptance_criteria=tuple(
+                    criterion for _key, criterion in target.acceptance_dimensions
+                ),
                 used_owner_keys=set(target.used_source_owner_keys),
                 owner_acceptance_rates=dict(target.owner_acceptance_rates),
             )[:page_limit]
             for result in batch_sample:
-                if target.first_pass and len(batch_urls) >= 1:
-                    break
                 if normalize_source_url(result.url) not in reusable_pages:
                     batch_urls.append(result.url)
             if batch_urls:
@@ -557,12 +622,14 @@ class ResearchLoopService:
         for result in _prioritize_search_results(
             page_results,
             query=target.query,
+            alternate_query=target.alternate_query,
+            acceptance_criteria=tuple(
+                criterion for _key, criterion in target.acceptance_dimensions
+            ),
             used_owner_keys=set(target.used_source_owner_keys),
             owner_acceptance_rates=dict(target.owner_acceptance_rates),
         )[:_MAX_PAGE_ATTEMPTS]:
             if pages_read >= page_limit:
-                break
-            if target.first_pass and pages_read >= 1:
                 break
             if _deadline_expired(target):
                 await self._repository.release_page_slots(
@@ -667,6 +734,11 @@ class ResearchLoopService:
                 triage = cheap_triage(
                     question=target.question,
                     criteria=tuple(criterion for _key, criterion in target.acceptance_dimensions),
+                    query_hints=tuple(
+                        value
+                        for value in (target.query, target.alternate_query)
+                        if value
+                    ),
                     text=page.clean_text,
                     url=page.final_url,
                 )
@@ -676,6 +748,7 @@ class ResearchLoopService:
                         worker_task_id=worker_task_id,
                         target=target,
                         url=page.final_url,
+                        requested_url=result.url,
                         score=triage.score,
                         reason=triage.reason,
                         source_role=triage.source_role,
@@ -928,6 +1001,8 @@ def _prioritize_search_results(
     results: list[SearchResult],
     *,
     query: str = "",
+    alternate_query: str = "",
+    acceptance_criteria: tuple[str, ...] = (),
     used_owner_keys: set[str] | None = None,
     owner_acceptance_rates: dict[str, float] | None = None,
 ) -> list[SearchResult]:
@@ -935,7 +1010,10 @@ def _prioritize_search_results(
 
     used_owners = used_owner_keys or set()
     acceptance_rates = owner_acceptance_rates or {}
-    query_tokens = _search_tokens(query)
+    query_token_sets = [
+        tokens for value in (query, alternate_query) if (tokens := _search_tokens(value))
+    ]
+    query_tokens = set().union(*query_token_sets) if query_token_sets else set()
 
     def sort_key(result: SearchResult) -> tuple[float, int]:
         parsed = urlsplit(result.url)
@@ -944,20 +1022,34 @@ def _prioritize_search_results(
         penalty = 0.0
         candidate_tokens = _search_tokens(f"{result.title} {result.snippet}")
         title_tokens = _search_tokens(result.title)
-        overlap_count = len(query_tokens & candidate_tokens)
-        overlap = overlap_count / max(len(query_tokens), 1)
-        title_overlap = len(query_tokens & title_tokens)
+        overlap = max(
+            (len(tokens & candidate_tokens) / max(len(tokens), 1) for tokens in query_token_sets),
+            default=0.0,
+        )
+        title_overlap = max(
+            (len(tokens & title_tokens) for tokens in query_token_sets),
+            default=0,
+        )
         if _matches_domain(hostname, _PREFERRED_READABLE_DOMAINS):
             # Academic/open-access status is valuable only after topical
             # relevance. A weakly related arXiv hit must not displace a directly
             # relevant standards, market or manufacturer source.
             penalty += -20 if not query_tokens or title_overlap >= 2 else 10
         if _matches_domain(hostname, _RESTRICTED_SOURCE_DOMAINS):
-            penalty += 20
+            # These hosts are credible but routinely return login shells,
+            # bot challenges, or empty abstracts to the public reader. Keep
+            # them as a last resort after directly readable sources.
+            penalty += 70
         if path.endswith(".pdf") or "/pdf" in path:
-            penalty += 30
+            # The public reader now parses bounded PDFs directly.  Treat an
+            # explicit PDF as a readability signal instead of carrying over
+            # the old unsupported-format penalty; otherwise bounded page
+            # slots are spent on paywalls while open papers never get read.
+            penalty -= 18
         if source_owner_key(result.url) in used_owners:
-            penalty += 18
+            # A corroboration pass must strongly prefer a genuinely independent
+            # publisher. Retain same-owner pages only as a last resort.
+            penalty += 60
         # Historical owner yield is only a bounded tie-breaker. It cannot
         # override topical relevance or the owner-diversity penalty.
         penalty -= max(0.0, min(1.0, acceptance_rates.get(source_owner_key(result.url), 0.0))) * 10
@@ -974,6 +1066,22 @@ def _prioritize_search_results(
         # recognised academic/government/primary hosts now get a real quality
         # preference.
         penalty -= (source_reliability(result.url) - 0.68) * 45
+        if acceptance_criteria:
+            claim_type = infer_claim_type(" ".join(acceptance_criteria))
+            source_role = classify_source_role(
+                result.url,
+                text=f"{result.title}\n{result.snippet}",
+            )
+            if not source_role_fits_claim(claim_type=claim_type, source_role=source_role):
+                penalty += 28
+            elif claim_type == "vendor_product" and source_role == "manufacturer":
+                # Vendor/product questions need first-party attribution. A
+                # topical news roundup is useful for discovery but must not
+                # consume the only first-pass P2 page ahead of the vendor's
+                # own product or application page.
+                penalty -= 30
+        if "官网" in result.title or "official" in result.title.casefold():
+            penalty -= 12
         penalty -= overlap * 80
         penalty -= title_overlap * 4
         return penalty, result.rank
@@ -981,7 +1089,12 @@ def _prioritize_search_results(
     # Do not let a generic lexical overlap reintroduce pages rejected by the
     # provider's topical gate (for example remote-sensing or pedestrian
     # tracking pages for an industrial-defect question).
-    filtered = [result for result in results if _topic_relevance_ok(query, result)]
+    filtered = [
+        result
+        for result in results
+        if _topic_relevance_ok(query, result)
+        or bool(alternate_query and _topic_relevance_ok(alternate_query, result))
+    ]
     ordered = sorted(filtered, key=sort_key)
     # Keep the first extraction batch owner-diverse. Repeated pages from one
     # content host are retained as a last resort, but cannot crowd primary

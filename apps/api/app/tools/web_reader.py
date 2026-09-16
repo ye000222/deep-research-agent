@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as html_module
+import io
 import ipaddress
 import re
 import socket
@@ -13,13 +15,17 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import trafilatura
+from pypdf import PdfReader
 
 from app.domain.research_tools import ReadPage
 from app.tools.errors import ToolExecutionError
 
 _MAX_DOWNLOAD_BYTES = 2_000_000
+_MAX_PDF_DOWNLOAD_BYTES = 12_000_000
+_MAX_PDF_PAGES = 80
 _MAX_CLEAN_CHARS = 30_000
 _MAX_REDIRECTS = 3
+_HTML_PARSE_TIMEOUT_SECONDS = 20.0
 
 
 class PublicWebReader:
@@ -35,7 +41,7 @@ class PublicWebReader:
                     "GET",
                     current,
                     headers={
-                        "Accept": "text/html,application/xhtml+xml",
+                        "Accept": "text/html,application/xhtml+xml,application/pdf",
                         "User-Agent": "DeepResearchAgent/0.1 (+public-research-reader)",
                     },
                     timeout=httpx.Timeout(25.0, connect=8.0),
@@ -50,16 +56,32 @@ class PublicWebReader:
                     if response.status_code >= 500:
                         raise ToolExecutionError("WEBPAGE_PROVIDER_UNAVAILABLE", retryable=True)
                     if response.status_code >= 400:
+                        fallback_url = _public_fallback_url(current)
+                        if fallback_url is not None and redirect_count < _MAX_REDIRECTS:
+                            # A number of scholarly publishers reject their
+                            # abstract HTML while exposing the same public
+                            # document through a stable PDF/download endpoint.
+                            # Treat that endpoint like a normal redirect so all
+                            # SSRF, size, content-type, and extraction guards
+                            # remain in force.
+                            current = fallback_url
+                            continue
                         raise ToolExecutionError("WEBPAGE_REQUEST_REJECTED", retryable=False)
                     content_type = response.headers.get("content-type", "").lower()
-                    if (
+                    is_pdf = "application/pdf" in content_type
+                    if not is_pdf and (
                         "text/html" not in content_type
                         and "application/xhtml+xml" not in content_type
                     ):
                         raise ToolExecutionError(
                             "WEBPAGE_CONTENT_TYPE_UNSUPPORTED", retryable=False
                         )
-                    body = await _bounded_body(response)
+                    body = await _bounded_body(
+                        response,
+                        max_bytes=(
+                            _MAX_PDF_DOWNLOAD_BYTES if is_pdf else _MAX_DOWNLOAD_BYTES
+                        ),
+                    )
                     encoding = response.encoding or "utf-8"
             except ToolExecutionError:
                 raise
@@ -68,21 +90,42 @@ class PublicWebReader:
             except httpx.RequestError as exc:
                 raise ToolExecutionError("WEBPAGE_NETWORK_ERROR", retryable=True) from exc
 
-            html = body.decode(encoding, errors="replace")
-            extracted = trafilatura.extract(
-                html,
-                include_comments=False,
-                include_links=False,
-                favor_precision=True,
-            )
+            html = ""
+            extracted: str | None
+            if is_pdf:
+                extracted = await asyncio.to_thread(_extract_pdf_text, body)
+            else:
+                html = body.decode(encoding, errors="replace")
+                metadata_parser = _MetadataParser()
+                metadata_parser.feed(html[:200_000])
+                try:
+                    # Trafilatura is synchronous and can spend minutes on a
+                    # malformed or script-heavy publisher page.  Keep it off
+                    # the event loop so lease heartbeats and sibling reads
+                    # continue, and bound the damage to this one page.
+                    extracted = await asyncio.wait_for(
+                        asyncio.to_thread(_extract_html_text, html),
+                        timeout=_HTML_PARSE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError as exc:
+                    raise ToolExecutionError(
+                        "WEBPAGE_EXTRACTION_TIMEOUT", retryable=False
+                    ) from exc
+                extracted = _merge_extracted_text(extracted, metadata_parser.metadata_text)
             if not extracted or len(extracted.strip()) < 100:
                 raise ToolExecutionError("WEBPAGE_EXTRACTION_EMPTY", retryable=False)
             clean = extracted.strip()
             truncated = len(clean) > _MAX_CLEAN_CHARS
             clean = clean[:_MAX_CLEAN_CHARS]
-            title_parser = _TitleParser()
-            title_parser.feed(html[:100_000])
-            title = title_parser.title or urlsplit(current).hostname or "Untitled source"
+            title_parser = _MetadataParser()
+            if html:
+                title_parser.feed(html[:200_000])
+            title = (
+                title_parser.title
+                or urlsplit(current).path.rsplit("/", 1)[-1]
+                or urlsplit(current).hostname
+                or "Untitled source"
+            )
             return ReadPage(
                 final_url=current,
                 title=title[:1000],
@@ -93,6 +136,36 @@ class PublicWebReader:
                 truncated=truncated,
             )
         raise ToolExecutionError("WEBPAGE_REDIRECT_REJECTED", retryable=False)
+
+
+def _public_fallback_url(url: str) -> str | None:
+    """Return a deterministic public document endpoint for common publishers.
+
+    These are URL-shape transformations only; no credentials, private hosts,
+    or arbitrary proxy endpoints are introduced. Returning ``None`` keeps the
+    original rejection semantics for all unknown sites.
+    """
+
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path
+    if host in {"www.ssrn.com", "ssrn.com"}:
+        match = re.search(r"abstract(?:id)?[=/](\d+)", f"{path}?{parsed.query}")
+        if match:
+            return f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={match.group(1)}"
+    if host == "www.mdpi.com" and not path.endswith("/pdf"):
+        return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/") + "/pdf", parsed.query, ""))
+    if host in {"ieeexplore.ieee.org", "www.ieeexplore.ieee.org"}:
+        match = re.search(r"/document/(\d+)", path)
+        if match:
+            return f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={match.group(1)}"
+    if host == "dl.acm.org" and "/doi/abs/" in path:
+        return urlunsplit((parsed.scheme, parsed.netloc, path.replace("/doi/abs/", "/doi/pdf/"), parsed.query, ""))
+    if host == "academic.oup.com" and "/article/" in path and not parsed.query:
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "download=1", ""))
+    if host in {"www.spiedigitallibrary.org", "proceedings.spiedigitallibrary.org"} and path.endswith(".aspx"):
+        return urlunsplit((parsed.scheme, parsed.netloc, path[:-5] + ".full", parsed.query, ""))
+    return None
 
 
 _PUBLICATION_META_RE = re.compile(
@@ -119,15 +192,35 @@ def _extract_published_at(html: str) -> datetime | None:
     return None
 
 
-async def _bounded_body(response: httpx.Response) -> bytes:
+def _extract_pdf_text(body: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(body), strict=False)
+        if reader.is_encrypted and not reader.decrypt(""):
+            return ""
+        parts = [page.extract_text() or "" for page in reader.pages[:_MAX_PDF_PAGES]]
+    except Exception:
+        return ""
+    return "\n\n".join(part.strip() for part in parts if part.strip())
+
+
+def _extract_html_text(html: str) -> str | None:
+    return trafilatura.extract(
+        html,
+        include_comments=False,
+        include_links=False,
+        favor_precision=True,
+    )
+
+
+async def _bounded_body(response: httpx.Response, *, max_bytes: int) -> bytes:
     declared = response.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > _MAX_DOWNLOAD_BYTES:
+    if declared and declared.isdigit() and int(declared) > max_bytes:
         raise ToolExecutionError("WEBPAGE_TOO_LARGE", retryable=False)
     chunks: list[bytes] = []
     size = 0
     async for chunk in response.aiter_bytes():
         size += len(chunk)
-        if size > _MAX_DOWNLOAD_BYTES:
+        if size > max_bytes:
             raise ToolExecutionError("WEBPAGE_TOO_LARGE", retryable=False)
         chunks.append(chunk)
     return b"".join(chunks)
@@ -172,19 +265,82 @@ async def _require_public_destination(url: str) -> None:
         raise ToolExecutionError("WEBPAGE_PRIVATE_DESTINATION", retryable=False)
 
 
-class _TitleParser(HTMLParser):
+_CONTENT_META_KEYS = frozenset(
+    {
+        "citation_abstract",
+        "citation_title",
+        "dc.description",
+        "description",
+        "keywords",
+        "og:description",
+        "og:title",
+        "twitter:description",
+        "twitter:title",
+    }
+)
+
+
+def _clean_metadata_value(value: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", html_module.unescape(value))
+    return " ".join(without_tags.split())
+
+
+def _merge_extracted_text(extracted: str | None, metadata_text: str) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for value in (extracted or "", metadata_text):
+        clean = value.strip()
+        identity = clean.casefold()
+        if clean and identity not in seen:
+            parts.append(clean)
+            seen.add(identity)
+    return "\n\n".join(parts)
+
+
+class _MetadataParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self._inside_title = False
         self._parts: list[str] = []
+        self._metadata: list[tuple[str, str]] = []
 
     @property
     def title(self) -> str:
-        return " ".join("".join(self._parts).split())
+        title = " ".join("".join(self._parts).split())
+        if title:
+            return title
+        for key, value in self._metadata:
+            if key in {"citation_title", "og:title", "twitter:title"}:
+                return value
+        return ""
+
+    @property
+    def metadata_text(self) -> str:
+        values: list[str] = []
+        seen: set[str] = set()
+        for _key, value in self._metadata:
+            identity = value.casefold()
+            if identity not in seen:
+                values.append(value)
+                seen.add(identity)
+        return "\n\n".join(values)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() == "title":
             self._inside_title = True
+            return
+        if tag.lower() != "meta":
+            return
+        values = {key.casefold(): value for key, value in attrs if value is not None}
+        key = (
+            values.get("name")
+            or values.get("property")
+            or values.get("itemprop")
+            or ""
+        ).casefold()
+        content = _clean_metadata_value(values.get("content") or "")
+        if key in _CONTENT_META_KEYS and content:
+            self._metadata.append((key, content))
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":

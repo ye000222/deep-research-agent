@@ -69,6 +69,7 @@ class ApplicationRuntime:
             ResearchMemoryManager(business_db.session_factory),
             controlled_tools,
             LLMCallRepository(business_db.session_factory),
+            source_revision=settings.source_revision,
         )
         return cls(
             business_db=business_db,

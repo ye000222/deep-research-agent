@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -93,6 +93,16 @@ async def rebuild_evidence(session: AsyncSession, *, run_id: UUID | None = None)
 
 async def rebuild_memory(session: AsyncSession, *, owner_hash: str | None = None) -> int:
     config = await _config(session)
+    if owner_hash is not None:
+        # Multiple runs for one browser owner can capture state concurrently.
+        # Serialize the owner-scoped delete/rebuild transaction so PostgreSQL
+        # never deadlocks two workers deleting overlapping projection rows.
+        # The lock is transaction-scoped and releases automatically at commit
+        # or rollback; different owners remain fully concurrent.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:owner_hash, 0))"),
+            {"owner_hash": owner_hash},
+        )
     query = select(MemoryItemRow)
     if owner_hash is not None:
         query = query.where(MemoryItemRow.owner_hash == owner_hash)

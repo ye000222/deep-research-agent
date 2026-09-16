@@ -357,7 +357,7 @@ function runMessage(run: ResearchRun, events: AgentEvent[] = []): string {
     const quality = run.quality_snapshot;
     const unmet = [
       metric(quality, "coverage") < 0.85 ? "总体覆盖度" : null,
-      metric(quality, "priority_one_coverage") < 0.80 ? "P1 覆盖度" : null,
+      metric(quality, "priority_one_coverage") < 0.80 ? "P1 最低覆盖度" : null,
       metric(quality, "source_quality") < 0.75 ? "来源质量" : null,
       metric(quality, "cross_validation") < 0.70 ? "交叉验证" : null,
       metric(quality, "critical_gaps") > 0 ? "关键缺口" : null,
@@ -365,6 +365,13 @@ function runMessage(run: ResearchRun, events: AgentEvent[] = []): string {
     const reason = isBudgetStopReason(run.termination_reason)
       ? `停止原因：${budgetStopLabel(run.termination_reason)}。`
       : "";
+    if (unmet.length === 0) {
+      const unresolved = metric(quality, "unresolved_gap_count");
+      const limitation = unresolved > 0
+        ? `仍有 ${unresolved} 个非关键细分缺口未获得更多合格来源`
+        : "检索来源空间已耗尽";
+      return `研究任务已完成并生成报告；五项硬质量门均已通过，但因${limitation}以限制性状态结束。${reason}`;
+    }
     return `研究任务已完成并生成报告；未通过质量门：${unmet.join("、") || "历史终止原因"}。${reason}`;
   }
   if (run.status === "failed") {
@@ -1138,9 +1145,16 @@ function App() {
   const citations = metric(quality, "citation_count");
   const informationGain = metric(quality, "information_gain");
   const lowGainStreak = metric(quality, "low_information_gain_streak");
+  const priorityOneCompleted = metric(quality, "priority_one_completed");
+  const priorityOneTotal = metric(quality, "priority_one_total");
   const qualityGates = [
     {key: "coverage", label: "总体覆盖度", value: coverage, target: 0.85},
-    {key: "priority_one_coverage", label: "P1 覆盖度", value: metric(quality, "priority_one_coverage"), target: 0.80},
+    {
+      key: "priority_one_coverage",
+      label: `P1 最低覆盖度 · ${priorityOneCompleted}/${priorityOneTotal || "—"} 完成`,
+      value: metric(quality, "priority_one_coverage"),
+      target: 0.80,
+    },
     {key: "source_quality", label: "来源质量", value: metric(quality, "source_quality"), target: 0.75},
     {key: "cross_validation", label: "交叉验证", value: metric(quality, "cross_validation"), target: 0.70},
   ];
@@ -1223,7 +1237,7 @@ function App() {
   const budgetItems = [
     {key: "scheduler_actions", label: "调度动作", used: metric(usage, "scheduler_actions"), max: metric(budget, "max_scheduler_actions")},
     {key: "logical_queries", label: "逻辑查询", used: metric(usage, "logical_queries") || metric(usage, "searches"), max: metric(budget, "max_logical_queries") || metric(budget, "max_searches")},
-    {key: "provider_requests", label: "上游请求", used: metric(usage, "search_provider_requests"), max: metric(budget, "max_provider_requests")},
+    {key: "provider_requests", label: "上游原始尝试", used: metric(usage, "search_provider_requests"), max: metric(budget, "max_provider_requests")},
     {key: "pages_fetched", label: "抓取页面", used: metric(usage, "pages_fetched"), max: metric(budget, "max_pages_fetched")},
     {key: "pages_extracted", label: "抽取页面", used: metric(usage, "pages_extracted") || metric(usage, "pages"), max: metric(budget, "max_pages_extracted") || metric(budget, "max_pages")},
     {key: "model_tokens", label: "模型 Token", used: modelTokenUsage(usage), max: metric(budget, "max_tokens")},
@@ -1272,6 +1286,9 @@ function App() {
       : events.filter((event) => event.event_type === "budget.settled").length,
     budgetStopped: isBudgetStopReason(researchStopReason),
     stopReason: researchStopReason,
+    healthyProviderResponses: metric(usage, "search_provider_healthy_responses"),
+    productiveProviderResponses: metric(usage, "search_provider_productive_responses"),
+    unresponsiveProviderResponses: metric(usage, "search_provider_unresponsive_responses"),
   };
   const recentGainEvents = events
     .filter((event) => event.event_type === "research.information_gain_calculated")
@@ -1466,6 +1483,9 @@ function App() {
                   <div><strong>{budgetDiagnostics.yielded}</strong><span>本题让出次数</span></div>
                   <div><strong>{budgetDiagnostics.settled}</strong><span>已结算预留</span></div>
                   <div><strong>{budgetDiagnostics.budgetStopped ? "是" : "否"}</strong><span>预算触发停止</span></div>
+                  <div><strong>{budgetDiagnostics.healthyProviderResponses}</strong><span>健康上游响应</span></div>
+                  <div><strong>{budgetDiagnostics.productiveProviderResponses}</strong><span>有效候选响应</span></div>
+                  <div><strong>{budgetDiagnostics.unresponsiveProviderResponses}</strong><span>失效上游响应</span></div>
                 </div>
                 {budgetDiagnostics.stopReason ? (
                   <div className="budget-diag-stop">

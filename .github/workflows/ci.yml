@@ -116,7 +116,7 @@ jobs:
       - run: docker compose config
 
   release:
-    name: Strict V1 release gate
+    name: Static V1 release checks
     needs: [integration, api, web, compose]
     runs-on: ubuntu-latest
     services:

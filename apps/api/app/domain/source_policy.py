@@ -111,7 +111,18 @@ def source_owner_key(url: str) -> str:
     labels = [label for label in hostname.split(".") if label]
     if len(labels) <= 2:
         return hostname[:255]
-    multi_label_suffixes = {"co.uk", "com.cn", "co.jp", "com.au", "com.br"}
+    multi_label_suffixes = {
+        "ac.cn",
+        "com.au",
+        "com.br",
+        "com.cn",
+        "co.jp",
+        "co.uk",
+        "edu.cn",
+        "gov.cn",
+        "net.cn",
+        "org.cn",
+    }
     suffix = ".".join(labels[-2:])
     keep = 3 if suffix in multi_label_suffixes else 2
     return ".".join(labels[-keep:])[:255]

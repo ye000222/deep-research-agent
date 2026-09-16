@@ -434,9 +434,14 @@ class LLMGateway:
             "temperature": _generation_temperature(request),
         }
         # The switch is provider-specific: never send it to arbitrary compatible servers.
+        # DeepSeek exposes several moving aliases (for example ``deepseek-flash``
+        # and versioned ``deepseek-v4-*`` names).  Restricting this control to two
+        # exact model strings silently re-enabled hidden reasoning whenever an
+        # alias was selected, allowing reasoning tokens to consume the entire
+        # structured-output budget before any JSON was emitted.
         if (
             urlsplit(base_url).hostname == "api.deepseek.com"
-            and request.model in {"deepseek-v4-flash", "deepseek-v4-pro"}
+            and request.model.strip().casefold().startswith("deepseek-")
             and request.generation_parameters.get("reasoning_enabled") is False
         ):
             body["thinking"] = {"type": "disabled"}

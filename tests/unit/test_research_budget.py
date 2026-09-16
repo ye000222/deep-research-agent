@@ -177,6 +177,7 @@ def test_resource_pool_snapshot_accounts_for_in_flight_slots_and_model_holds() -
         "max_logical_queries": 6,
         "max_provider_requests": 8,
         "max_pages_fetched": 10,
+        "max_page_fetch_attempts": 14,
         "max_pages_extracted": 5,
         "max_extraction_calls": 5,
         "max_verification_calls": 2,
@@ -187,6 +188,7 @@ def test_resource_pool_snapshot_accounts_for_in_flight_slots_and_model_holds() -
         "logical_queries": 2,
         "search_provider_requests": 3,
         "pages_fetched": 4,
+        "page_fetch_attempts": 7,
         "page_slots_reserved": 2,
         "pages_extracted": 1,
         "extraction_slots_reserved": 1,
@@ -203,6 +205,7 @@ def test_resource_pool_snapshot_accounts_for_in_flight_slots_and_model_holds() -
     pools = build_resource_pool_snapshot(budget, usage)
 
     assert pools["pages_fetched"]["remaining"] == 4
+    assert pools["page_fetch_attempts"]["remaining"] == 5
     assert pools["pages_fetched"]["reserved"] == 2
     assert pools["pages_extracted"]["remaining"] == 3
     assert pools["model_tokens.research"]["committed"] == 4_000
@@ -269,6 +272,126 @@ def test_claim_conflict_blocks_research_borrow_until_verification() -> None:
         low_gain_streak=0,
     )
     assert decision.allowed is False
+    assert decision.freeze_question is True
+
+
+def test_p1_low_gain_can_borrow_for_one_untried_recovery_family() -> None:
+    question = classify_question_risk(
+        question_id="q1",
+        priority=1,
+        coverage=0.0,
+        requirements=["两个独立来源"],
+        gap_open=True,
+        open_dimension_keys=["q1:d1"],
+        unresolved_claim_ids=[],
+        high_risk_claim_ids=[],
+        high_risk_conflict_ids=[],
+        independent_source_deficit=1,
+        blocked=False,
+    )
+
+    recovery = decide_question_borrow(
+        state=question,
+        all_first_passes_complete=True,
+        projected_spend=11_000,
+        target_tokens=10_000,
+        expected_utility=1.0,
+        low_gain_streak=2,
+        has_untried_query_family=True,
+    )
+    exhausted = decide_question_borrow(
+        state=question,
+        all_first_passes_complete=True,
+        projected_spend=11_000,
+        target_tokens=10_000,
+        expected_utility=1.0,
+        low_gain_streak=2,
+        has_untried_query_family=False,
+    )
+
+    assert recovery.allowed is True
+    assert exhausted.allowed is False
+    assert exhausted.freeze_question is True
+
+
+def test_open_acceptance_gap_can_borrow_even_without_high_risk_claim() -> None:
+    question = classify_question_risk(
+        question_id="q5",
+        priority=2,
+        coverage=0.0,
+        requirements=["至少一条可验证证据"],
+        gap_open=True,
+        open_dimension_keys=["q5:d1"],
+        blocked=True,
+    )
+
+    decision = decide_question_borrow(
+        state=question,
+        all_first_passes_complete=True,
+        projected_spend=9_500,
+        target_tokens=9_000,
+        expected_utility=0.02,
+        low_gain_streak=0,
+        has_untried_query_family=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "high_risk_high_utility_borrow"
+
+
+def test_high_risk_untried_family_can_cross_question_borrow_cap() -> None:
+    question = classify_question_risk(
+        question_id="q6",
+        priority=2,
+        coverage=0.25,
+        requirements=["高风险结论需两个独立来源"],
+        gap_open=True,
+        open_dimension_keys=["q6:d1"],
+        unresolved_claim_ids=["c6"],
+        high_risk_claim_ids=["c6"],
+        independent_source_deficit=1,
+    )
+
+    decision = decide_question_borrow(
+        state=question,
+        all_first_passes_complete=True,
+        projected_spend=14_500,
+        target_tokens=9_000,
+        expected_utility=0.02,
+        low_gain_streak=0,
+        has_untried_query_family=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "high_risk_high_utility_borrow"
+
+
+def test_high_risk_exception_has_bounded_recovery_ceiling() -> None:
+    question = classify_question_risk(
+        question_id="q3",
+        priority=1,
+        coverage=0.1,
+        requirements=["两个独立来源"],
+        gap_open=True,
+        open_dimension_keys=["q3:d1"],
+        unresolved_claim_ids=["c3"],
+        high_risk_claim_ids=["c3"],
+        independent_source_deficit=1,
+    )
+
+    decision = decide_question_borrow(
+        state=question,
+        all_first_passes_complete=True,
+        projected_spend=20_001,
+        target_tokens=10_000,
+        expected_utility=1.0,
+        low_gain_streak=0,
+        has_untried_query_family=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "bounded_recovery_limit"
+    assert decision.hard_limit is True
     assert decision.freeze_question is True
 
 

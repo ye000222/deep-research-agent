@@ -43,7 +43,8 @@ V1 的自主 Research Loop 与证据驱动报告主链路已经可以端到端�
 
 当前 Worker 会调用用户明确选择的 Provider Adapter 生成并持久化研究计划，依据当前 Known / Unknown / Next Action 状态选择工具，自主执行多轮搜索、网页安全读取、证据抽取、质量评估和动态补缺。满足质量阈值或达到资源上限后进入 Writer；Writer 只接收经过验证的有限 Evidence Cards，并通过稳定引用和确定性校验生成报告。预算不足时会生成明确标注限制的证据报告；没有有效证据时会失败，而不会伪造结论、来源或质量指标。
 
-V1 已进入严格 Release Gate 阶段；本地可用以下命令生成可审计 JSON 报告（严格模式要求 PostgreSQL 集成开关）：
+V1 已进入 Release Gate 阶段；以下命令生成静态、集成、Web 与 Golden Eval 的可审计
+JSON 报告，但不能单独证明真实 V1 收口：
 
 ```powershell
 $env:RUN_POSTGRES_INTEGRATION = "1"
@@ -53,7 +54,18 @@ $env:CHECKPOINT_DATABASE_URI = "postgresql://deep_research:deep_research@localho
 python scripts/release_gate.py --skip-compose --report-path artifacts/release_gate.json
 ```
 
-该 Gate 会执行 Ruff、MyPy、全量测试、零跳过 PostgreSQL 集成测试、前端构建、13 条 Golden Eval 和高置信度 Secret 扫描；后续版本可继续增强来源冲突归因、语义向量检索、PDF/多模态来源和 Multi-Agent 协作。
+该 Gate 会执行 Ruff、MyPy、全量测试、零跳过 PostgreSQL 集成测试、前端构建、13 条
+Golden Eval 和高置信度 Secret 扫描。只有增加 `--v1-closeout`，并由数据库证明同一配置、
+可识别代码版本下最新连续三次真实 Run 全部达到质量门，才允许宣称 V1 收口通过：
+
+```powershell
+$env:V1_ACCEPTANCE_OWNER_HASH = "<当前验收用户 owner hash>"
+python scripts/release_gate.py --v1-closeout --v1-source-revision "<提交版本>" `
+  --report-path artifacts/release_gate.json
+```
+
+真实三连验收会调用已配置的模型与搜索服务，应在得到用户明确授权后另行启动；Gate 本身
+只读取已经完成的运行，不会创建任务或调用外部服务。
 
 ## 技术栈
 
@@ -187,18 +199,24 @@ pytest tests/integration/test_provider_profile_persistence.py -q
 
 ## V1 Release Gate
 
-在提交 GitHub 前运行：
+在提交 GitHub 前运行静态、测试与构建门禁：
 
 ~~~powershell
 python scripts/release_gate.py
 ~~~
 
-脚本检查必需文件、PostgreSQL 迁移头、Compose 配置和 MySQL 专属依赖残留。完整验证还应执行：
+该命令的报告范围是 `static_release_checks`，不能据此宣称 V1 已完成。真实收口必须在同一
+可识别代码版本和同一配置下完成连续三次 Run，再运行：
 
 ~~~powershell
-pytest -q
-pnpm --dir apps/web build
-docker compose run --rm --no-deps api python /app/scripts/verify_postgres_recovery.py
+$env:RUN_POSTGRES_INTEGRATION = "1"
+$env:V1_ACCEPTANCE_OWNER_HASH = "<验收用户 owner hash>"
+python scripts/release_gate.py --v1-closeout --v1-source-revision "<提交版本>" `
+  --report-path artifacts/release_gate.json
 ~~~
+
+真实门禁会核验三次运行均进入并完成报告阶段，且总体覆盖率 >=85%、P1 覆盖率 >=80%、
+交叉验证 >=70%、关键缺口为 0；任一运行是 `completed_with_limitations` 都会失败。
+`--v1-closeout` 禁止搭配任何 `--skip-*` 参数，并要求提供非开发态的候选代码版本。
 
 所有 API Key 只通过本地 `.env` 或页面输入使用；`.env`、运行时 Artifact、Secret 和构建产物均由 `.gitignore` 排除，不应提交到 GitHub。
