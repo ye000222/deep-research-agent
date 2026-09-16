@@ -1,0 +1,685 @@
+{
+  "schema_version": "v1",
+  "suite_id": "deep-research-agent-v1",
+  "suite_version": "1.0.0",
+  "status": "definition_only",
+  "purpose": "建立可重复、可比较的 V1 Research Agent Benchmark Suite；本文件只定义评测输入、覆盖维度、证据要求和结果记录格式。",
+  "execution_policy": {
+    "run_now": false,
+    "paid_real_e2e_requires_explicit_authorization": true,
+    "production_behavior_changed": false
+  },
+  "priority_mapping": {
+    "P0": {
+      "runtime_priority": 1,
+      "meaning": "最高优先级；对应当前运行时 priority=1。",
+      "existing_v1_metric": "priority_one_coverage"
+    },
+    "P1": {
+      "runtime_priority": 2,
+      "meaning": "次高优先级；对应当前运行时 priority=2。"
+    },
+    "P2": {
+      "runtime_priority": 3,
+      "meaning": "补充优先级；对应当前运行时 priority=3。"
+    }
+  },
+  "benchmarks": [
+    {
+      "benchmark_id": "v1-dev-industrial-vision-defect",
+      "benchmark_version": "1.0.0",
+      "type": "development",
+      "goal": "研究工业视觉缺陷检测领域的发展情况，分析技术路线、厂商、代表产品、大模型应用与未来三年趋势。",
+      "planner_mode": "frozen_reference_plan",
+      "reference_plan": {
+        "source_run_id": "01a09f08-d6ea-7650-820b-8d48f8f4496a",
+        "source_plan_version": 1,
+        "captured_from_existing_historical_run": true,
+        "frozen_for_comparison": true,
+        "questions": [
+          {
+            "question_id": "dev-q1",
+            "priority": 1,
+            "priority_tier": "P0",
+            "question": "工业视觉缺陷检测的典型系统由哪些环节构成，各环节的核心功能与关键指标是什么？",
+            "rationale": "建立系统边界与评价指标基线。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q1-d1",
+                "dimension": "system_components_and_functions",
+                "acceptance": "网页原文给出系统环节划分及各环节功能描述",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              },
+              {
+                "dimension_id": "dev-q1-d2",
+                "dimension": "key_detection_metrics",
+                "acceptance": "原文列出至少一项关键性功能指标，如检出率或误检率",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q2",
+            "priority": 1,
+            "priority_tier": "P0",
+            "question": "传统图像处理方法在工业缺陷检测中的主要技术手段与适用场景是什么？",
+            "rationale": "建立传统技术路线与适用边界基线。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q2-d1",
+                "dimension": "traditional_method_families",
+                "acceptance": "原文列出至少两种传统图像处理方法名称",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              },
+              {
+                "dimension_id": "dev-q2-d2",
+                "dimension": "traditional_method_scenarios",
+                "acceptance": "原文说明其适用缺陷类型或场景",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q3",
+            "priority": 1,
+            "priority_tier": "P0",
+            "question": "基于深度学习的工业缺陷检测主流算法路线有哪些，各自解决什么核心问题？",
+            "rationale": "建立深度学习路线与任务匹配基线。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q3-d1",
+                "dimension": "deep_learning_algorithm_families",
+                "acceptance": "原文列出至少两种深度学习算法路线",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              },
+              {
+                "dimension_id": "dev-q3-d2",
+                "dimension": "algorithm_task_fit",
+                "acceptance": "原文说明各路线针对的缺陷检测任务类型",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q4",
+            "priority": 1,
+            "priority_tier": "P0",
+            "question": "工业缺陷检测中数据采集与样本稀缺问题具体表现为何，常用应对手段有哪些？",
+            "rationale": "覆盖数据瓶颈及其工程应对方式。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q4-d1",
+                "dimension": "data_scarcity_and_imbalance",
+                "acceptance": "原文描述缺陷样本稀少或正负样本不均衡的具体表现",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              },
+              {
+                "dimension_id": "dev-q4-d2",
+                "dimension": "data_augmentation_or_synthesis",
+                "acceptance": "原文列出至少一种数据增强或合成样本手段",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q5",
+            "priority": 1,
+            "priority_tier": "P0",
+            "question": "大模型或视觉基础模型在工业缺陷检测中有哪些已落地的应用方式？",
+            "rationale": "覆盖大模型在该领域的实际应用，而不只记录概念描述。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q5-d1",
+                "dimension": "foundation_model_case",
+                "acceptance": "原文给出至少一个大模型用于缺陷检测的具体案例",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              },
+              {
+                "dimension_id": "dev-q5-d2",
+                "dimension": "foundation_model_technique",
+                "acceptance": "原文说明该应用采用的技术方式，如零样本或少样本",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q6",
+            "priority": 2,
+            "priority_tier": "P1",
+            "question": "工业视觉缺陷检测领域有哪些代表性厂商与产品，各自定位与差异是什么？",
+            "rationale": "建立厂商、产品和定位的竞争侧基线。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q6-d1",
+                "dimension": "vendors_and_products",
+                "acceptance": "原文列出至少两家厂商及其缺陷检测产品名称",
+                "minimum_accepted_sources": 2,
+                "requires_independent_sources": true
+              },
+              {
+                "dimension_id": "dev-q6-d2",
+                "dimension": "product_positioning",
+                "acceptance": "原文说明产品面向的行业或检测对象",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q7",
+            "priority": 2,
+            "priority_tier": "P1",
+            "question": "工业视觉缺陷检测当前面临的主要挑战有哪些，硬件与算法各占何种位置？",
+            "rationale": "建立现阶段工程约束和技术瓶颈基线。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q7-d1",
+                "dimension": "current_challenges",
+                "acceptance": "原文列出至少两项挑战并说明其影响",
+                "minimum_accepted_sources": 2,
+                "requires_independent_sources": true
+              },
+              {
+                "dimension_id": "dev-q7-d2",
+                "dimension": "hardware_and_algorithm_challenges",
+                "acceptance": "原文区分硬件层面与算法层面的挑战",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          },
+          {
+            "question_id": "dev-q8",
+            "priority": 3,
+            "priority_tier": "P2",
+            "question": "未来三年工业视觉缺陷检测在技术路线与市场应用上有哪些可核验的趋势判断？",
+            "rationale": "形成带时间范围和证据约束的趋势基线。",
+            "coverage_dimensions": [
+              {
+                "dimension_id": "dev-q8-d1",
+                "dimension": "three_year_trends",
+                "acceptance": "至少两个独立来源给出未来趋势或预测",
+                "minimum_accepted_sources": 2,
+                "requires_independent_sources": true
+              },
+              {
+                "dimension_id": "dev-q8-d2",
+                "dimension": "forecast_horizon_and_direction",
+                "acceptance": "原文明确预测时间范围或增长方向",
+                "minimum_accepted_sources": 1,
+                "requires_independent_sources": false
+              }
+            ]
+          }
+        ]
+      },
+      "coverage_dimensions": [
+        "system_components_and_functions",
+        "key_detection_metrics",
+        "traditional_method_families",
+        "traditional_method_scenarios",
+        "deep_learning_algorithm_families",
+        "algorithm_task_fit",
+        "data_scarcity_and_imbalance",
+        "data_augmentation_or_synthesis",
+        "foundation_model_case",
+        "foundation_model_technique",
+        "vendors_and_products",
+        "product_positioning",
+        "current_challenges",
+        "hardware_and_algorithm_challenges",
+        "three_year_trends",
+        "forecast_horizon_and_direction"
+      ],
+      "evidence_requirements": {
+        "acceptance_is_fixture_contract_only": true,
+        "requirements_are": "每个 coverage dimension 的最小可接受证据条件，沿用 reference plan 中已存在的要求。",
+        "does_not_change_runtime_acceptance_strategy": true
+      }
+    },
+    {
+      "benchmark_id": "v1-gen-multimodal-manufacturing",
+      "benchmark_version": "1.0.0",
+      "type": "generalization",
+      "pattern": "technical_trend",
+      "goal": "分析多模态大模型在工业制造中的应用趋势。",
+      "planner_mode": "dynamic",
+      "reference_plan": null,
+      "planner_recording": {
+        "must_record_input_goal": true,
+        "must_record_output_plan": true,
+        "must_record_question_count": true,
+        "must_record_priority_counts": true,
+        "must_record_runtime_coverage_mapping": true
+      },
+      "coverage_dimensions": [
+        "multimodal_model_capabilities_and_evolution",
+        "manufacturing_use_cases",
+        "representative_technical_approaches",
+        "deployment_constraints_and_limitations",
+        "current_trend_and_near_term_direction"
+      ],
+      "evidence_requirements": [
+        {
+          "dimension": "multimodal_model_capabilities_and_evolution",
+          "minimum_accepted_sources": 1,
+          "requires_independent_sources": false,
+          "acceptance": "来源明确描述多模态能力或技术演进，而非只有标题或摘要。"
+        },
+        {
+          "dimension": "manufacturing_use_cases",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "至少两个独立来源给出制造业具体应用或案例。"
+        },
+        {
+          "dimension": "representative_technical_approaches",
+          "minimum_accepted_sources": 1,
+          "requires_independent_sources": false,
+          "acceptance": "来源明确说明采用的模型、数据或部署方式。"
+        },
+        {
+          "dimension": "deployment_constraints_and_limitations",
+          "minimum_accepted_sources": 1,
+          "requires_independent_sources": false,
+          "acceptance": "来源明确说明成本、时延、数据、可靠性或安全约束中的至少一项。"
+        },
+        {
+          "dimension": "current_trend_and_near_term_direction",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "趋势判断具有明确时间范围或方向，并由独立来源支持。"
+        }
+      ]
+    },
+    {
+      "benchmark_id": "v1-gen-ai-agent-competition",
+      "benchmark_version": "1.0.0",
+      "type": "generalization",
+      "pattern": "industry_competition",
+      "goal": "分析 AI Agent 市场主要企业、产品和竞争格局。",
+      "planner_mode": "dynamic",
+      "reference_plan": null,
+      "planner_recording": {
+        "must_record_input_goal": true,
+        "must_record_output_plan": true,
+        "must_record_question_count": true,
+        "must_record_priority_counts": true,
+        "must_record_runtime_coverage_mapping": true
+      },
+      "coverage_dimensions": [
+        "major_companies_and_products",
+        "product_capability_positioning",
+        "business_model_and_distribution",
+        "competitive_landscape_and_differentiation",
+        "market_change_and_recent_momentum"
+      ],
+      "evidence_requirements": [
+        {
+          "dimension": "major_companies_and_products",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "至少两个独立来源支持企业、产品或排名事实。"
+        },
+        {
+          "dimension": "product_capability_positioning",
+          "minimum_accepted_sources": 1,
+          "requires_independent_sources": false,
+          "acceptance": "来源明确描述产品能力、目标客户或定位。"
+        },
+        {
+          "dimension": "business_model_and_distribution",
+          "minimum_accepted_sources": 1,
+          "requires_independent_sources": false,
+          "acceptance": "来源明确描述商业模式、定价、渠道或生态关系中的至少一项。"
+        },
+        {
+          "dimension": "competitive_landscape_and_differentiation",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "竞争判断必须有至少两个独立来源，不能只根据单一厂商自述。"
+        },
+        {
+          "dimension": "market_change_and_recent_momentum",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "市场变化或增长判断必须有时间标记和独立来源。"
+        }
+      ]
+    },
+    {
+      "benchmark_id": "v1-gen-low-altitude-economy",
+      "benchmark_version": "1.0.0",
+      "type": "generalization",
+      "pattern": "industry_trend",
+      "goal": "分析低空经济未来三年的产业发展趋势。",
+      "planner_mode": "dynamic",
+      "reference_plan": null,
+      "planner_recording": {
+        "must_record_input_goal": true,
+        "must_record_output_plan": true,
+        "must_record_question_count": true,
+        "must_record_priority_counts": true,
+        "must_record_runtime_coverage_mapping": true
+      },
+      "coverage_dimensions": [
+        "policy_and_regulatory_environment",
+        "market_size_and_growth",
+        "industry_players_and_applications",
+        "technology_and_infrastructure_trajectory",
+        "three_year_development_forecast"
+      ],
+      "evidence_requirements": [
+        {
+          "dimension": "policy_and_regulatory_environment",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "政策或监管判断必须引用可核验的官方或权威来源。"
+        },
+        {
+          "dimension": "market_size_and_growth",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "市场规模、增速等量化陈述必须由至少两个独立来源支持。"
+        },
+        {
+          "dimension": "industry_players_and_applications",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "至少两个独立来源支持主要企业、场景或落地案例。"
+        },
+        {
+          "dimension": "technology_and_infrastructure_trajectory",
+          "minimum_accepted_sources": 1,
+          "requires_independent_sources": false,
+          "acceptance": "来源明确描述技术、空域、起降设施或运营基础设施的演进。"
+        },
+        {
+          "dimension": "three_year_development_forecast",
+          "minimum_accepted_sources": 2,
+          "requires_independent_sources": true,
+          "acceptance": "预测必须明确未来三年时间范围、增长方向或关键不确定性。"
+        }
+      ]
+    }
+  ],
+  "metrics_schema": {
+    "recording_rule": "每次运行保存一个不可变 Metrics Snapshot；字段缺失时记录 null 和 unavailable_reason，不用推测值补齐。",
+    "fields": [
+      {
+        "name": "run_id",
+        "group": "configuration",
+        "source": "research_runs.id",
+        "calculation": "当前运行的唯一 ID。"
+      },
+      {
+        "name": "benchmark_id",
+        "group": "configuration",
+        "source": "fixture",
+        "calculation": "本文件中的 benchmark_id。"
+      },
+      {
+        "name": "benchmark_version",
+        "group": "configuration",
+        "source": "fixture",
+        "calculation": "本文件中的 benchmark_version。"
+      },
+      {
+        "name": "code_commit",
+        "group": "configuration",
+        "source": "git",
+        "calculation": "运行开始时的 HEAD commit。"
+      },
+      {
+        "name": "model",
+        "group": "configuration",
+        "source": "research_runs.llm_config_snapshot",
+        "calculation": "运行实际使用的模型。"
+      },
+      {
+        "name": "provider",
+        "group": "configuration",
+        "source": "research_runs.llm_config_snapshot",
+        "calculation": "运行实际使用的模型提供方。"
+      },
+      {
+        "name": "budget",
+        "group": "configuration",
+        "source": "research_runs.budget_snapshot or usage_snapshot",
+        "calculation": "运行时预算配置及消耗快照。"
+      },
+      {
+        "name": "question_count",
+        "group": "planning",
+        "source": "research_plan_items",
+        "calculation": "当前最终 plan version 的问题数。"
+      },
+      {
+        "name": "p0_count",
+        "group": "planning",
+        "source": "research_plan_items.priority",
+        "calculation": "runtime priority=1 的问题数；见 priority_mapping。"
+      },
+      {
+        "name": "p1_count",
+        "group": "planning",
+        "source": "research_plan_items.priority",
+        "calculation": "runtime priority=2 的问题数。"
+      },
+      {
+        "name": "p2_count",
+        "group": "planning",
+        "source": "research_plan_items.priority",
+        "calculation": "runtime priority=3 的问题数。"
+      },
+      {
+        "name": "plan_version",
+        "group": "planning",
+        "source": "research_runs.plan_version",
+        "calculation": "最终使用的 plan version。"
+      },
+      {
+        "name": "runtime_coverage_mapping",
+        "group": "planning",
+        "source": "run-time plan/evaluator record",
+        "calculation": "问题 ID 到 fixture coverage dimension ID 的映射；Generalization 必须在运行结果中保存。"
+      },
+      {
+        "name": "provider_requests",
+        "group": "search",
+        "source": "usage_snapshot.search_provider_requests or search.completed.metrics.provider_requests",
+        "calculation": "向搜索 provider 发出的请求次数。"
+      },
+      {
+        "name": "logical_queries",
+        "group": "search",
+        "source": "usage_snapshot.logical_queries or research_search_queries",
+        "calculation": "逻辑查询数；排除明确标记为 cache reuse 的请求。"
+      },
+      {
+        "name": "search_candidates",
+        "group": "search",
+        "source": "usage_snapshot.candidate_urls or search event result_count",
+        "calculation": "搜索返回的候选 URL 数。"
+      },
+      {
+        "name": "relevant_candidates",
+        "group": "search",
+        "source": "run-time relevance record",
+        "calculation": "被判定与问题相关的候选数；当前 baseline schema 未持久化时记录 null，不从 accepted evidence 反推。",
+        "availability": "not_persisted_in_current_baseline"
+      },
+      {
+        "name": "read_attempts",
+        "group": "reading",
+        "source": "usage_snapshot.page_fetch_attempts",
+        "calculation": "页面读取尝试次数。"
+      },
+      {
+        "name": "successful_reads",
+        "group": "reading",
+        "source": "source.fetched events",
+        "calculation": "成功取得页面内容的来源数。"
+      },
+      {
+        "name": "failed_reads",
+        "group": "reading",
+        "source": "usage_snapshot.page_read_failures or source.rejected events",
+        "calculation": "读取失败或被拒绝的来源数。"
+      },
+      {
+        "name": "extraction_count",
+        "group": "reading",
+        "source": "usage_snapshot.extraction_calls or evidence.extraction_started events",
+        "calculation": "证据抽取调用次数。"
+      },
+      {
+        "name": "candidate_evidence",
+        "group": "evidence",
+        "source": "quality_snapshot.candidate_evidence",
+        "calculation": "候选证据条数。"
+      },
+      {
+        "name": "accepted_evidence",
+        "group": "evidence",
+        "source": "quality_snapshot.accepted_evidence",
+        "calculation": "通过现有 Evidence Acceptance 的证据条数。"
+      },
+      {
+        "name": "rejected_evidence",
+        "group": "evidence",
+        "source": "quality_snapshot or evidence records",
+        "calculation": "候选证据中未被接受的条数；不能把缺失记录默认为拒绝。"
+      },
+      {
+        "name": "independent_source_count",
+        "group": "evidence",
+        "source": "quality_snapshot.independent_source_count",
+        "calculation": "接受证据覆盖的独立 source_owner 数。"
+      },
+      {
+        "name": "coverage",
+        "group": "research_quality",
+        "source": "quality_snapshot.coverage",
+        "calculation": "沿用当前 V1 quality snapshot 的 coverage。"
+      },
+      {
+        "name": "priority_one_coverage",
+        "group": "research_quality",
+        "source": "quality_snapshot.priority_one_coverage",
+        "calculation": "保留当前 V1 生产指标原名和语义；在本 fixture 的三档映射中等价于 P0 coverage。"
+      },
+      {
+        "name": "cross_validation",
+        "group": "research_quality",
+        "source": "quality_snapshot.cross_validation",
+        "calculation": "沿用当前 V1 quality snapshot 的 cross validation。"
+      },
+      {
+        "name": "critical_gaps",
+        "group": "research_quality",
+        "source": "quality_snapshot.critical_gaps",
+        "calculation": "沿用当前 V1 quality snapshot 的关键缺口列表。"
+      },
+      {
+        "name": "replans",
+        "group": "agent_behavior",
+        "source": "usage_snapshot.replans or replan events",
+        "calculation": "发生的 replan 次数；不对 replan 行为设定新的通过阈值。"
+      },
+      {
+        "name": "retry_count",
+        "group": "agent_behavior",
+        "source": "question.retry_scheduled events",
+        "calculation": "问题级 retry 次数。"
+      },
+      {
+        "name": "search_reused",
+        "group": "agent_behavior",
+        "source": "usage_snapshot.search_reuses or search reuse events",
+        "calculation": "被标记为复用的搜索次数。"
+      },
+      {
+        "name": "source_space_exhausted",
+        "group": "agent_behavior",
+        "source": "search.source_space_exhausted events",
+        "calculation": "source space exhausted 事件次数。"
+      },
+      {
+        "name": "question_yielded",
+        "group": "agent_behavior",
+        "source": "usage_snapshot.question_yields or question.yielded events",
+        "calculation": "被 yield 的问题数。"
+      },
+      {
+        "name": "budget_usage",
+        "group": "agent_behavior",
+        "source": "usage_snapshot and budget_snapshot",
+        "calculation": "请求、读取、抽取、时间等预算池的配置与实际消耗。"
+      },
+      {
+        "name": "termination_status",
+        "group": "agent_behavior",
+        "source": "research_runs.status and termination event",
+        "calculation": "运行结束状态及终止原因。"
+      }
+    ]
+  },
+  "run_record_schema": {
+    "storage": "可先保存为与 benchmark fixture 同版本控制策略一致的 JSON/JSONB 记录；不新增运行时表，不改变现有 DB schema。",
+    "required_fields": [
+      "run_id",
+      "benchmark_id",
+      "benchmark_version",
+      "code_commit",
+      "plan_version",
+      "metrics_snapshot",
+      "evidence_summary",
+      "termination_status"
+    ],
+    "record": {
+      "run_id": "string",
+      "benchmark_id": "string",
+      "benchmark_version": "string",
+      "code_commit": "string",
+      "plan_version": "integer|null",
+      "planner_input_goal": "string",
+      "planner_output": "object|null",
+      "metrics_snapshot": "object",
+      "evidence_summary": {
+        "candidate_evidence": "integer|null",
+        "accepted_evidence": "integer|null",
+        "independent_source_count": "integer|null",
+        "critical_gaps": "array|null"
+      },
+      "termination_status": {
+        "status": "string",
+        "reason": "string|null"
+      },
+      "unavailable_metrics": "array"
+    },
+    "generalization_requirement": "动态 Planner 的实际输出、问题数、优先级分布和 coverage mapping 必须随 run record 保存；不能用预设 Reference Plan 代替。"
+  },
+  "later_run_plan": {
+    "development": "使用冻结 Reference Plan，先运行并记录完整 Metrics Snapshot，再将结果作为后续回归比较基线。",
+    "generalization": "每个 benchmark 至少运行一次动态 Planner；记录 planner input/output、question count、priority counts、coverage mapping 和完整指标。",
+    "comparison": "先比较同一 benchmark/version 下不同 code commit；benchmark version 变化时不直接混合比较。",
+    "not_done_in_phase_1": [
+      "付费真实 E2E",
+      "Gap repair",
+      "cache reuse 根因修复",
+      "source_space_exhausted 根因修复",
+      "Research Loop、Scheduler、Budget、Coverage、Evidence Acceptance、Planner 或 Search 行为修改"
+    ]
+  }
+}
