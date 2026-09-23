@@ -84,7 +84,7 @@ python scripts/release_gate.py --v1-closeout --v1-source-revision "<提交版本
 - 首次启动需要网络访问以获取镜像/依赖；
 - Windows 一键启动需要 PowerShell；手动启动可使用支持 Docker Compose 的操作系统。
 
-V1 RC 使用 `v1.0.0-rc.1` 与冻结配置 `v1-pre-rc-reference-1`：
+V1 RC 使用 `v1.1.0-rc.1`（previous release: `v1.0.0`）与冻结配置 `v1-pre-rc-reference-1`：
 `EVIDENCE_AWARE_CONTEXT_ENABLED=false`、
 `INDEPENDENT_SOURCE_TARGETING_ENABLED=true`、
 `EVIDENCE_INPUT_QUALITY_ENABLED=false`。这些开关由 Compose 显式传给 API 和 Worker；

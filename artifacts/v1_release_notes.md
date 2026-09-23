@@ -1,20 +1,37 @@
-# DeepResearch Agent V1 Release Notes (Candidate)
+# DeepResearch Agent V1.1 Release Notes — Candidate
 
-Release target: `v1.0.0`
-
-Current candidate identity: `v1.0.0-rc.1`
+Previous release: `v1.0.0`
+New release: `v1.1.0`
+Current candidate identity: `v1.1.0-rc.1`
+Validated research/runtime base commit: `466eefd301a6dfa24e39b58d0cf50a1b8c59a037`
 Frozen reference: `v1-pre-rc-reference-1`
 
-## Product scope
+This is an incremental release in the V1 product line, not a new V2 product. The existing `v1.0.0` tag and GitHub Release are immutable and unchanged.
 
-V1 is a generic autonomous research agent with evidence grounding, gap-aware research, independent-source targeting, event traceability, and evidence-backed report generation. It is not positioned as a mature, uniformly high-stability deep-research product; results vary by task family and provider availability.
+## Main changes since v1.0.0
 
-## Main capabilities
+- Expanded the research pipeline with explicit candidate/dispatch, reader, evidence-selection, and evidence lifecycle observability.
+- Added question-level research state and recovery execution/context tracing, including recovery outcome and gap-closure feedback paths.
+- Added evidence-to-requirement alignment and closure evaluation integration, plus feedback-driven query execution wiring.
+- Improved provider failure classification, retry/fallback routing, and research continuation under provider degradation.
+- Added benchmark, evidence-quality, gap-closure, and release qualification analysis artifacts and regression coverage.
+- Improved release reproducibility: committed the audited runtime/migration file set, aligned build/source provenance, and verified clean-worktree Docker/schema/report plumbing.
 
-- Docker Compose deployment with API, web, worker, dispatcher, beat, PostgreSQL, Redis and SearXNG.
-- Multi-step research plans, query/search, safe web reading, evidence extraction and acceptance, coverage/gap evaluation, and report verification.
-- Persisted run events and state, report retrieval, and explicit no-evidence failure rather than fabricated reports.
-- Independent-source targeting is active in the frozen V1 reference configuration.
+These are pipeline, reliability, evaluation, and packaging changes. They do not imply uniformly high research coverage; results remain task-family dependent.
+
+## Qualification reference
+
+Phase 17.0 cross-family qualification:
+
+| Family | Coverage |
+|---|---:|
+| Model comparison | `0.7143 ± 0.1010` |
+| AI-agent competition | `0.8088` (one run; limited sample) |
+| Multimodal manufacturing | `0.6532 ± 0.1466` |
+| Low-altitude economy | `0.2500 ± 0.1782` |
+| Cross-family macro-average | Mean ≈ `0.6066`; median ≈ `0.6837` |
+
+Low-altitude economy remains a severe task-family limitation. The deployment smoke is plumbing evidence, not a new qualification benchmark.
 
 ## Frozen features
 
@@ -22,30 +39,12 @@ V1 is a generic autonomous research agent with evidence grounding, gap-aware res
 - `evidence_aware_context_enabled=false` — EXPERIMENTAL_DISABLED.
 - `evidence_input_quality_enabled=false` — EXPERIMENTAL_DISABLED.
 
-## Qualification summary
+## Deployment and limitations
 
-Phase 17.0 cross-family qualification references:
+The maintained deployment path is local Docker Compose. Copy `.env.example` to `.env`, configure provider credentials through the supported profile UI, then use `docker compose up -d --build`; see README for checkpoint initialization, API endpoints, and health checks. Production deployment hardening is not claimed.
 
-| Family | Result |
-|---|---:|
-| Model comparison | `0.7143 ± 0.1010` |
-| AI-agent competition | `0.8088` |
-| Multimodal manufacturing | `0.6532 ± 0.1466` |
-| Low-altitude economy | `0.2500 ± 0.1782` |
-| Cross-family | Mean ≈ `0.6066`; median ≈ `0.6837` |
+See [`v1_known_issues.md`](./v1_known_issues.md) for low-altitude coverage weakness, run variance, the per-claim verified-claim limitation, q1 projection inconsistency, historical provenance gaps, and disabled experimental features. Semantic claim equivalence, cross-source corroboration, per-claim independent verification, source-role redesign, advanced evidence-input quality, and bounded variance-reduction work remain deferred.
 
-Low-altitude economy is a known severe family limitation, not representative evidence of uniform performance. Phase 17.1 standard deployment smoke produced accepted evidence, persisted a report, fetched it through the application service and verified it. The separate no-evidence path correctly refused to fabricate a report.
+## Version-correction scope
 
-## Deployment
-
-The maintained deployment path in this candidate is local Docker Compose. Copy `.env.example` to `.env`, configure provider credentials through the supported profile UI, then use `docker compose up -d --build`; see README for checkpoint initialization, API endpoints and health checks. Production hardening/deployment is not claimed by this candidate.
-
-## Known limitations
-
-See [`v1_known_issues.md`](./v1_known_issues.md): low-altitude task-family weakness, run variance, no per-claim verified-claim output, q1 projection inconsistency without proven user-visible impact, historical provenance gaps, and disabled experimental features.
-
-## Deferred beyond V1
-
-Semantic claim equivalence; cross-source claim corroboration; per-claim independent verification; source-role semantic redesign; advanced evidence-input quality; and bounded variance-reduction work.
-
-This is a packaging candidate note, not a publication announcement. The release gate is currently blocked by uncommitted source/schema provenance; do not treat it as a released `v1.0.0` build.
+The v1.1.0 change is a release/package metadata correction based on the validated research/runtime commit above; it does not change Research Intelligence behavior. This release-metadata commit establishes the final candidate identity. The final candidate will receive clean-worktree reproducibility checks and a single plumbing smoke; no benchmark qualification suite is rerun. These notes describe a candidate, not an already-published release. No v1.1.0 tag, push, GitHub Release, or production deployment has been performed.

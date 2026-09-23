@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     app_name: str = "DeepResearch Agent"
     app_env: str = "development"
-    app_version: str = "1.0.0-rc.1"
+    app_version: str = "1.1.0-rc.1"
     source_revision: str = "development"
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
