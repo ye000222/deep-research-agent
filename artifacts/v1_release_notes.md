@@ -1,27 +1,28 @@
-# DeepResearch Agent V1.1 Release Notes — Candidate
+# Deep Research Agent V1.1.0 Release Notes
 
 Previous release: `v1.0.0`
-New release: `v1.1.0`
-Current candidate identity: `v1.1.0-rc.1`
-Validated research/runtime base commit: `466eefd301a6dfa24e39b58d0cf50a1b8c59a037`
-Frozen reference: `v1-pre-rc-reference-1`
+Release: `v1.1.0`
+Runtime-validated base: `36c920f58196a258dbcc215f5f76aec9a0582243`
+Research/runtime qualification base: `466eefd301a6dfa24e39b58d0cf50a1b8c59a037`
 
-This is an incremental release in the V1 product line, not a new V2 product. The existing `v1.0.0` tag and GitHub Release are immutable and unchanged.
+V1.1.0 is an incremental release in the V1 product line, not a new V2 product. The existing `v1.0.0` release remains unchanged and immutable. The final release documentation commit is documentation-only and does not change runtime or Research Intelligence behavior.
 
-## Main changes since v1.0.0
+## What's New
 
-- Expanded the research pipeline with explicit candidate/dispatch, reader, evidence-selection, and evidence lifecycle observability.
-- Added question-level research state and recovery execution/context tracing, including recovery outcome and gap-closure feedback paths.
-- Added evidence-to-requirement alignment and closure evaluation integration, plus feedback-driven query execution wiring.
+- Expanded observability across candidate dispatch, reader, evidence selection, and evidence lifecycle stages.
+- Added question-level research state and recovery execution/context tracing, including recovery outcomes and gap-closure feedback.
+- Added evidence-to-requirement alignment and closure evaluation integration, with feedback-driven query execution wiring.
 - Improved provider failure classification, retry/fallback routing, and research continuation under provider degradation.
-- Added benchmark, evidence-quality, gap-closure, and release qualification analysis artifacts and regression coverage.
-- Improved release reproducibility: committed the audited runtime/migration file set, aligned build/source provenance, and verified clean-worktree Docker/schema/report plumbing.
+- Added benchmark, evidence-quality, gap-closure, and release-qualification analysis artifacts and regression coverage.
+- Improved release reproducibility through audited runtime/migration provenance and clean-worktree Docker, schema, and report-plumbing validation.
 
-These are pipeline, reliability, evaluation, and packaging changes. They do not imply uniformly high research coverage; results remain task-family dependent.
+## Validation
 
-## Qualification reference
+Runtime and reproducibility validation was completed against the runtime-validated base before this documentation-only finalization. Validation covered clean Docker builds, migration verification, API/Worker/runtime provenance, static quality gates, and live research execution plumbing.
 
-Phase 17.0 cross-family qualification:
+The final-candidate standard smoke reached Search, Reader, and Evidence Extraction but produced no Candidate or Accepted Evidence; the application correctly declined to persist an unsupported report. The final smoke variance audit classified this as live research variance, with no confirmed configuration regression, correctness bug, or P0. A prior standard run demonstrated persisted and verified report plumbing, but the two runs differ in plan and retrieved-source outcomes and are not a controlled quality comparison. A deployment smoke is plumbing evidence, not a qualification benchmark.
+
+Phase 17.0 cross-family qualification reference:
 
 | Family | Coverage |
 |---|---:|
@@ -31,20 +32,22 @@ Phase 17.0 cross-family qualification:
 | Low-altitude economy | `0.2500 ± 0.1782` |
 | Cross-family macro-average | Mean ≈ `0.6066`; median ≈ `0.6837` |
 
-Low-altitude economy remains a severe task-family limitation. The deployment smoke is plumbing evidence, not a new qualification benchmark.
+## Known Limitations
 
-## Frozen features
+- Research outcomes have meaningful run-to-run variance; research completion and coverage are not guaranteed for every live task.
+- Low-altitude economy remains a severe task-family coverage weakness.
+- Per-claim verified-claim output remains limited; cross-source corroboration and semantic claim equivalence are incomplete.
+- The q1 projection inconsistency and source-role semantics remain known limitations.
+- Production deployment hardening is not claimed. The maintained deployment path is local Docker Compose; see the README for setup and health checks.
+
+See [`v1_known_issues.md`](./v1_known_issues.md) for the detailed limitations and their disposition.
+
+## Experimental Features
 
 - `independent_source_targeting_enabled=true` — ACTIVE_V1.
 - `evidence_aware_context_enabled=false` — EXPERIMENTAL_DISABLED.
 - `evidence_input_quality_enabled=false` — EXPERIMENTAL_DISABLED.
 
-## Deployment and limitations
+## V2 Deferred Work
 
-The maintained deployment path is local Docker Compose. Copy `.env.example` to `.env`, configure provider credentials through the supported profile UI, then use `docker compose up -d --build`; see README for checkpoint initialization, API endpoints, and health checks. Production deployment hardening is not claimed.
-
-See [`v1_known_issues.md`](./v1_known_issues.md) for low-altitude coverage weakness, run variance, the per-claim verified-claim limitation, q1 projection inconsistency, historical provenance gaps, and disabled experimental features. Semantic claim equivalence, cross-source corroboration, per-claim independent verification, source-role redesign, advanced evidence-input quality, and bounded variance-reduction work remain deferred.
-
-## Version-correction scope
-
-The v1.1.0 change is a release/package metadata correction based on the validated research/runtime commit above; it does not change Research Intelligence behavior. This release-metadata commit establishes the final candidate identity. The final candidate will receive clean-worktree reproducibility checks and a single plumbing smoke; no benchmark qualification suite is rerun. These notes describe a candidate, not an already-published release. No v1.1.0 tag, push, GitHub Release, or production deployment has been performed.
+Semantic claim equivalence, cross-source corroboration, per-claim independent verification, source-role redesign, advanced evidence-input quality, and bounded variance-reduction work remain deferred. These limitations are not represented as completed capabilities in this release.
