@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TypedDict, cast
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import and_, distinct, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -29,7 +29,17 @@ from app.domain.adaptive_scheduler import (
     query_family_for_attempt,
     source_role_fits_claim,
 )
+from app.domain.closure_evaluation_context import ClosureEvaluationContext
+from app.domain.closure_evaluator import ClosureEvaluationExecution, ClosureEvaluator
+from app.domain.closure_feedback import ClosureFeedback, ClosureFeedbackGenerator
+from app.domain.closure_feedback_completeness_pass import (
+    run_closure_feedback_completeness_pass,
+)
+from app.domain.closure_feedback_dispatcher import ClosureFeedbackDispatcher
 from app.domain.evaluation import EvaluationScope, EvaluationSnapshot, EvaluationVerdict
+from app.domain.evidence_alignment import EvidenceAlignment
+from app.domain.evidence_alignment_executor import EvidenceAlignmentExecutor
+from app.domain.evidence_alignment_request import EvidenceAlignmentRequest
 from app.domain.evidence_graph import (
     EvidenceGraphClaimEdgeView,
     EvidenceGraphClaimNode,
@@ -40,8 +50,52 @@ from app.domain.evidence_graph import (
     claim_fingerprint,
     derive_claim_status,
 )
+from app.domain.evidence_quality_analyzer import build_feedback_analysis
+from app.domain.feedback_execution import (
+    FeedbackExecutionContext,
+    feedback_execution_allowed,
+)
+from app.domain.gap_closure import (
+    GAP_STATE_SOURCE_PRIORITY,
+    ClosureEvaluation,
+    ClosureSnapshot,
+    GapClosureStatus,
+    GapRequirement,
+    GapRequirementType,
+    VerificationStatus,
+    gap_requirement_id,
+    project_gap_requirements,
+)
+from app.domain.gap_projection import project_research_gaps
 from app.domain.identifiers import uuid7
+from app.domain.provider_failure_classification import (
+    ProviderFailureType,
+    classify_provider_failure,
+    retry_decision,
+)
+from app.domain.provider_health import (
+    ProviderHealthTracker,
+    ProviderHealthUpdate,
+)
+from app.domain.provider_registry import SearchProviderRegistry
+from app.domain.provider_router import ProviderRouter, ProviderSelectionDecision
 from app.domain.providers import TokenUsage, UsageAccuracy
+from app.domain.query_candidate import QueryCandidateGenerator
+from app.domain.query_candidate_ranking import QueryCandidateRanker
+from app.domain.query_candidate_validation import QueryCandidateValidator
+from app.domain.query_execution import QueryExecutionAdapter
+from app.domain.query_plan_validation import QueryPlanValidator
+from app.domain.question_research_state import (
+    QuestionResearchFacts,
+    project_question_research_state,
+)
+from app.domain.recovery_execution import (
+    RecoveryContext,
+    RecoveryOutcome,
+    build_recovery_event,
+    clear_recovery_context,
+    merge_recovery_context,
+)
 from app.domain.research_budget import (
     allocate_research_call,
     build_resource_pool_snapshot,
@@ -53,14 +107,31 @@ from app.domain.research_budget import (
     model_token_pool_for_node,
     model_token_pool_limits,
 )
+from app.domain.research_context import (
+    EXISTING_SOURCE_OWNERS_KEY,
+    MISSING_SOURCE_COUNT_KEY,
+    REQUIRED_SOURCE_COUNT_KEY,
+    TARGET_CLAIM_ID_KEY,
+)
+from app.domain.research_context_enricher import ResearchContextEnrichmentResult
+from app.domain.research_context_resolver import (
+    ResearchContextResolver,
+    ResolvedResearchContext,
+)
 from app.domain.research_management import ResearchFactCounts, calculate_information_gain
-from app.domain.research_runs import RunPhase, RunStatus
+from app.domain.research_query_intent import ResearchQueryIntentGenerator
+from app.domain.research_query_plan import ResearchQueryPlanGenerator
+from app.domain.research_runs import EXECUTION_LEASE_SECONDS, RunPhase, RunStatus
 from app.domain.research_tools import (
     EvidenceView,
     ReadPage,
     ReusablePageRef,
     ScoredEvidence,
     SearchResult,
+)
+from app.domain.run_closure_feedback_finalizer import (
+    finalize_run_closure_feedback,
+    is_terminal_run_stop_reason,
 )
 from app.domain.source_policy import normalize_source_url, source_owner_key
 from app.infrastructure.db.evaluation_models import EvaluationSnapshotRow
@@ -75,8 +146,10 @@ from app.infrastructure.db.evidence_graph_relations import (
     RelationRefreshStats,
     refresh_question_relations,
 )
+from app.infrastructure.db.gap_requirements import GapRequirementRepository
 from app.infrastructure.db.model_budget_models import ModelBudgetReservationRow
 from app.infrastructure.db.research_models import (
+    GapRequirementRow,
     ResearchEvidenceRow,
     ResearchGapRow,
     ResearchSourceRow,
@@ -105,8 +178,213 @@ def search_query_duplicate_key(question_id: str, query: str) -> str:
     return hashlib.sha256(f"{question_id}:{normalized_query}".encode()).hexdigest()
 
 
+NUL_BYTE = "\x00"
+
+
+def nul_safe_text(value: str) -> str:
+    """Strip NUL (0x00) bytes before a caller-supplied string reaches Postgres.
+
+    A defensive storage-only guard: PostgreSQL ``text`` columns reject 0x00,
+    and live web pages occasionally carry it, which otherwise aborts the whole
+    run at the page-ingestion write.  This deletes only the un-storable control
+    byte; every other character is preserved byte-for-byte (normal text is
+    returned unchanged, and consecutive NULs never disturb the surrounding
+    content).  It changes no research decision, query, evidence evaluation, or
+    closure behavior.
+    """
+
+    if NUL_BYTE not in value:
+        return value
+    return value.replace(NUL_BYTE, "")
+
+
 class ResearchLeaseLostError(RuntimeError):
     pass
+
+
+_CANDIDATE_SKIP_REASONS = frozenset(
+    {
+        "duplicate",
+        "low_quality",
+        "budget_limit",
+        "domain_restricted",
+        "already_processed",
+    }
+)
+_CANDIDATE_DISPATCH_SKIP_REASONS = frozenset(
+    {
+        "page_budget",
+        "source_diversity",
+        "relevance_rank",
+        "already_selected",
+    }
+)
+_CANDIDATE_EVENT_TYPES = {
+    "candidate_created": "candidate.created",
+    "url_normalized": "candidate.normalized",
+    "duplicate_checked": "candidate.duplicate_checked",
+    "candidate_skipped": "candidate.skipped",
+    "fetch_started": "candidate.fetch_started",
+    "fetch_failed": "candidate.fetch_failed",
+    "fetch_success": "candidate.fetch_success",
+    "triage_rejected": "candidate.triage_rejected",
+    "extraction_started": "candidate.extraction_started",
+    "extraction_failed": "candidate.extraction_failed",
+    "readable": "candidate.readable",
+    "dispatch_started": "candidate.dispatch_started",
+    "dispatch_selected": "candidate.dispatch_selected",
+    "dispatch_skipped": "candidate.dispatch_skipped",
+}
+
+_EVIDENCE_SELECTION_SKIP_REASONS = frozenset(
+    {
+        "already_processed",
+        "duplicate_source",
+        "extraction_budget",
+        "question_budget",
+        "token_budget",
+        "source_diversity",
+        "low_evidence_value",
+        "question_mismatch",
+        "page_limit",
+    }
+)
+_EVIDENCE_SELECTION_EVENT_TYPES = {
+    "selection_started": "evidence.selection_started",
+    "selection_selected": "evidence.selection_selected",
+    "selection_skipped": "evidence.selection_skipped",
+}
+
+# Phase 12.4: the Provider Registry is the single source of the candidate pool.
+# This tuple is only a defensive fallback for callers (mostly unit-test fakes)
+# that construct a repository without an injected registry; the worker always
+# injects a real :class:`SearchProviderRegistry`, so production routing reads
+# ``registry.active_providers()`` and never relies on this constant.
+_SEARCH_CANDIDATE_PROVIDERS: tuple[str, ...] = ("SearXNG", "Bing")
+_RECOVERY_PROPAGATED_EVENT_TYPES = frozenset(
+    {
+        "search.query.started",
+        "search.completed",
+        "search.reused",
+        "candidate.created",
+        "candidate.normalized",
+        "candidate.duplicate_checked",
+        "candidate.skipped",
+        "candidate.dispatch_started",
+        "candidate.dispatch_selected",
+        "candidate.dispatch_skipped",
+        "candidate.fetch_started",
+        "candidate.fetch_failed",
+        "candidate.fetch_success",
+        "candidate.readable",
+        "source.fetch_started",
+        "source.fetch_success",
+        "source.fetch_failed",
+        "source.parse_started",
+        "source.parse_success",
+        "source.parse_failed",
+        "source.content_extracted",
+        "source.content_quality_passed",
+        "source.content_quality_rejected",
+        "source.readable",
+        "evidence.selection_started",
+        "evidence.selection_selected",
+        "evidence.selection_skipped",
+        "evidence.extraction_started",
+        "evidence.extracted",
+        "evidence.alignment.started",
+        "evidence.alignment.completed",
+        "evidence.alignment.failed",
+        "gap.closure.started",
+        "gap.closure.transition",
+        "gap.closure.completed",
+        "evaluation.completed",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateIdentity:
+    """Stable identity and provenance carried by a search candidate."""
+
+    candidate_id: str
+    raw_url: str
+    normalized_url: str
+    question_id: str
+    query_id: str
+    domain: str
+
+
+def candidate_lifecycle_event(
+    identity: CandidateIdentity,
+    stage: str,
+    *,
+    reason: str | None = None,
+    failure_reason: str | None = None,
+    timestamp: datetime | None = None,
+) -> dict[str, object]:
+    """Build the bounded, queryable payload for one candidate lifecycle step."""
+
+    if stage not in _CANDIDATE_EVENT_TYPES:
+        raise ValueError(f"unsupported candidate lifecycle stage: {stage}")
+    if stage == "candidate_skipped" and reason not in _CANDIDATE_SKIP_REASONS:
+        raise ValueError(f"unsupported candidate skip reason: {reason}")
+    if stage == "dispatch_skipped" and reason not in _CANDIDATE_DISPATCH_SKIP_REASONS:
+        raise ValueError(f"unsupported candidate dispatch skip reason: {reason}")
+    if stage == "fetch_failed" and not failure_reason:
+        raise ValueError("fetch_failed requires failure_reason")
+    refs: dict[str, object] = {
+        "candidate_id": identity.candidate_id,
+        "raw_url": identity.raw_url[:1000],
+        "normalized_url": identity.normalized_url[:1000],
+        "question_id": identity.question_id,
+        "query_id": identity.query_id,
+        "domain": identity.domain[:255],
+        "stage": stage,
+        "timestamp": (timestamp or datetime.now(UTC)).isoformat(),
+    }
+    if reason is not None:
+        refs["reason"] = reason
+    if failure_reason is not None:
+        refs["failure_reason"] = failure_reason[:100]
+    return {
+        "event_type": _CANDIDATE_EVENT_TYPES[stage],
+        "refs": refs,
+    }
+
+
+def evidence_selection_lifecycle_event(
+    identity: CandidateIdentity,
+    stage: str,
+    *,
+    reason: str | None = None,
+    source_id: UUID | str | None = None,
+    timestamp: datetime | None = None,
+) -> dict[str, object]:
+    """Build one queryable Evidence Selection lifecycle event."""
+
+    if stage not in _EVIDENCE_SELECTION_EVENT_TYPES:
+        raise ValueError(f"unsupported evidence selection stage: {stage}")
+    if stage == "selection_skipped" and reason not in _EVIDENCE_SELECTION_SKIP_REASONS:
+        raise ValueError(f"unsupported evidence selection skip reason: {reason}")
+    refs: dict[str, object] = {
+        "candidate_id": identity.candidate_id,
+        "raw_url": identity.raw_url[:1000],
+        "normalized_url": identity.normalized_url[:1000],
+        "question_id": identity.question_id,
+        "query_id": identity.query_id,
+        "domain": identity.domain[:255],
+        "stage": stage,
+        "timestamp": (timestamp or datetime.now(UTC)).isoformat(),
+    }
+    if reason is not None:
+        refs["reason"] = reason
+    if source_id is not None:
+        refs["source_id"] = str(source_id)
+    return {
+        "event_type": _EVIDENCE_SELECTION_EVENT_TYPES[stage],
+        "refs": refs,
+    }
 
 
 # A gap retry is deliberately cheaper than a productive research round when
@@ -117,7 +395,12 @@ class ResearchLeaseLostError(RuntimeError):
 # counter) decide when research is terminal.
 # Four explicit QueryFamily actions replace the old implicit suffix cycle.
 _MAX_GAP_ATTEMPTS = 4
-_MAX_REPLANS = 8
+# Allow several genuinely different gap-resolution passes.  Query hashes remain
+# run-scoped, so this is bounded retry headroom rather than permission to replay
+# the same search.  Eight passes was too small once a polluted hint consumed a
+# family; after hint compaction, twelve gives both P1 corroboration and vendor
+# product gaps a fair recovery window.
+_MAX_REPLANS = 12
 _LOW_INFORMATION_GAIN_THRESHOLD = 0.10
 _LOW_INFORMATION_GAIN_STREAK_TO_STOP = 2
 _MAX_EVIDENCE_MODEL_CALL_TOKENS = 12_000
@@ -128,6 +411,24 @@ _MODEL_RESERVATION_LEASE = timedelta(minutes=15)
 # compact contract when the available call budget is small.
 _MIN_EVIDENCE_MODEL_CALL_TOKENS = 3_000
 _MAX_REPORT_WRITER_RESERVE_TOKENS = 15_000
+# SearXNG may fan one logical query out to several engine groups. A per-target
+# cap prevents one empty/unstable query from consuming the entire run-wide
+# provider pool before untouched questions receive their first search.
+_MAX_PROVIDER_REQUESTS_PER_QUERY = 3
+_GLOBAL_TRIAGE_FAILURE_REASONS = frozenset(
+    {
+        "body_too_short",
+        "login_or_navigation_page",
+        "prompt_injection_detected",
+    }
+)
+_NON_DETERMINISTIC_PAGE_FAILURE_SUFFIXES = (
+    "_DNS_FAILED",
+    "_NETWORK_ERROR",
+    "_PROVIDER_UNAVAILABLE",
+    "_TIMEOUT",
+)
+_FAILED_OWNER_EXCLUSION_THRESHOLD = 2
 _NON_CONSUMING_ITERATION_OUTCOMES = frozenset(
     {
         "yield_question",
@@ -141,6 +442,91 @@ _NON_CONSUMING_ITERATION_OUTCOMES = frozenset(
         "budget_exhausted",
     }
 )
+_SEARCH_ACQUISITION_BUDGET_REASONS = frozenset(
+    {
+        "search_budget_exhausted",
+        "logical_query_budget_exhausted",
+        "provider_request_budget_exhausted",
+        "page_fetch_attempt_budget_exhausted",
+    }
+)
+
+
+def _search_acquisition_budget_exhausted(reason: str | None) -> bool:
+    """Return whether new searches are blocked while cached work may continue."""
+
+    return reason in _SEARCH_ACQUISITION_BUDGET_REASONS
+
+
+def _fair_provider_request_allowance(
+    remaining_requests: int,
+    unattempted_questions: int,
+    *,
+    per_query_cap: int = _MAX_PROVIDER_REQUESTS_PER_QUERY,
+) -> int:
+    """Share remaining upstream capacity across untouched questions first."""
+
+    remaining = max(0, int(remaining_requests))
+    if remaining == 0:
+        return 0
+    untouched = max(0, int(unattempted_questions))
+    fair_share = (
+        max(1, remaining // untouched)
+        if untouched
+        else remaining
+    )
+    return min(remaining, max(1, int(per_query_cap)), fair_share)
+
+
+def _source_failure_feedback(
+    events: Iterable[tuple[str, Mapping[str, object]]],
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Return run-wide failed URLs and repeatedly unusable source owners.
+
+    A URL that already failed reading should not consume another page slot in
+    the same run.  Domain-level exclusion is deliberately more conservative:
+    only deterministic failures count and an owner must fail twice before it
+    is removed from later search results.  Topic mismatch remains
+    question-local because the same page may answer another plan item.
+    """
+
+    failed_urls: set[str] = set()
+    deterministic_owner_failures: dict[str, int] = {}
+    for event_type, refs in events:
+        primary_url = refs.get("url")
+        if not isinstance(primary_url, str) or not primary_url.strip():
+            continue
+        if event_type == "source.triage_rejected":
+            reason = str(refs.get("reason") or "")
+            if reason not in _GLOBAL_TRIAGE_FAILURE_REASONS:
+                continue
+            deterministic = True
+        elif event_type == "source.rejected":
+            error_code = str(refs.get("error_code") or "")
+            deterministic = not error_code.endswith(
+                _NON_DETERMINISTIC_PAGE_FAILURE_SUFFIXES
+            )
+        else:
+            continue
+        failed_urls.add(normalize_source_url(primary_url))
+        requested_url = refs.get("requested_url")
+        if isinstance(requested_url, str) and requested_url.strip():
+            failed_urls.add(normalize_source_url(requested_url))
+        if not deterministic:
+            continue
+        owner = source_owner_key(primary_url)
+        if owner != "unknown":
+            deterministic_owner_failures[owner] = (
+                deterministic_owner_failures.get(owner, 0) + 1
+            )
+    excluded_owners = tuple(
+        sorted(
+            owner
+            for owner, count in deterministic_owner_failures.items()
+            if count >= _FAILED_OWNER_EXCLUSION_THRESHOLD
+        )
+    )
+    return frozenset(failed_urls), excluded_owners
 
 
 def _research_attempt_consumes_iteration(
@@ -167,10 +553,14 @@ class ResearchTarget:
     gap_id: UUID
     tool_call_id: UUID
     source_id_seed: UUID
+    alternate_query: str = ""
+    priority: int = 2
     attempt_index: int = 0
     gap_attempt_index: int = 0
     acceptance_dimensions: tuple[tuple[str, str], ...] = ()
     used_source_owner_keys: tuple[str, ...] = ()
+    search_excluded_owner_keys: tuple[str, ...] = ()
+    search_excluded_urls: tuple[str, ...] = ()
     reusable_results: tuple[SearchResult, ...] = ()
     reusable_pages: tuple[ReusablePageRef, ...] = ()
     first_pass: bool = False
@@ -186,6 +576,10 @@ class ResearchTarget:
     deadline_at: datetime | None = None
     cheap_triage_enabled: bool = False
     owner_acceptance_rates: tuple[tuple[str, float], ...] = ()
+    feedback_id: UUID | None = None
+    feedback_execution_id: UUID | None = None
+    query_execution_id: UUID | None = None
+    feedback_trigger_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +607,10 @@ class ModelTokenReservation:
     reserved_total: int
     status: str
     reason: str = ""
+    recovery_attempt_id: UUID | None = None
+    recovery_coverage_before: float = 0.0
+    recovery_gap_before: tuple[str, ...] = ()
+    recovery_accepted_evidence_before: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,8 +637,28 @@ class _CoverageMapEntry(TypedDict):
 
 
 class ResearchToolRepository:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        provider_registry: SearchProviderRegistry | None = None,
+    ) -> None:
         self._sessions = sessions
+        self._provider_registry = provider_registry
+
+    def _candidate_providers(self) -> tuple[str, ...]:
+        """Return the live provider pool.
+
+        Phase 12.4 makes the :class:`SearchProviderRegistry` the sole source of
+        the candidate pool; the module-level tuple remains only as a fallback
+        when a caller has not injected a registry (unit-test doubles).
+        """
+
+        if self._provider_registry is not None:
+            active = self._provider_registry.active_providers()
+            if active:
+                return active
+        return _SEARCH_CANDIDATE_PROVIDERS
 
     async def evidence_model_budget(
         self,
@@ -465,8 +883,15 @@ class ResearchToolRepository:
             )
             usage = dict(run.usage_snapshot)
             committed = max(0, _as_int(usage.get("pages_fetched", usage.get("pages", 0))))
+            committed_attempts = max(
+                0, _as_int(usage.get("page_fetch_attempts", committed))
+            )
             reserved = max(0, _as_int(usage.get("page_slots_reserved", 0)))
             remaining = max(0, maximum - committed - reserved)
+            attempt_maximum = int(
+                run.budget_snapshot.get("max_page_fetch_attempts", maximum) or maximum
+            )
+            attempt_remaining = max(0, attempt_maximum - committed_attempts - reserved)
             # A fresh search has already been counted by record_search_results
             # before this reservation is requested. Keep one page slot for
             # every still-available fresh search, so the page budget cannot
@@ -477,7 +902,7 @@ class ResearchToolRepository:
                 max(0, maximum_searches - used_searches) if fresh_search else 0
             )
             current_search_capacity = max(0, remaining - remaining_fresh_searches)
-            granted = min(requested, current_search_capacity)
+            granted = min(requested, current_search_capacity, attempt_remaining)
             if granted:
                 usage["page_slots_reserved"] = reserved + granted
                 owners_raw = usage.get("page_slots_reserved_by_worker", {})
@@ -501,6 +926,12 @@ class ResearchToolRepository:
 
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            candidate_identity = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=url,
+            )
             usage = dict(run.usage_snapshot)
             owners_raw = usage.get("page_slots_reserved_by_worker", {})
             owners = dict(owners_raw) if isinstance(owners_raw, dict) else {}
@@ -525,6 +956,21 @@ class ResearchToolRepository:
                 0, latency_ms
             )
             run.usage_snapshot = _usage_with_resource_pools(run, usage)
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate_identity,
+                "fetch_started",
+                public_summary="候选来源开始抓取。",
+            )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate_identity,
+                "fetch_success",
+                public_summary="候选来源抓取成功。",
+                metrics={"reused": reused, "latency_ms": max(0, latency_ms)},
+            )
             await self._append_event(
                 session,
                 run,
@@ -534,9 +980,64 @@ class ResearchToolRepository:
                     if not reused
                     else "复用已抓取页面并进入廉价预筛。"
                 ),
-                refs={"question_id": target.question_id, "url": url[:1000]},
+                refs={
+                    "question_id": target.question_id,
+                    "url": url[:1000],
+                    "candidate_id": candidate_identity.candidate_id,
+                },
                 metrics={"reused": reused, "latency_ms": max(0, latency_ms)},
             )
+
+    async def record_reader_lifecycle(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        requested_url: str,
+        events: list[dict[str, object]],
+        source_id: UUID | None = None,
+    ) -> None:
+        """Persist Reader events independently from Evidence events."""
+        if not events:
+            return
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=requested_url,
+            )
+            for event in events:
+                event_type = str(event.get("event_type", "source.reader_event"))
+                refs = {
+                    key: value
+                    for key, value in event.items()
+                    if key not in {"event_type", "metrics"}
+                }
+                refs.update(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "question_id": target.question_id,
+                        "plan_version": target.plan_version,
+                    }
+                )
+                if source_id is not None:
+                    refs["source_id"] = str(source_id)
+                normalized_url = refs.get("normalized_url")
+                if not isinstance(normalized_url, str) or not normalized_url:
+                    refs["normalized_url"] = normalize_source_url(requested_url)
+                metrics_raw = event.get("metrics")
+                metrics = dict(metrics_raw) if isinstance(metrics_raw, dict) else None
+                await self._append_event(
+                    session,
+                    run,
+                    event_type=event_type,
+                    public_summary=f"Reader 生命周期事件: {event_type}",
+                    refs=refs,
+                    metrics=metrics,
+                )
 
     async def reserve_extraction_slot(
         self,
@@ -590,9 +1091,16 @@ class ResearchToolRepository:
         score: float,
         reason: str,
         source_role: str,
+        requested_url: str | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=url,
+            )
             usage = dict(run.usage_snapshot)
             usage["cheap_triage_rejections"] = _as_int(usage.get("cheap_triage_rejections", 0)) + 1
             source_stats_raw = usage.get("source_type_stats", {})
@@ -621,10 +1129,32 @@ class ResearchToolRepository:
                 refs={
                     "question_id": target.question_id,
                     "url": url[:1000],
+                    "candidate_id": candidate.candidate_id,
+                    **(
+                        {"requested_url": requested_url[:1000]}
+                        if requested_url and requested_url != url
+                        else {}
+                    ),
                     "reason": reason[:100],
                     "source_role": source_role[:50],
                 },
                 metrics={"triage_score": round(max(0.0, min(1.0, score)), 4)},
+            )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "triage_rejected",
+                public_summary="候选来源未通过廉价质量预筛。",
+                metrics={"triage_score": round(max(0.0, min(1.0, score)), 4)},
+            )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "candidate_skipped",
+                reason="low_quality",
+                public_summary="低质量候选未进入证据抽取。",
             )
 
     async def release_page_slots(
@@ -691,6 +1221,7 @@ class ResearchToolRepository:
                 return ModelTokenReservation(False, 0, existing.status, "attempt_already_terminal")
             maximum = int(run.budget_snapshot.get("max_tokens", 0) or 0)
             borrowed_question_tokens = 0
+            recovery_context: dict[str, object] | None = None
             if maximum > 0:
                 available = (
                     maximum
@@ -802,6 +1333,73 @@ class ResearchToolRepository:
                             (item for item in plan_items if item.question_id == question_id),
                             None,
                         )
+                        search_statuses = list(
+                            (
+                                await session.scalars(
+                                    select(SearchQueryRow.status).where(
+                                        SearchQueryRow.run_id == run_id,
+                                        SearchQueryRow.question_id == question_id,
+                                    )
+                                )
+                            ).all()
+                        )
+                        state_event_types = (
+                            "source.readable",
+                            "evidence.extraction_started",
+                            "evidence.extracted",
+                            "evaluation.completed",
+                            "provider.degraded",
+                            "search.provider_degraded",
+                            "source.fetch_failed",
+                            "source.parse_failed",
+                        )
+                        event_rows = (
+                            await session.execute(
+                                select(AgentEventRow.event_type, AgentEventRow.refs).where(
+                                    AgentEventRow.run_id == run_id,
+                                    AgentEventRow.event_type.in_(state_event_types),
+                                )
+                            )
+                        ).all()
+                        question_event_counts: dict[str, int] = {}
+                        for event_type, refs in event_rows:
+                            if isinstance(refs, dict) and refs.get("question_id") == question_id:
+                                question_event_counts[event_type] = (
+                                    question_event_counts.get(event_type, 0) + 1
+                                )
+                        candidate_evidence = int(
+                            await session.scalar(
+                                select(func.count(ResearchEvidenceRow.id)).where(
+                                    ResearchEvidenceRow.run_id == run_id,
+                                    ResearchEvidenceRow.question_id == question_id,
+                                )
+                            )
+                            or 0
+                        )
+                        accepted_evidence = int(
+                            await session.scalar(
+                                select(func.count(ResearchEvidenceRow.id)).where(
+                                    ResearchEvidenceRow.run_id == run_id,
+                                    ResearchEvidenceRow.question_id == question_id,
+                                    ResearchEvidenceRow.accepted.is_(True),
+                                )
+                            )
+                            or 0
+                        )
+                        gap_resolution_attempts = int(
+                            await session.scalar(
+                                select(
+                                    func.coalesce(
+                                        func.max(ResearchGapRow.resolution_attempts),
+                                        0,
+                                    )
+                                ).where(
+                                    ResearchGapRow.run_id == run_id,
+                                    ResearchGapRow.question_id == question_id,
+                                )
+                            )
+                            or 0
+                        )
                         priority = current_item.priority if current_item is not None else 3
                         requirements = (
                             [str(value) for value in current_item.evidence_requirements]
@@ -858,6 +1456,56 @@ class ResearchToolRepository:
                         low_streak = (
                             _as_int(streaks.get(question_id, 0)) if isinstance(streaks, dict) else 0
                         )
+                        executed_families = _executed_query_families(
+                            run.usage_snapshot,
+                            question_id,
+                        )
+                        has_untried_query_family = len(executed_families) < _query_strategy_limit(
+                            current_item.question if current_item is not None else ""
+                        )
+                        question_research_state = project_question_research_state(
+                            QuestionResearchFacts(
+                                question_id=question_id,
+                                search_queries_started=len(search_statuses),
+                                search_queries_completed=sum(
+                                    status == "succeeded" for status in search_statuses
+                                ),
+                                search_queries_failed=sum(
+                                    status != "succeeded" for status in search_statuses
+                                ),
+                                readable_sources=question_event_counts.get("source.readable", 0),
+                                evidence_extraction_started=question_event_counts.get(
+                                    "evidence.extraction_started", 0
+                                ),
+                                candidate_evidence=candidate_evidence,
+                                accepted_evidence=accepted_evidence,
+                                evaluation_completed=question_event_counts.get(
+                                    "evaluation.completed", 0
+                                )
+                                > 0,
+                                coverage=coverage,
+                                gap_open=risk_state.gap_open,
+                                critical_gap=risk_state.risk_level == "critical",
+                                gap_resolution_attempts=gap_resolution_attempts,
+                                query_family_marker_present=bool(executed_families),
+                                technical_blocked=(
+                                    not any(status == "succeeded" for status in search_statuses)
+                                    and any(
+                                        question_event_counts.get(event_type, 0) > 0
+                                        for event_type in (
+                                            "provider.degraded",
+                                            "search.provider_degraded",
+                                            "source.fetch_failed",
+                                            "source.parse_failed",
+                                        )
+                                    )
+                                ),
+                                has_recovery_path=(
+                                    has_untried_query_family
+                                    or question_event_counts.get("source.readable", 0) > 0
+                                ),
+                            )
+                        )
                         utility = expected_utility(
                             priority=priority,
                             gap_risk=risk_state.risk_score,
@@ -869,10 +1517,12 @@ class ResearchToolRepository:
                         borrow_decision = decide_question_borrow(
                             state=risk_state,
                             all_first_passes_complete=all_first_attempted,
+                            research_state=question_research_state,
                             projected_spend=projected_spend,
                             target_tokens=question_limit,
                             expected_utility=utility,
                             low_gain_streak=low_streak,
+                            has_untried_query_family=has_untried_query_family,
                         )
                         if not borrow_decision.allowed:
                             usage = dict(run.usage_snapshot)
@@ -920,6 +1570,62 @@ class ResearchToolRepository:
                                 ),
                                 borrow_decision.reason,
                             )
+                        recovery_context = {
+                            "coverage_before": coverage,
+                            "gap_before": tuple(risk_state.open_dimension_keys),
+                            "accepted_evidence_before": accepted_evidence,
+                            "candidate_evidence_before": candidate_evidence,
+                            "reason": borrow_decision.reason,
+                        }
+                        independent_sources_before = int(
+                            await session.scalar(
+                                select(func.count(distinct(ResearchSourceRow.source_owner_key)))
+                                .join(
+                                    ResearchEvidenceRow,
+                                    ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                                )
+                                .where(
+                                    ResearchEvidenceRow.run_id == run_id,
+                                    ResearchEvidenceRow.question_id == question_id,
+                                    ResearchEvidenceRow.accepted.is_(True),
+                                )
+                            )
+                            or 0
+                        )
+                        recovery_context["independent_sources_before"] = (
+                            independent_sources_before
+                        )
+                        usage = dict(run.usage_snapshot)
+                        usage["recovery_attempt_id"] = str(attempt_id)
+                        usage["recovery_question_id"] = question_id
+                        context_refs = RecoveryContext.create(
+                            run_id=run_id,
+                            question_id=question_id,
+                            plan_version=run.plan_version,
+                            recovery_attempt_id=attempt_id,
+                            trigger_reason=borrow_decision.reason,
+                            coverage_before=coverage,
+                            gap_before=tuple(risk_state.open_dimension_keys),
+                        ).as_refs()
+                        context_refs["recovery_candidate_evidence_before"] = candidate_evidence
+                        context_refs[
+                            "recovery_independent_sources_before"
+                        ] = independent_sources_before
+                        usage["recovery_context"] = context_refs
+                        run.usage_snapshot = _usage_with_resource_pools(run, usage)
+                        await self._append_recovery_event(
+                            session,
+                            run,
+                            event_type="recovery.borrow.allowed",
+                            question_id=question_id,
+                            plan_version=run.plan_version,
+                            attempt_id=attempt_id,
+                            coverage_before=coverage,
+                            gap_before=tuple(risk_state.open_dimension_keys),
+                            accepted_evidence_before=accepted_evidence,
+                            tokens_reserved=0,
+                            reason=borrow_decision.reason,
+                        )
             now = datetime.now(UTC)
             session.add(
                 ModelBudgetReservationRow(
@@ -962,7 +1668,396 @@ class ResearchToolRepository:
                     refs={"question_id": question_id[:50]},
                     metrics={"borrowed_tokens": borrowed_question_tokens},
                 )
-            return ModelTokenReservation(True, requested, "reserved")
+            if recovery_context is not None:
+                await self._append_recovery_event(
+                    session,
+                    run,
+                    event_type="recovery.token_reserved",
+                    question_id=question_id,
+                    plan_version=run.plan_version,
+                    attempt_id=attempt_id,
+                    coverage_before=_as_float(recovery_context["coverage_before"]),
+                    gap_before=cast(tuple[str, ...], recovery_context["gap_before"]),
+                    accepted_evidence_before=_as_int(
+                        recovery_context["accepted_evidence_before"]
+                    ),
+                    tokens_reserved=requested,
+                    reason=str(recovery_context["reason"]),
+                )
+            return ModelTokenReservation(
+                True,
+                requested,
+                "reserved",
+                recovery_attempt_id=attempt_id if recovery_context is not None else None,
+                recovery_coverage_before=(
+                    _as_float(recovery_context["coverage_before"])
+                    if recovery_context is not None
+                    else 0.0
+                ),
+                recovery_gap_before=(
+                    cast(tuple[str, ...], recovery_context["gap_before"])
+                    if recovery_context is not None
+                    else ()
+                ),
+                recovery_accepted_evidence_before=(
+                    _as_int(recovery_context["accepted_evidence_before"])
+                    if recovery_context is not None
+                    else 0
+                ),
+            )
+
+    async def record_recovery_event(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        event_type: str,
+        question_id: str,
+        plan_version: int,
+        attempt_id: UUID,
+        coverage_before: float,
+        coverage_after: float | None = None,
+        gap_before: tuple[str, ...] = (),
+        gap_after: tuple[str, ...] = (),
+        accepted_evidence_before: int = 0,
+    accepted_evidence_after: int = 0,
+    tokens_reserved: int = 0,
+        reason: str | None = None,
+        outcome: RecoveryOutcome | None = None,
+    ) -> None:
+        """Persist one recovery lifecycle event and its active context."""
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            terminal = event_type in {
+                "recovery.completed",
+                "recovery.failed",
+                "recovery.cancelled",
+            }
+            if event_type == "recovery.started":
+                usage = dict(run.usage_snapshot)
+                usage["recovery_attempt_id"] = str(attempt_id)
+                usage["recovery_question_id"] = question_id
+                usage["recovery_context"] = RecoveryContext.create(
+                    run_id=run_id,
+                    question_id=question_id,
+                    plan_version=plan_version,
+                    recovery_attempt_id=attempt_id,
+                    trigger_reason=reason or "borrow_allowed",
+                    coverage_before=coverage_before,
+                    gap_before=gap_before,
+                ).as_refs()
+                run.usage_snapshot = _usage_with_resource_pools(run, usage)
+            if event_type in {"recovery.completed", "recovery.failed"} and outcome is None:
+                outcome = await self._evaluate_recovery_outcome(
+                    session,
+                    run,
+                    question_id=question_id,
+                    attempt_id=attempt_id,
+                    coverage_before=coverage_before,
+                    coverage_after=coverage_after,
+                    gap_before=gap_before,
+                    gap_after=gap_after,
+                    accepted_evidence_before=accepted_evidence_before,
+                    accepted_evidence_after=accepted_evidence_after,
+                    tokens_reserved=tokens_reserved,
+                    execution_failed=event_type == "recovery.failed",
+                )
+            await self._append_recovery_event(
+                session,
+                run,
+                event_type=event_type,
+                question_id=question_id,
+                plan_version=plan_version,
+                attempt_id=attempt_id,
+                coverage_before=coverage_before,
+                coverage_after=coverage_after,
+                gap_before=gap_before,
+                gap_after=gap_after,
+                accepted_evidence_before=accepted_evidence_before,
+                accepted_evidence_after=accepted_evidence_after,
+                tokens_reserved=tokens_reserved,
+                reason=reason,
+                outcome=outcome,
+            )
+            if terminal:
+                usage = clear_recovery_context(run.usage_snapshot, attempt_id)
+                run.usage_snapshot = _usage_with_resource_pools(run, usage)
+
+    async def _evaluate_recovery_outcome(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        question_id: str,
+        attempt_id: UUID,
+        coverage_before: float,
+        coverage_after: float | None,
+        gap_before: tuple[str, ...],
+        gap_after: tuple[str, ...],
+        accepted_evidence_before: int,
+        accepted_evidence_after: int,
+        tokens_reserved: int,
+        execution_failed: bool,
+    ) -> RecoveryOutcome:
+        usage_context = run.usage_snapshot.get("recovery_context", {})
+        usage_context = usage_context if isinstance(usage_context, dict) else {}
+        candidate_before = _as_int(
+            usage_context.get("recovery_candidate_evidence_before", 0)
+        )
+        independent_before = _as_int(
+            usage_context.get("recovery_independent_sources_before", 0)
+        )
+        candidate_after = int(
+            await session.scalar(
+                select(func.count(ResearchEvidenceRow.id)).where(
+                    ResearchEvidenceRow.run_id == run.id,
+                    ResearchEvidenceRow.question_id == question_id,
+                )
+            )
+            or 0
+        )
+        accepted_after = int(
+            await session.scalar(
+                select(func.count(ResearchEvidenceRow.id)).where(
+                    ResearchEvidenceRow.run_id == run.id,
+                    ResearchEvidenceRow.question_id == question_id,
+                    ResearchEvidenceRow.accepted.is_(True),
+                )
+            )
+            or accepted_evidence_after
+        )
+        independent_after = int(
+            await session.scalar(
+                select(func.count(distinct(ResearchSourceRow.source_owner_key)))
+                .join(
+                    ResearchEvidenceRow,
+                    ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                )
+                .where(
+                    ResearchEvidenceRow.run_id == run.id,
+                    ResearchEvidenceRow.question_id == question_id,
+                    ResearchEvidenceRow.accepted.is_(True),
+                )
+            )
+            or 0
+        )
+        tokens_used = int(
+            await session.scalar(
+                select(
+                    func.coalesce(
+                        func.sum(
+                            func.coalesce(
+                                ModelBudgetReservationRow.actual_total,
+                                ModelBudgetReservationRow.reserved_total,
+                            )
+                        ),
+                        0,
+                    )
+                ).where(
+                    ModelBudgetReservationRow.run_id == run.id,
+                    ModelBudgetReservationRow.attempt_id == attempt_id,
+                )
+            )
+            or 0
+        )
+        event_rows = (
+            await session.scalars(
+                select(AgentEventRow).where(
+                    AgentEventRow.run_id == run.id,
+                    AgentEventRow.event_type.in_(
+                        {"source.readable", "candidate.readable", "source.read"}
+                    ),
+                )
+            )
+        ).all()
+        new_sources: set[str] = set()
+        for row in event_rows:
+            refs = row.refs if isinstance(row.refs, dict) else {}
+            if refs.get("recovery_attempt_id") != str(attempt_id):
+                continue
+            source_key = refs.get("source_id") or refs.get("candidate_id")
+            if source_key is not None:
+                new_sources.add(str(source_key))
+        closure_rows = (
+            await session.scalars(
+                select(AgentEventRow).where(
+                    AgentEventRow.run_id == run.id,
+                    AgentEventRow.event_type.in_(
+                        {"gap.closure.completed", "gap.closure.transition"}
+                    ),
+                )
+            )
+        ).all()
+        closure_evaluation_ids: list[UUID] = []
+        closed_gap_ids: set[str] = set()
+        partial_gap_ids: set[str] = set()
+        remaining_gap_ids: set[str] = set()
+        for row in closure_rows:
+            refs = row.refs if isinstance(row.refs, dict) else {}
+            if refs.get("recovery_attempt_id") != str(attempt_id):
+                continue
+            raw_evaluation_id = refs.get("evaluation_id")
+            if raw_evaluation_id:
+                try:
+                    evaluation_id = UUID(str(raw_evaluation_id))
+                except ValueError:
+                    evaluation_id = None
+                if evaluation_id is not None and evaluation_id not in closure_evaluation_ids:
+                    closure_evaluation_ids.append(evaluation_id)
+            raw_gap_id = refs.get("gap_id")
+            if raw_gap_id is None:
+                continue
+            gap_id = str(raw_gap_id)
+            status = str(refs.get("after_status", "open"))
+            if status == GapClosureStatus.CLOSED.value:
+                closed_gap_ids.add(gap_id)
+            else:
+                remaining_gap_ids.add(gap_id)
+                if status == GapClosureStatus.PARTIAL.value:
+                    partial_gap_ids.add(gap_id)
+        if not closure_evaluation_ids:
+            remaining_gap_ids.update(gap_after)
+        return RecoveryOutcome.evaluate(
+            run_id=run.id,
+            question_id=question_id,
+            plan_version=run.plan_version,
+            recovery_attempt_id=attempt_id,
+            coverage_before=coverage_before,
+            coverage_after=coverage_after if coverage_after is not None else coverage_before,
+            gap_count_before=len(gap_before),
+            gap_count_after=len(remaining_gap_ids),
+            accepted_evidence_before=accepted_evidence_before,
+            accepted_evidence_after=max(accepted_evidence_after, accepted_after),
+            candidate_evidence_before=candidate_before,
+            candidate_evidence_after=candidate_after,
+            independent_sources_before=independent_before,
+            independent_sources_after=independent_after,
+            tokens_reserved=tokens_reserved,
+            tokens_used=tokens_used,
+            new_sources_count=len(new_sources),
+            new_independent_sources_count=max(0, independent_after - independent_before),
+            execution_failed=execution_failed,
+            closure_evaluation_id=(
+                closure_evaluation_ids[0] if closure_evaluation_ids else None
+            ),
+            closure_evaluation_ids=tuple(closure_evaluation_ids),
+            closed_gap_ids=tuple(sorted(closed_gap_ids)),
+            partial_gap_ids=tuple(sorted(partial_gap_ids)),
+            remaining_gap_ids=tuple(sorted(remaining_gap_ids)),
+        )
+
+    async def research_event_cursor(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+    ) -> int:
+        """Return the first event sequence of the current research action."""
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            return int(run.next_event_seq)
+
+    async def attach_recovery_context(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        context: RecoveryContext,
+        from_run_seq: int,
+    ) -> int:
+        """Backfill a late-created Recovery ID onto this action's events.
+
+        The budget decision is made immediately before evidence extraction, so
+        Search/Reader events can precede creation of the Recovery attempt ID.
+        Only events from this bounded action and Question are annotated; normal
+        research events outside that range remain unchanged.
+        """
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            rows = (
+                await session.scalars(
+                    select(AgentEventRow)
+                    .where(
+                        AgentEventRow.run_id == run_id,
+                        AgentEventRow.run_seq >= max(1, from_run_seq),
+                        AgentEventRow.run_seq < run.next_event_seq,
+                        AgentEventRow.event_type.in_(_RECOVERY_PROPAGATED_EVENT_TYPES),
+                    )
+                    .order_by(AgentEventRow.run_seq)
+                )
+            ).all()
+            context_refs = context.as_refs()
+            attached = 0
+            for row in rows:
+                refs = dict(row.refs)
+                if refs.get("question_id") != context.question_id:
+                    continue
+                if refs.get("recovery_attempt_id") is not None:
+                    continue
+                row.refs = {**refs, **context_refs}
+                attached += 1
+            return attached
+
+    @staticmethod
+    async def _append_recovery_event(
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        event_type: str,
+        question_id: str,
+        plan_version: int,
+        attempt_id: UUID,
+        coverage_before: float,
+        coverage_after: float | None = None,
+        gap_before: tuple[str, ...] = (),
+        gap_after: tuple[str, ...] = (),
+        accepted_evidence_before: int = 0,
+        accepted_evidence_after: int = 0,
+        tokens_reserved: int = 0,
+        reason: str | None = None,
+        outcome: RecoveryOutcome | None = None,
+    ) -> None:
+        payload = build_recovery_event(
+            event=event_type,
+            run_id=run.id,
+            question_id=question_id,
+            plan_version=plan_version,
+            attempt_id=attempt_id,
+            coverage_before=coverage_before,
+            coverage_after=coverage_after,
+            gap_before=gap_before,
+            gap_after=gap_after,
+            accepted_evidence_before=accepted_evidence_before,
+            accepted_evidence_after=accepted_evidence_after,
+            tokens_reserved=tokens_reserved,
+            reason=reason,
+            outcome=outcome,
+        )
+        refs = {
+            key: payload[key]
+            for key in (
+                "question_id",
+                "plan_version",
+                "attempt_id",
+                "recovery_attempt_id",
+            )
+        }
+        metrics = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"event", "run_id", *refs}
+        }
+        await ResearchToolRepository._append_event(
+            session,
+            run,
+            event_type=event_type,
+            public_summary=f"Recovery lifecycle: {event_type}.",
+            refs=refs,
+            metrics=metrics,
+        )
 
     async def settle_model_reservation(
         self,
@@ -1258,6 +2353,11 @@ class ResearchToolRepository:
                 and risk.get("unresolved_high_risk")
             )
             hard_limit = int(target * 1.5)
+            # High-risk P1 recovery may cross the normal 150% envelope only
+            # within the same bounded two-target ceiling enforced by
+            # decide_question_borrow().  Never render an exception as an
+            # unlimited borrowing state in the dashboard.
+            recovery_limit = int(target * 2.0)
             result[key] = {
                 "floor_tokens": floor,
                 "target_tokens": target,
@@ -1270,10 +2370,16 @@ class ResearchToolRepository:
                 "borrowed_tokens": max(0, projected - target),
                 "remaining_to_target_tokens": max(0, target - projected),
                 "remaining_to_hard_limit_tokens": max(0, hard_limit - projected),
+                "recovery_limit_tokens": recovery_limit,
+                "remaining_to_recovery_limit_tokens": max(0, recovery_limit - projected),
                 "p1_high_risk_exception": p1_exception,
                 "status": (
                     "hard_exhausted"
-                    if hard_limit > 0 and projected >= hard_limit and not p1_exception
+                    if (
+                        recovery_limit > 0 and projected >= recovery_limit
+                    ) or (
+                        hard_limit > 0 and projected >= hard_limit and not p1_exception
+                    )
                     else "borrowing"
                     if projected > target
                     else "target_exhausted"
@@ -1331,11 +2437,9 @@ class ResearchToolRepository:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             budget_stop_reason = _budget_exhaustion_reason(run)
-            search_budget_exhausted = budget_stop_reason in {
-                "search_budget_exhausted",
-                "logical_query_budget_exhausted",
-                "provider_request_budget_exhausted",
-            }
+            search_budget_exhausted = _search_acquisition_budget_exhausted(
+                budget_stop_reason
+            )
             if budget_stop_reason is not None and not search_budget_exhausted:
                 await self._enter_writing(
                     session,
@@ -1344,6 +2448,9 @@ class ResearchToolRepository:
                     summary=_budget_stop_summary(budget_stop_reason),
                 )
                 return None
+            feedback_target = await self._prepare_feedback_target(session, run)
+            if feedback_target is not None:
+                return feedback_target
             candidates = (
                 await session.scalars(
                     select(ResearchPlanItemRow)
@@ -1376,6 +2483,33 @@ class ResearchToolRepository:
                 if isinstance(raw_quality_repair_targets, dict)
                 else {}
             )
+            # Recompute corroboration targets from the live dimension map as
+            # well.  The persisted quality-repair projection can lag one
+            # extraction behind (especially across a replan), which otherwise
+            # lets zero-yield P1 retries outrank claims that already need a
+            # second independent source.
+            corroboration_targets: set[str] = set(quality_repair_targets)
+            accepted_by_question: dict[str, int] = {}
+            for entry in coverage_entries:
+                if not isinstance(entry, dict):
+                    continue
+                question_id = str(entry.get("dimension_key", ""))
+                if not question_id:
+                    continue
+                accepted_by_question[question_id] = _as_int(
+                    entry.get("accepted_evidence", 0)
+                )
+                statuses = entry.get("requirement_statuses", [])
+                if not isinstance(statuses, list):
+                    continue
+                if any(
+                    isinstance(status, dict)
+                    and _as_int(status.get("accepted_evidence", 0)) > 0
+                    and _as_int(status.get("independent_sources", 0))
+                    < max(1, _as_int(status.get("required_sources", 1)))
+                    for status in statuses
+                ):
+                    corroboration_targets.add(question_id)
             # Keep a small tail of the page budget available for unresolved
             # priority-one dimensions and quality-gate repair. Without this,
             # low-priority questions can consume every page before source
@@ -1421,10 +2555,13 @@ class ResearchToolRepository:
                     candidate.status == "partial"
                     and coverage_by_question.get(candidate.question_id, 0.0) >= 1.0
                     and candidate.question_id not in quality_repair_targets
+                    and candidate.question_id not in corroboration_targets
                 ):
                     # Repair stale state produced by the former global-anchor
                     # policy. A complete question without an actionable gate
-                    # dimension is terminal for this plan version.
+                    # dimension is terminal for this plan version.  A question
+                    # that still needs an independent source is actionable even
+                    # when its coverage score has reached 1.0.
                     candidate.status = "researched"
             historical_attempts = {
                 question_id: int(attempts)
@@ -1463,11 +2600,41 @@ class ResearchToolRepository:
                 )
                 for candidate in candidates
             }
+            zero_yield_deprioritized_questions = {
+                candidate.question_id
+                for candidate in candidates
+                if _zero_yield_retry_deprioritized(
+                    search_budget_exhausted=search_budget_exhausted,
+                    attempts=executed_family_attempts.get(
+                        candidate.question_id,
+                        historical_attempts.get(candidate.question_id, 0),
+                    ),
+                    coverage=coverage_by_question.get(candidate.question_id, 0.0),
+                    accepted_evidence=accepted_by_question.get(candidate.question_id, 0),
+                    is_corroboration_target=(
+                        candidate.question_id in corroboration_targets
+                    ),
+                )
+            }
+            unattempted_questions = sum(
+                1
+                for candidate in candidates
+                if candidate.question_id not in exhausted_questions
+                and candidate.question_id not in strategy_exhausted_questions
+                and candidate.question_id not in frozen_questions
+                and candidate.status != "researched"
+                and executed_family_attempts.get(candidate.question_id, 0) == 0
+            )
             for candidate in candidates:
                 if (
                     candidate.question_id in exhausted_questions
                     or candidate.question_id in strategy_exhausted_questions
                     or candidate.question_id in frozen_questions
+                    or (
+                        candidate.question_id in zero_yield_deprioritized_questions
+                        and candidate.priority != 1
+                        and candidate.question_id not in corroboration_targets
+                    )
                     or candidate.status == "researched"
                     or (
                         search_budget_exhausted and candidate.question_id not in cached_question_ids
@@ -1479,7 +2646,12 @@ class ResearchToolRepository:
                     historical_attempts.get(candidate.question_id, 0),
                 )
                 candidate_coverage = coverage_by_question.get(candidate.question_id, 0.0)
-                if candidate.priority == 1 and candidate_coverage < 1.0 and attempts < 3:
+                if (
+                    candidate.priority == 1 or candidate.question_id in corroboration_targets
+                ) and candidate_coverage < 1.0 and _query_family_capacity_remaining(
+                    question=candidate.question,
+                    attempted_families=attempts,
+                ):
                     unfinished_p1_variants.append(candidate.question_id)
             p1_variant_mode = bool(unfinished_p1_variants)
             # A P1 variant must not starve the first pass of other questions.
@@ -1488,10 +2660,10 @@ class ResearchToolRepository:
             # the scheduler boundary as well. Once every question has had a
             # first attempt, unresolved P1 items regain the protected variant
             # lane and can receive their bounded follow-up searches.
-            has_unattempted_question = any(
-                (executed_family_attempts.get(candidate.question_id, 0) == 0)
-                for candidate in candidates
-            )
+            # Reuse the eligibility-aware count above. A frozen or exhausted
+            # question with zero attempts must not keep the P1 recovery lane
+            # disabled for the rest of the run.
+            has_unattempted_question = unattempted_questions > 0
             p1_variant_mode = p1_variant_mode and not has_unattempted_question
             for candidate in candidates:
                 if (
@@ -1510,8 +2682,8 @@ class ResearchToolRepository:
                 )
                 candidate_coverage = coverage_by_question.get(candidate.question_id, 0.0)
                 if p1_variant_mode and candidate.question_id not in unfinished_p1_variants:
-                    # Give every unfinished P1 three distinct query variants
-                    # before ordinary P2/P3 work can compete for pages.
+                # Give every unfinished P1 every bounded query family
+                # before ordinary P2/P3 work can compete for pages.
                     continue
                 effective_priority = candidate.priority
                 if protected_page_mode and candidate.priority > 1 and candidate_coverage >= 1.0:
@@ -1545,9 +2717,24 @@ class ResearchToolRepository:
                         provider_requests=1,
                     ),
                 )
+                utility_rank = -int(utility * 1_000_000)
+                if attempts > 0 and candidate.question_id in corroboration_targets:
+                    # Corroboration is a quality-gate action, not an ordinary
+                    # retry. Give it a dedicated lane and rotate by attempt
+                    # count so one already-covered P1 cannot monopolize it.
+                    utility_rank = -1_000_000_000 + attempts * 1_000_000 - int(
+                        utility * 1_000
+                    )
+                elif attempts > 0 and candidate_coverage > 0.0:
+                    utility_rank -= 500_000_000
+                elif candidate.question_id in zero_yield_deprioritized_questions:
+                    # Two empty families should yield to untouched and
+                    # productive work, but must remain recoverable: the third
+                    # alternate-language family may be the first useful one.
+                    utility_rank += 500_000_000
                 schedule_key = (
                     0 if attempts == 0 else 1,
-                    0 if attempts == 0 else -int(utility * 1_000_000),
+                    0 if attempts == 0 else utility_rank,
                     candidate_coverage,
                     effective_priority,
                     candidate.question_id,
@@ -1563,16 +2750,29 @@ class ResearchToolRepository:
                         # Once the reserve zone is reached, do not spend its
                         # slots on already-covered ordinary P2/P3 questions.
                         continue
-                    # The ordinary round-robin key gives an untouched P2
-                    # item precedence over a retried unresolved P1 because it
-                    # sorts by attempt count first. In the reserve tail,
-                    # explicitly move protected work ahead of that axis.
-                    schedule_key = (
-                        0,
-                        0,
-                        candidate_coverage,
-                        effective_priority,
-                        candidate.question_id,
+                if p1_variant_mode:
+                    # The P1 gate is a minimum across all P1 questions.  An
+                    # already productive 50% item must therefore not outrank
+                    # a 0% P1 merely because its next extraction is likelier
+                    # to succeed.  Lowest coverage wins; attempts only rotate
+                    # candidates tied at the same coverage.
+                    schedule_key = _p1_variant_schedule_key(
+                        attempts=attempts,
+                        coverage=candidate_coverage,
+                        priority=effective_priority,
+                        question_id=candidate.question_id,
+                    )
+                elif protected_page_mode:
+                    # Keep the first-pass fairness axis even in the protected
+                    # tail. Without it, an unresolved P1 could repeatedly win
+                    # by priority and prevent untouched questions from ever
+                    # completing their first pass; the borrow gate would then
+                    # remain closed forever for every follow-up attempt.
+                    schedule_key = _protected_page_schedule_key(
+                        attempts=attempts,
+                        coverage=candidate_coverage,
+                        priority=effective_priority,
+                        question_id=candidate.question_id,
                     )
                 eligible.append(
                     (
@@ -1584,6 +2784,29 @@ class ResearchToolRepository:
             if selected_entry is None:
                 quality_snapshot = cast(dict[str, object], run.quality_snapshot or {})
                 quality_met = _quality_gate_met_from_snapshot(quality_snapshot)
+                unresolved_gap_count = _as_int(quality_snapshot.get("unresolved_gap_count", 0))
+                replans_used = _as_int(run.usage_snapshot.get("replans", 0))
+                if (
+                    not search_budget_exhausted
+                    and not quality_met
+                    and unresolved_gap_count > 0
+                    and replans_used < _MAX_REPLANS
+                ):
+                    # No currently eligible candidate is not equivalent to
+                    # source exhaustion: frozen/strategy-exhausted questions
+                    # may still be recoverable through a targeted REPLAN.
+                    usage = dict(run.usage_snapshot)
+                    usage["replan_requested"] = True
+                    run.usage_snapshot = _usage_with_resource_pools(run, usage)
+                    run.phase = RunPhase.RESEARCHING.value
+                    await self._append_event(
+                        session,
+                        run,
+                        event_type="research.replan_requested",
+                        public_summary="当前候选均不可执行但仍有开放验收缺口; 转入定向 REPLAN。",
+                        refs={"unresolved_gap_count": unresolved_gap_count},
+                    )
+                    return None
                 stop_reason = (
                     budget_stop_reason or "logical_query_budget_exhausted"
                     if search_budget_exhausted
@@ -1629,7 +2852,13 @@ class ResearchToolRepository:
                     or 0
                 )
                 gap = ResearchGapRow(
-                    id=uuid7(),
+                    # Stable compatibility identity.  Canonical requirement
+                    # identities live in GapRequirement; this row exists only
+                    # for legacy foreign keys and historical consumers.
+                    id=uuid5(
+                        NAMESPACE_URL,
+                        f"legacy-research-gap:{run_id}:{run.plan_version}:{question.question_id}",
+                    ),
                     run_id=run_id,
                     plan_version=run.plan_version,
                     question_id=question.question_id,
@@ -1664,27 +2893,24 @@ class ResearchToolRepository:
                 None,
             )
             unmet_criterion: str | None = None
+            unmet_dimension_key: str | None = None
             repair_reasons = quality_repair_targets.get(question.question_id, [])
             if current_coverage is not None:
                 requirement_statuses = current_coverage.get("requirement_statuses", [])
                 if isinstance(requirement_statuses, list):
-                    unmet_criterion = next(
-                        (
-                            str(status.get("criterion"))
-                            for status in requirement_statuses
-                            if isinstance(status, dict)
-                            and float(status.get("coverage", 0.0) or 0.0) < 1.0
-                            and status.get("criterion")
-                        ),
-                        None,
-                    )
+                    unmet = _select_unmet_requirement(requirement_statuses)
+                    if unmet is not None:
+                        unmet_dimension_key, unmet_criterion = unmet
                     if unmet_criterion is None and repair_reasons:
                         repair_dimensions = {
                             reason.split(":", 1)[1] for reason in repair_reasons if ":" in reason
                         }
-                        unmet_criterion = next(
+                        repair_target = next(
                             (
-                                str(status.get("criterion"))
+                                (
+                                    str(status.get("dimension_key")),
+                                    str(status.get("criterion")),
+                                )
                                 for status in requirement_statuses
                                 if isinstance(status, dict)
                                 and str(status.get("dimension_key")) in repair_dimensions
@@ -1692,6 +2918,8 @@ class ResearchToolRepository:
                             ),
                             None,
                         )
+                        if repair_target is not None:
+                            unmet_dimension_key, unmet_criterion = repair_target
             executed_query_hashes = set(
                 (
                     await session.scalars(
@@ -1705,19 +2933,33 @@ class ResearchToolRepository:
             )
             query = ""
             query_family: QueryFamily | None = None
-            prefer_authoritative = any(
-                reason.startswith("source_quality:") for reason in repair_reasons
+            prefer_authoritative = (
+                any(reason.startswith("source_quality:") for reason in repair_reasons)
+                or question.question_id in corroboration_targets
             )
             family_order = _query_family_order(prefer_authoritative=prefer_authoritative)
             for family in family_order:
-                if family.value in executed_families:
-                    continue
+                # A replan may deliberately keep the same query family while
+                # changing the gap-specific search hint.  Treating the family
+                # itself as exhausted made every replan a no-op: all four
+                # families had already been used by the parent plan, so the
+                # new hints were never materialized into a query.  Duplicate
+                # protection is query-hash scoped below, which still prevents
+                # replaying an identical successful query while allowing a
+                # genuinely new angle in the same family.
                 candidate_query = build_family_query(
                     question=question.question,
                     criterion=(unmet_criterion or "").strip(),
                     hints=tuple(str(value) for value in question.search_hints),
                     family=family,
                 )
+                if unmet_criterion and family is not QueryFamily.SCOPE:
+                    candidate_query = " ".join(
+                        (
+                            candidate_query,
+                            _source_hint_for_requirement(unmet_criterion),
+                        )
+                    )[:400]
                 candidate_hash = hashlib.sha256(
                     normalize_search_query(candidate_query).encode()
                 ).hexdigest()
@@ -1760,6 +3002,15 @@ class ResearchToolRepository:
             normalized_query = normalize_search_query(query)
             if query_family is None:  # pragma: no cover - guarded by ``query`` above
                 query_family = query_family_for_attempt(attempt_index) or QueryFamily.SCOPE
+            alternate_query = build_family_query(
+                question=question.question,
+                criterion=(unmet_criterion or "").strip(),
+                hints=tuple(str(value) for value in question.search_hints),
+                family=query_family,
+                prefer_alternate_hint=True,
+            )
+            if normalize_search_query(alternate_query) == normalized_query:
+                alternate_query = ""
             # Query idempotency is run-scoped, not plan-version-scoped. A
             # replan may change the search angle, but it must never authorize
             # replaying a query that already succeeded in an older plan.
@@ -1784,6 +3035,7 @@ class ResearchToolRepository:
                     status="running",
                     arguments={
                         "query": query,
+                        "alternate_query": alternate_query,
                         "limit": 10,
                         "query_family": query_family.value,
                     },
@@ -1801,6 +3053,7 @@ class ResearchToolRepository:
                 tool_call.arguments = {
                     **(tool_call.arguments or {}),
                     "query": query,
+                    "alternate_query": alternate_query,
                     "query_family": query_family.value,
                 }
             if created_gap:
@@ -1907,19 +3160,21 @@ class ResearchToolRepository:
                 if cross_question_rows:
                     query_already_executed = True
                     reusable_rows = [*reusable_rows, *cross_question_rows]
-            rejected_urls = {
-                str(refs.get("url"))
-                for refs in (
-                    await session.scalars(
-                        select(AgentEventRow.refs).where(
-                            AgentEventRow.run_id == run_id,
-                            AgentEventRow.event_type == "source.rejected",
-                            AgentEventRow.refs["question_id"].as_string() == question.question_id,
-                        )
+            failure_event_rows = (
+                await session.execute(
+                    select(AgentEventRow.event_type, AgentEventRow.refs).where(
+                        AgentEventRow.run_id == run_id,
+                        AgentEventRow.event_type.in_(
+                            ("source.rejected", "source.triage_rejected")
+                        ),
                     )
-                ).all()
-                if isinstance(refs, dict) and refs.get("url")
-            }
+                )
+            ).all()
+            rejected_urls, failed_owner_keys = _source_failure_feedback(
+                (event_type, refs)
+                for event_type, refs in failure_event_rows
+                if isinstance(refs, dict)
+            )
             reusable_results = tuple(
                 SearchResult(
                     title=row.title,
@@ -1931,8 +3186,7 @@ class ResearchToolRepository:
                 for row in reusable_rows
                 if (
                     normalize_source_url(row.url) not in read_urls
-                    and normalize_source_url(row.url)
-                    not in {normalize_source_url(url) for url in rejected_urls}
+                    and normalize_source_url(row.url) not in rejected_urls
                 )
             )
             source_searched_for_question = exists(
@@ -2027,9 +3281,24 @@ class ResearchToolRepository:
             )
             action_usage["deadline_remaining"] = _deadline_remaining_seconds(run)
             run.usage_snapshot = action_usage
-            dimensions = tuple(
+            remaining_provider_requests = max(
+                0,
+                _as_int(run.budget_snapshot.get("max_provider_requests", 0))
+                - _as_int(run.usage_snapshot.get("search_provider_requests", 0)),
+            )
+            provider_request_allowance = _fair_provider_request_allowance(
+                remaining_provider_requests,
+                unattempted_questions,
+            )
+            all_dimensions = tuple(
                 (f"{question.question_id}:d{index}", str(criterion))
                 for index, criterion in enumerate(question.evidence_requirements, start=1)
+            )
+            dimensions = tuple(
+                sorted(
+                    all_dimensions,
+                    key=lambda item: (item[0] != unmet_dimension_key, item[0]),
+                )
             )
             return ResearchTarget(
                 plan_version=run.plan_version,
@@ -2039,22 +3308,24 @@ class ResearchToolRepository:
                 gap_id=gap.id,
                 tool_call_id=tool_call.id,
                 source_id_seed=uuid7(),
+                alternate_query=alternate_query,
+                priority=question.priority,
                 attempt_index=attempt_index,
                 gap_attempt_index=gap.resolution_attempts,
                 first_pass=not executed_families
                 and len(eligible) > 1,
                 acceptance_dimensions=dimensions,
                 used_source_owner_keys=used_owner_keys,
+                search_excluded_owner_keys=tuple(
+                    sorted(set(used_owner_keys) | set(failed_owner_keys))
+                ),
+                search_excluded_urls=tuple(sorted(rejected_urls)),
                 reusable_results=reusable_results,
                 reusable_pages=reusable_pages,
                 query_already_executed=query_already_executed,
                 search_budget_exhausted=search_budget_exhausted,
                 query_family=query_family.value,
-                provider_request_allowance=max(
-                    0,
-                    _as_int(run.budget_snapshot.get("max_provider_requests", 0))
-                    - _as_int(run.usage_snapshot.get("search_provider_requests", 0)),
-                ),
+                provider_request_allowance=provider_request_allowance,
                 baseline_model_tokens=_model_tokens(run),
                 baseline_pages_fetched=_as_int(
                     run.usage_snapshot.get("pages_fetched", run.usage_snapshot.get("pages", 0))
@@ -2086,6 +3357,395 @@ class ResearchToolRepository:
                 ),
             )
 
+    async def _prepare_feedback_target(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+    ) -> ResearchTarget | None:
+        """Adapt one feedback request into the normal ResearchTarget path."""
+
+        events = (
+            await session.scalars(
+                select(AgentEventRow)
+                .where(
+                    AgentEventRow.run_id == run.id,
+                    AgentEventRow.event_type == "feedback.query.execution.started",
+                )
+                .order_by(AgentEventRow.run_seq)
+            )
+        ).all()
+        consumed = {
+            str(event.refs.get("feedback_execution_id"))
+            for event in (
+                await session.scalars(
+                    select(AgentEventRow).where(
+                        AgentEventRow.run_id == run.id,
+                        AgentEventRow.event_type == "feedback.query.execution.consumed",
+                    )
+                )
+            ).all()
+            if isinstance(event.refs, dict)
+        }
+        pending = next(
+            (
+                event
+                for event in events
+                if isinstance(event.refs, dict)
+                and str(event.refs.get("feedback_execution_id")) not in consumed
+            ),
+            None,
+        )
+        if pending is None or not isinstance(pending.refs, dict):
+            return None
+        refs = pending.refs
+        question_id = str(refs.get("question_id", ""))
+        query = str(refs.get("query_text", "")).strip()
+        if not question_id or not query:
+            return None
+        question = await session.scalar(
+            select(ResearchPlanItemRow).where(
+                ResearchPlanItemRow.run_id == run.id,
+                ResearchPlanItemRow.plan_version == run.plan_version,
+                ResearchPlanItemRow.question_id == question_id,
+            )
+        )
+        if question is None:
+            return None
+        legacy_gap = await session.scalar(
+            select(ResearchGapRow).where(
+                ResearchGapRow.run_id == run.id,
+                ResearchGapRow.plan_version == run.plan_version,
+                ResearchGapRow.question_id == question_id,
+            )
+        )
+        if legacy_gap is None:
+            prior_attempts = int(
+                await session.scalar(
+                    select(func.count(SearchQueryRow.id)).where(
+                        SearchQueryRow.run_id == run.id,
+                        SearchQueryRow.question_id == question_id,
+                    )
+                )
+                or 0
+            )
+            legacy_gap = ResearchGapRow(
+                id=uuid5(
+                    NAMESPACE_URL,
+                    f"legacy-research-gap:{run.id}:{run.plan_version}:{question_id}",
+                ),
+                run_id=run.id,
+                plan_version=run.plan_version,
+                question_id=question_id,
+                gap_type="missing",
+                description=f"当前缺少对研究问题 {question_id} 的可验证证据。",
+                acceptance_criteria="至少获得一条可定位到原网页逐字引文的有效证据。",
+                severity=1.0,
+                status="open",
+                resolution_attempts=prior_attempts,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+            session.add(legacy_gap)
+            await session.flush()
+        tool_call = ResearchToolCallRow(
+            id=uuid7(),
+            run_id=run.id,
+            question_id=question_id,
+            # The feedback event carries the canonical GapRequirement ID.
+            # The existing Research Loop foreign key still points to the
+            # compatibility research_gaps row, so keep that adapter local to
+            # the handoff boundary.
+            gap_id=legacy_gap.id,
+            action_id=uuid7(),
+            tool_name="web_search",
+            duplicate_key=search_query_duplicate_key(question_id, query),
+            status="running",
+            arguments={
+                "query": query,
+                "query_family": "feedback_recovery",
+                "feedback_id": refs.get("feedback_id"),
+                "feedback_execution_id": refs.get("feedback_execution_id"),
+            },
+            result_refs={},
+            started_at=datetime.now(UTC),
+        )
+        session.add(tool_call)
+        await session.flush()
+        feedback_context = {
+            "feedback_id": refs.get("feedback_id"),
+            "feedback_execution_id": refs.get("feedback_execution_id"),
+            "query_execution_id": refs.get("execution_id"),
+            "feedback_question_id": question_id,
+        }
+        usage = dict(run.usage_snapshot)
+        usage["feedback_query_context"] = feedback_context
+        run.usage_snapshot = usage
+        await self._append_event(
+            session,
+            run,
+            event_type="feedback.query.execution.consumed",
+            public_summary="Feedback Query 已进入现有 Research Loop。",
+            refs={
+                "feedback_id": refs.get("feedback_id"),
+                "feedback_execution_id": refs.get("feedback_execution_id"),
+                "query_execution_id": refs.get("execution_id"),
+                "query_candidate_id": refs.get("query_candidate_id"),
+                "question_id": question_id,
+                "gap_id": refs.get("gap_id"),
+            },
+        )
+        dimensions = tuple(
+            (f"{question_id}:d{index}", str(criterion))
+            for index, criterion in enumerate(question.evidence_requirements, start=1)
+        )
+        return ResearchTarget(
+            plan_version=run.plan_version,
+            question_id=question_id,
+            question=question.question,
+            query=query,
+            gap_id=tool_call.gap_id,
+            tool_call_id=tool_call.id,
+            source_id_seed=uuid7(),
+            acceptance_dimensions=dimensions,
+            priority=question.priority,
+            query_family=QueryFamily.SCOPE.value,
+            provider_request_allowance=1,
+            baseline_model_tokens=_model_tokens(run),
+            baseline_pages_fetched=_as_int(run.usage_snapshot.get("pages_fetched", 0)),
+            baseline_pages_extracted=_as_int(run.usage_snapshot.get("pages_extracted", 0)),
+            baseline_provider_requests=_as_int(
+                run.usage_snapshot.get("search_provider_requests", 0)
+            ),
+            action_started_at=datetime.now(UTC),
+            deadline_at=_deadline_at(run),
+            feedback_id=UUID(str(refs["feedback_id"])),
+            feedback_execution_id=UUID(str(refs["feedback_execution_id"])),
+            query_execution_id=UUID(str(refs["execution_id"])),
+            feedback_trigger_reason=str(refs.get("trigger_reason", "feedback_recovery")),
+        )
+
+    async def research_phase_active(
+        self, run_id: UUID, *, worker_task_id: str
+    ) -> bool:
+        """Return whether an empty scheduler pass should advance, not write.
+
+        ``prepare_target`` can retire one query-exhausted question without
+        selecting another target in the same transaction. In that case the
+        durable run is still researching and the graph must take another
+        scheduler step. Budget/source exhaustion paths enter writing before
+        returning ``None``.
+        """
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            return RunPhase(run.phase) == RunPhase.RESEARCHING
+
+    async def replan_requested(
+        self, run_id: UUID, *, worker_task_id: str
+    ) -> bool:
+        """Return whether the scheduler requested a gap-repair replan."""
+
+        async with self._sessions() as session:
+            run = await self._locked_run(session, run_id, worker_task_id)
+            return bool(run.usage_snapshot.get("replan_requested"))
+
+    async def research_context_for_question(
+        self, run_id: UUID, *, worker_task_id: str, question_id: str
+    ) -> ResolvedResearchContext | None:
+        """Phase 14.2: resolve one question's evidence-aware ResearchContext.
+
+        The ``research_context_by_question`` snapshot key is owned exclusively
+        by ``ResearchContextResolver``; the Research Loop consumes this typed
+        result instead of touching ``usage_snapshot`` itself.
+        """
+
+        async with self._sessions() as session:
+            run = await self._locked_run(session, run_id, worker_task_id)
+            return ResearchContextResolver.resolve(run.usage_snapshot, question_id=question_id)
+
+    async def record_query_context_enriched(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        resolved: ResolvedResearchContext,
+        enrichment: ResearchContextEnrichmentResult,
+    ) -> None:
+        """Phase 14.2: emit the observable enrichment event for one target.
+
+        Additive audit only; the event is never produced for a target without
+        a ResearchContext (the caller skips this recorder entirely then).
+        """
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            await self._append_event(
+                session,
+                run,
+                event_type="research.query.context.enriched",
+                public_summary="ResearchContext 已按缺失证据增强本轮真实搜索查询。",
+                refs={
+                    "question_id": target.question_id,
+                    "tool_call_id": str(target.tool_call_id),
+                    "research_need_id": resolved.research_need_id,
+                    "query_plan_id": resolved.query_plan_id,
+                    "query_candidate_id": resolved.query_candidate_id,
+                    # Phase 14.3: text pair (truncated) so the read-only A/B
+                    # analyzer can prove the provider query changed and
+                    # measure its length delta. Audit payload only.
+                    "original_query": enrichment.original_query[:500],
+                    "enriched_query": enrichment.enriched_query[:500],
+                },
+                metrics={
+                    "hint_count": len(resolved.context.query_hints),
+                    "applied_hint_count": len(enrichment.applied_hints),
+                    "query_changed": enrichment.changed,
+                },
+            )
+
+    @staticmethod
+    async def _candidate_identity_for_url(
+        session: AsyncSession,
+        *,
+        run_id: UUID,
+        target: ResearchTarget,
+        url: str,
+    ) -> CandidateIdentity:
+        normalized_url = normalize_source_url(url)
+        rows = await session.execute(
+            select(SearchResultRow, SearchQueryRow)
+            .join(SearchQueryRow, SearchResultRow.search_query_id == SearchQueryRow.id)
+            .where(
+                SearchQueryRow.run_id == run_id,
+                SearchQueryRow.question_id == target.question_id,
+            )
+            .order_by(SearchQueryRow.created_at, SearchResultRow.rank)
+        )
+        for result_row, query_row in rows.all():
+            if normalize_source_url(result_row.url) != normalized_url:
+                continue
+            return CandidateIdentity(
+                candidate_id=str(result_row.id),
+                raw_url=result_row.url,
+                normalized_url=normalized_url,
+                question_id=target.question_id,
+                query_id=str(query_row.id),
+                domain=(urlsplit(normalized_url).hostname or "unknown")[:255],
+            )
+        # This fallback is only used for reusable or externally supplied pages
+        # that have no SearchResultRow. It remains stable for the run/question
+        # and keeps downstream events queryable without changing fetch behavior.
+        fallback_id = uuid5(
+            NAMESPACE_URL,
+            f"research-candidate:{run_id}:{target.question_id}:{normalized_url}",
+        )
+        return CandidateIdentity(
+            candidate_id=str(fallback_id),
+            raw_url=url,
+            normalized_url=normalized_url,
+            question_id=target.question_id,
+            query_id=str(target.tool_call_id),
+            domain=(urlsplit(normalized_url).hostname or "unknown")[:255],
+        )
+
+    @staticmethod
+    async def _candidate_identity_for_latest_fetch(
+        session: AsyncSession,
+        *,
+        run_id: UUID,
+        target: ResearchTarget,
+    ) -> CandidateIdentity | None:
+        rows = await session.scalars(
+            select(AgentEventRow.refs)
+            .where(
+                AgentEventRow.run_id == run_id,
+                AgentEventRow.event_type == "candidate.fetch_success",
+            )
+            .order_by(AgentEventRow.run_seq.desc())
+        )
+        for refs in rows:
+            if not isinstance(refs, dict) or refs.get("question_id") != target.question_id:
+                continue
+            required = ("candidate_id", "raw_url", "normalized_url", "query_id", "domain")
+            if not all(key in refs for key in required):
+                continue
+            return CandidateIdentity(
+                candidate_id=str(refs["candidate_id"]),
+                raw_url=str(refs["raw_url"]),
+                normalized_url=str(refs["normalized_url"]),
+                question_id=target.question_id,
+                query_id=str(refs["query_id"]),
+                domain=str(refs["domain"]),
+            )
+        return None
+
+    @staticmethod
+    async def _append_candidate_event(
+        session: AsyncSession,
+        run: ResearchRunRow,
+        identity: CandidateIdentity,
+        stage: str,
+        *,
+        reason: str | None = None,
+        failure_reason: str | None = None,
+        public_summary: str,
+        metrics: dict[str, object] | None = None,
+    ) -> None:
+        event = candidate_lifecycle_event(
+            identity,
+            stage,
+            reason=reason,
+            failure_reason=failure_reason,
+        )
+        await ResearchToolRepository._append_event(
+            session,
+            run,
+            event_type=str(event["event_type"]),
+            public_summary=public_summary,
+            refs=cast(dict[str, object], event["refs"]),
+            metrics=metrics,
+        )
+
+    async def record_search_query_started(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        reused: bool,
+    ) -> None:
+        """Record the query boundary before provider work begins."""
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            await self._append_event(
+                session,
+                run,
+                event_type="search.query.started",
+                public_summary="搜索查询开始执行。",
+                refs={
+                    "question_id": target.question_id,
+                    "query": target.query[:1000],
+                    "query_family": target.query_family,
+                    "tool_call_id": str(target.tool_call_id),
+                    "feedback_id": (
+                        str(target.feedback_id) if target.feedback_id else None
+                    ),
+                    "feedback_execution_id": (
+                        str(target.feedback_execution_id)
+                        if target.feedback_execution_id
+                        else None
+                    ),
+                    "query_execution_id": (
+                        str(target.query_execution_id)
+                        if target.query_execution_id
+                        else None
+                    ),
+                },
+                metrics={"reused": reused},
+            )
+
     async def record_search_results(
         self,
         run_id: UUID,
@@ -2097,14 +3757,19 @@ class ResearchToolRepository:
         provider_requests: int = 0,
         provider_timeouts: int = 0,
         provider_fallbacks: int = 0,
+        provider_healthy: int = 0,
+        provider_unresponsive: int = 0,
+        provider_productive: int = 0,
         latency_ms: int = 0,
-    ) -> None:
+        executed_provider: str | None = None,
+    ) -> set[str] | None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             tool_call = await session.get(ResearchToolCallRow, target.tool_call_id)
             if tool_call is None:
                 raise ResearchLeaseLostError("tool call disappeared")
             if reused:
+                reused_recorded_urls: set[str] | None = None
                 query_hash = hashlib.sha256(
                     normalize_search_query(target.query).encode()
                 ).hexdigest()
@@ -2130,10 +3795,54 @@ class ResearchToolRepository:
                     )
                     session.add(query_row)
                     await session.flush()
+                    seen_urls: set[str] = set()
+                    reused_recorded_urls = seen_urls
                     for rank, result in enumerate(results, start=1):
+                        normalized_result_url = normalize_source_url(result.url)
+                        candidate_id = str(uuid7())
+                        identity = CandidateIdentity(
+                            candidate_id=candidate_id,
+                            raw_url=result.url,
+                            normalized_url=normalized_result_url,
+                            question_id=target.question_id,
+                            query_id=str(query_row.id),
+                            domain=(urlsplit(normalized_result_url).hostname or "unknown")[:255],
+                        )
+                        await self._append_candidate_event(
+                            session,
+                            run,
+                            identity,
+                            "candidate_created",
+                            public_summary="已创建搜索候选实体。",
+                        )
+                        await self._append_candidate_event(
+                            session,
+                            run,
+                            identity,
+                            "url_normalized",
+                            public_summary="已记录候选 URL 的规范化身份。",
+                        )
+                        await self._append_candidate_event(
+                            session,
+                            run,
+                            identity,
+                            "duplicate_checked",
+                            public_summary="已完成候选 URL 去重检查。",
+                        )
+                        if normalized_result_url in seen_urls:
+                            await self._append_candidate_event(
+                                session,
+                                run,
+                                identity,
+                                "candidate_skipped",
+                                reason="duplicate",
+                                public_summary="重复候选未进入抓取。",
+                            )
+                            continue
+                        seen_urls.add(normalized_result_url)
                         session.add(
                             SearchResultRow(
-                                id=uuid7(),
+                                id=UUID(candidate_id),
                                 search_query_id=query_row.id,
                                 rank=rank,
                                 title=result.title,
@@ -2150,6 +3859,12 @@ class ResearchToolRepository:
                 usage["search_provider_requests"] = _as_int(
                     usage.get("search_provider_requests", 0)
                 ) + max(0, provider_requests)
+                _update_provider_health_usage(
+                    usage,
+                    healthy=provider_healthy,
+                    unresponsive=provider_unresponsive,
+                    productive=provider_productive,
+                )
                 _update_query_family_usage(
                     usage,
                     family=target.query_family,
@@ -2167,10 +3882,23 @@ class ResearchToolRepository:
                     run,
                     event_type="search.reused",
                     public_summary=f"复用本任务已有候选, 获得 {len(results)} 个未读取结果。",
-                    refs={"question_id": target.question_id},
+                    refs={
+                        "question_id": target.question_id,
+                        "feedback_id": str(target.feedback_id) if target.feedback_id else None,
+                        "feedback_execution_id": (
+                            str(target.feedback_execution_id)
+                            if target.feedback_execution_id
+                            else None
+                        ),
+                        "query_execution_id": (
+                            str(target.query_execution_id)
+                            if target.query_execution_id
+                            else None
+                        ),
+                    },
                     metrics={"result_count": len(results), "search_budget_consumed": False},
                 )
-                return
+                return reused_recorded_urls
             query_hash = hashlib.sha256(normalize_search_query(target.query).encode()).hexdigest()
             query_row = await session.scalar(
                 select(SearchQueryRow).where(
@@ -2221,14 +3949,53 @@ class ResearchToolRepository:
                 ],
                 default=0,
             )
+            new_recorded_urls: set[str] = set()
             for result in results:
                 normalized_result_url = normalize_source_url(result.url)
+                candidate_id = str(uuid7())
+                identity = CandidateIdentity(
+                    candidate_id=candidate_id,
+                    raw_url=result.url,
+                    normalized_url=normalized_result_url,
+                    question_id=target.question_id,
+                    query_id=str(query_row.id),
+                    domain=(urlsplit(normalized_result_url).hostname or "unknown")[:255],
+                )
+                await self._append_candidate_event(
+                    session,
+                    run,
+                    identity,
+                    "candidate_created",
+                    public_summary="已创建搜索候选实体。",
+                )
+                await self._append_candidate_event(
+                    session,
+                    run,
+                    identity,
+                    "url_normalized",
+                    public_summary="已记录候选 URL 的规范化身份。",
+                )
+                await self._append_candidate_event(
+                    session,
+                    run,
+                    identity,
+                    "duplicate_checked",
+                    public_summary="已完成候选 URL 去重检查。",
+                )
                 if normalized_result_url in existing_urls:
+                    await self._append_candidate_event(
+                        session,
+                        run,
+                        identity,
+                        "candidate_skipped",
+                        reason="duplicate",
+                        public_summary="重复候选未进入抓取。",
+                    )
                     continue
                 next_rank += 1
                 session.add(
                     SearchResultRow(
-                        id=uuid7(),
+                        id=UUID(candidate_id),
                         search_query_id=query_row.id,
                         rank=next_rank,
                         title=result.title,
@@ -2238,6 +4005,7 @@ class ResearchToolRepository:
                     )
                 )
                 existing_urls.add(normalized_result_url)
+                new_recorded_urls.add(normalized_result_url)
             query_row.result_count = len(existing_urls)
             tool_call.status = "succeeded"
             tool_call.result_refs = {"search_query_id": str(query_row.id), "count": len(results)}
@@ -2250,7 +4018,15 @@ class ResearchToolRepository:
             usage["search_provider_requests"] = _as_int(
                 usage.get("search_provider_requests", 0)
             ) + max(0, provider_requests)
-            if provider_requests > 0:
+            _update_provider_health_usage(
+                usage,
+                healthy=provider_healthy,
+                unresponsive=provider_unresponsive,
+                productive=provider_productive,
+            )
+            if provider_requests > 0 and (
+                provider_healthy > 0 or provider_productive > 0 or bool(results)
+            ):
                 _mark_query_family_executed(
                     usage,
                     question_id=target.question_id,
@@ -2266,6 +4042,22 @@ class ResearchToolRepository:
                 usable_results=len(results),
                 latency_ms=latency_ms,
             )
+            _update_provider_observability_usage(
+                usage,
+                {
+                    "provider_requests": provider_requests,
+                    "healthy_responses": provider_healthy,
+                    "unresponsive_responses": provider_unresponsive,
+                    "timeout_count": provider_timeouts,
+                    "network_error_count": 0,
+                    "http_error_count": 0,
+                    "empty_response_count": 0,
+                    "invalid_response_count": 0,
+                    "fallback_attempts": provider_fallbacks,
+                    "fallback_successes": max(provider_productive - provider_healthy, 0),
+                    "circuit_open_count": 0,
+                },
+            )
             usage["candidate_urls"] = _as_int(usage.get("candidate_urls", 0)) + len(results)
             run.usage_snapshot = _usage_with_resource_pools(run, usage)
             await self._append_event(
@@ -2276,15 +4068,90 @@ class ResearchToolRepository:
                 refs={
                     "search_query_id": str(query_row.id),
                     "question_id": target.question_id,
+                    "feedback_id": str(target.feedback_id) if target.feedback_id else None,
+                    "feedback_execution_id": (
+                        str(target.feedback_execution_id)
+                        if target.feedback_execution_id
+                        else None
+                    ),
+                    "query_execution_id": (
+                        str(target.query_execution_id)
+                        if target.query_execution_id
+                        else None
+                    ),
                 },
                 metrics={
+                    "provider": executed_provider or "SearXNG",
                     "result_count": len(results),
                     "query_family": target.query_family,
                     "provider_requests": provider_requests,
                     "timeouts": provider_timeouts,
                     "fallbacks": provider_fallbacks,
+                    "healthy_responses": provider_healthy,
+                    "unresponsive_responses": provider_unresponsive,
+                    "productive_responses": provider_productive,
+                    "fallback_attempts": provider_fallbacks,
+                    "fallback_successes": max(provider_productive - provider_healthy, 0),
                     "latency_ms": latency_ms,
                 },
+            )
+            succeeding_providers: list[str] = []
+            candidates = self._candidate_providers()
+            if executed_provider:
+                # Phase 12.4: the Router-selected provider is authoritative for
+                # which provider actually served this search. Attribute the
+                # success to it directly instead of the legacy healthy/productive
+                # count heuristic that only made sense for the 2-provider model.
+                if results or provider_healthy or provider_productive:
+                    succeeding_providers.append(executed_provider)
+            else:
+                if provider_healthy > 0 and candidates:
+                    succeeding_providers.append(candidates[0])
+                if max(provider_productive - provider_healthy, 0) > 0 and len(candidates) > 1:
+                    succeeding_providers.append(candidates[1])
+            if succeeding_providers:
+                await self._record_provider_health_and_routing(
+                    session,
+                    run,
+                    target,
+                    failing_provider=None,
+                    failure_type=None,
+                    succeeding_providers=tuple(succeeding_providers),
+                )
+            return new_recorded_urls
+
+    async def record_candidate_dispatch_event(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        url: str,
+        stage: str,
+        reason: str | None = None,
+    ) -> None:
+        """Persist one URL-level dispatch decision without changing selection."""
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=url,
+            )
+            summaries = {
+                "dispatch_started": "候选来源进入 Dispatch 阶段。",
+                "dispatch_selected": "候选来源通过 Dispatch 决策并准备抓取。",
+                "dispatch_skipped": "候选来源未进入抓取并记录 Dispatch 原因。",
+            }
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                stage,
+                reason=reason,
+                public_summary=summaries[stage],
             )
 
     async def record_tool_failure(
@@ -2299,7 +4166,11 @@ class ResearchToolRepository:
         provider_requests: int = 0,
         provider_timeouts: int = 0,
         provider_fallbacks: int = 0,
+        provider_healthy: int = 0,
+        provider_unresponsive: int = 0,
+        provider_productive: int = 0,
         latency_ms: int = 0,
+        executed_provider: str | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -2323,7 +4194,37 @@ class ResearchToolRepository:
             usage_snapshot["search_provider_requests"] = _as_int(
                 usage_snapshot.get("search_provider_requests", 0)
             ) + max(0, provider_requests)
-            if provider_requests > 0:
+            _update_provider_health_usage(
+                usage_snapshot,
+                healthy=provider_healthy,
+                unresponsive=provider_unresponsive,
+                productive=provider_productive,
+            )
+            raw_failure_metrics = details.get("metrics") if details else None
+            failure_metrics = (
+                raw_failure_metrics
+                if isinstance(raw_failure_metrics, Mapping)
+                else {
+                    "provider_requests": provider_requests,
+                    "healthy_responses": provider_healthy,
+                    "unresponsive_responses": provider_unresponsive,
+                    "timeout_count": provider_timeouts,
+                    "network_error_count": 0,
+                    "http_error_count": 0,
+                    "empty_response_count": 0,
+                    "invalid_response_count": 0,
+                    "fallback_attempts": provider_fallbacks,
+                    "fallback_successes": max(provider_productive - provider_healthy, 0),
+                    "circuit_open_count": 0,
+                }
+            )
+            _update_provider_observability_usage(usage_snapshot, failure_metrics)
+            # A transport-only failure must remain retryable.  Counting its
+            # family as executed would make the scheduler report source-space
+            # exhaustion even though no healthy provider response was seen.
+            if provider_requests > 0 and (
+                provider_healthy > 0 or provider_productive > 0
+            ):
                 _mark_query_family_executed(
                     usage_snapshot,
                     question_id=target.question_id,
@@ -2347,6 +4248,86 @@ class ResearchToolRepository:
                     "details": dict(details),
                 }
             run.usage_snapshot = _usage_with_resource_pools(run, usage_snapshot)
+            failure_type = classify_provider_failure(
+                error_code=error_code,
+                details=details,
+            )
+            decision = retry_decision(failure_type)
+            context = details.get("context") if details else None
+            context = context if isinstance(context, Mapping) else {}
+            provider = (
+                executed_provider
+                or (str(details.get("provider", "unknown")) if details else "unknown")
+            )
+            event_refs: dict[str, object] = {
+                "query_execution_id": (
+                    str(target.query_execution_id) if target.query_execution_id else None
+                ),
+                "question_id": target.question_id,
+                "gap_id": str(target.gap_id),
+                "feedback_execution_id": (
+                    str(target.feedback_execution_id)
+                    if target.feedback_execution_id
+                    else None
+                ),
+                "provider": provider,
+                "failure_type": failure_type.value,
+                "retry_count": _as_int(usage_snapshot.get("provider_retry_count", 0)),
+            }
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.attempt.started",
+                public_summary="Provider Attempt 已开始记录。",
+                refs=event_refs,
+            )
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.attempt.failed",
+                public_summary="Provider Attempt 失败, 已完成失败分类。",
+                refs={**event_refs, "error_code": error_code[:100]},
+                metrics=dict(details) if details else None,
+            )
+            if decision.value == "retry":
+                usage_snapshot = dict(run.usage_snapshot)
+                usage_snapshot["provider_retry_count"] = (
+                    _as_int(usage_snapshot.get("provider_retry_count", 0)) + 1
+                )
+                run.usage_snapshot = _usage_with_resource_pools(run, usage_snapshot)
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="provider.retry.scheduled",
+                    public_summary="Provider Failure 可恢复, 保留 Research Continuation。",
+                    refs={**event_refs, "decision": decision.value},
+                )
+            elif decision.value == "fallback":
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="provider.fallback.selected",
+                    public_summary="Provider Failure 已选择受限 fallback/alternative 路径。",
+                    refs={
+                        **event_refs,
+                        "decision": decision.value,
+                        "fallback_provider": context.get("fallback_provider"),
+                    },
+                )
+            candidates = self._candidate_providers()
+            failing_candidate = (
+                provider
+                if provider in candidates
+                else (candidates[0] if candidates else provider)
+            )
+            await self._record_provider_health_and_routing(
+                session,
+                run,
+                target,
+                failing_provider=failing_candidate,
+                failure_type=failure_type,
+                succeeding_providers=(),
+            )
             await self._append_event(
                 session,
                 run,
@@ -2354,6 +4335,239 @@ class ResearchToolRepository:
                 public_summary="Web Search 执行失败, 公开轨迹仅记录安全错误码。",
                 refs={"question_id": target.question_id, "error_code": error_code[:100]},
                 metrics=dict(details) if details else None,
+            )
+
+    async def _record_provider_health_and_routing(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        target: ResearchTarget,
+        *,
+        failing_provider: str | None,
+        failure_type: ProviderFailureType | None,
+        succeeding_providers: tuple[str, ...],
+    ) -> None:
+        """Project provider health and emit health-routing decisions.
+
+        This is additive Phase 12.1 observability. It records how healthy each
+        search provider currently is and which provider a health-aware router
+        would pick next. It never changes the provider the search tool already
+        used, the search strategy, query ranking, coverage, evidence
+        acceptance, gap closure, budget, recovery policy, or the planner, and
+        it bounds provider switching through the existing retry counter so it
+        can never bypass the query/recovery/borrow budgets.
+        """
+
+        raw_health = run.usage_snapshot.get("provider_health")
+        tracker = ProviderHealthTracker.from_payload(
+            raw_health if isinstance(raw_health, Mapping) else {}
+        )
+        now = datetime.now(UTC)
+
+        for update in tracker.expire_cooldowns(now):
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.health.updated",
+                public_summary="Provider 冷却到期, 进入可重新探测状态。",
+                refs=self._provider_health_refs(target, update),
+            )
+
+        if failing_provider is not None and failure_type is not None:
+            update = tracker.record_failure(
+                failing_provider, failure_type=failure_type, when=now
+            )
+            if update.changed:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="provider.health.updated",
+                    public_summary="Provider 失败已更新健康状态。",
+                    refs=self._provider_health_refs(target, update),
+                    metrics={"failure_type": failure_type.value},
+                )
+
+        for provider in succeeding_providers:
+            update = tracker.record_success(provider, when=now)
+            if update.changed:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="provider.health.updated",
+                    public_summary="Provider 成功响应已恢复健康状态。",
+                    refs=self._provider_health_refs(target, update),
+                )
+
+        updated_usage = dict(run.usage_snapshot)
+        updated_usage["provider_health"] = tracker.to_payload()
+        run.usage_snapshot = _usage_with_resource_pools(run, updated_usage)
+
+        router = ProviderRouter(
+            tracker, candidate_providers=self._candidate_providers()
+        )
+        decision = router.select_for(
+            is_feedback=target.feedback_id is not None,
+            feedback_execution_id=target.feedback_execution_id,
+            already_excluded=(failing_provider,) if failing_provider else (),
+            provider_switches_used=_as_int(
+                updated_usage.get("provider_retry_count", 0)
+            ),
+        )
+        routing_refs: dict[str, object] = {
+            "provider_name": decision.selected_provider or "",
+            "selected_provider": decision.selected_provider or "",
+            "previous_state": None,
+            "new_state": (
+                decision.health_state.value
+                if decision.health_state is not None
+                else None
+            ),
+            "provider_pool_size": decision.provider_pool_size,
+            "available_provider_count": decision.available_provider_count,
+            "selection_rank": decision.selection_rank,
+            "query_execution_id": (
+                str(target.query_execution_id) if target.query_execution_id else None
+            ),
+            "question_id": target.question_id,
+            "gap_id": str(target.gap_id),
+            "feedback_execution_id": (
+                str(target.feedback_execution_id)
+                if target.feedback_execution_id
+                else None
+            ),
+            "reason": decision.reason,
+            "excluded_providers": list(decision.excluded_providers),
+            "fallback_used": decision.fallback_used,
+        }
+        if decision.selected_provider is not None:
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.routing.selected",
+                public_summary="Provider Health Routing 已选择可用 Provider。",
+                refs=routing_refs,
+            )
+        else:
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.routing.rejected",
+                public_summary="所有 Provider 不可用或切换预算耗尽, 停止健康路由。",
+                refs=routing_refs,
+            )
+
+    @staticmethod
+    def _provider_health_refs(
+        target: ResearchTarget,
+        update: ProviderHealthUpdate,
+    ) -> dict[str, object]:
+        return {
+            "provider_name": update.provider_name,
+            "previous_state": update.previous_state.value,
+            "new_state": update.state.value,
+            "query_execution_id": (
+                str(target.query_execution_id) if target.query_execution_id else None
+            ),
+            "question_id": target.question_id,
+            "gap_id": str(target.gap_id),
+            "feedback_execution_id": (
+                str(target.feedback_execution_id)
+                if target.feedback_execution_id
+                else None
+            ),
+            "reason": update.reason,
+        }
+
+    async def select_provider_for_target(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+    ) -> ProviderSelectionDecision:
+        """Return the current health-aware provider selection for one attempt.
+
+        Phase 12.2 promotes the router decision from a post-hoc annotation to
+        an actual execution input. This method is read-only: it does not
+        change provider health, budget, or emit events. It reuses the same
+        :class:`ProviderHealthTracker` persisted under
+        ``run.usage_snapshot["provider_health"]`` so Router selection and
+        recorded health state stay consistent, and honors the existing
+        ``provider_retry_count`` as the switch budget so this call can never
+        bypass the query / recovery / borrow limits.
+        """
+
+        async with self._sessions() as session:
+            run = await self._locked_run(session, run_id, worker_task_id)
+            raw_health = run.usage_snapshot.get("provider_health")
+            tracker = ProviderHealthTracker.from_payload(
+                raw_health if isinstance(raw_health, Mapping) else {}
+            )
+            tracker.expire_cooldowns(datetime.now(UTC))
+            router = ProviderRouter(
+                tracker, candidate_providers=self._candidate_providers()
+            )
+            return router.select_for(
+                is_feedback=target.feedback_id is not None,
+                feedback_execution_id=target.feedback_execution_id,
+                provider_switches_used=_as_int(
+                    run.usage_snapshot.get("provider_retry_count", 0)
+                ),
+            )
+
+    async def record_provider_execution_started(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        decision: ProviderSelectionDecision,
+    ) -> None:
+        """Emit ``provider.execution.started`` for a router-authoritative attempt.
+
+        Only fires when the router actually selected a provider. When the
+        decision is a STOP (all-unavailable or switch budget exhausted) the
+        corresponding ``provider.routing.rejected`` event has already been
+        emitted by Phase 12.1 and the caller records a normal tool failure.
+        """
+
+        if decision.selected_provider is None:
+            return
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.execution.started",
+                public_summary="Provider Executor 按路由决策发起真实调用。",
+                refs={
+                    "provider_name": decision.selected_provider,
+                    "selected_provider": decision.selected_provider,
+                    "provider_pool_size": decision.provider_pool_size,
+                    "available_provider_count": decision.available_provider_count,
+                    "selection_rank": decision.selection_rank,
+                    "previous_state": None,
+                    "new_state": (
+                        decision.health_state.value
+                        if decision.health_state is not None
+                        else None
+                    ),
+                    "query_execution_id": (
+                        str(target.query_execution_id)
+                        if target.query_execution_id
+                        else None
+                    ),
+                    "question_id": target.question_id,
+                    "gap_id": str(target.gap_id),
+                    "feedback_execution_id": (
+                        str(target.feedback_execution_id)
+                        if target.feedback_execution_id
+                        else None
+                    ),
+                    "reason": decision.reason,
+                    "fallback_used": decision.fallback_used,
+                    "excluded_providers": list(decision.excluded_providers),
+                },
             )
 
     async def record_extraction_started(
@@ -2366,6 +4580,27 @@ class ResearchToolRepository:
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_latest_fetch(
+                session,
+                run_id=run_id,
+                target=target,
+            )
+            if candidate is None:
+                candidate = CandidateIdentity(
+                    candidate_id=str(source_id),
+                    raw_url="",
+                    normalized_url="",
+                    question_id=target.question_id,
+                    query_id=str(target.tool_call_id),
+                    domain="unknown",
+                )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "extraction_started",
+                public_summary="候选来源开始证据抽取。",
+            )
             await self._append_event(
                 session,
                 run,
@@ -2374,8 +4609,49 @@ class ResearchToolRepository:
                 refs={
                     "question_id": target.question_id,
                     "source_id": str(source_id),
+                    "candidate_id": candidate.candidate_id,
                     "plan_version": target.plan_version,
                 },
+            )
+
+    async def record_evidence_selection_event(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        url: str,
+        stage: str,
+        reason: str | None = None,
+        source_id: UUID | str | None = None,
+    ) -> None:
+        """Persist Evidence Selection telemetry without changing selection."""
+
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=url,
+            )
+            event = evidence_selection_lifecycle_event(
+                candidate,
+                stage,
+                reason=reason,
+                source_id=source_id,
+            )
+            summaries = {
+                "selection_started": "Readable source 进入 Evidence Selection。",
+                "selection_selected": "Readable source 通过 Evidence Selection。",
+                "selection_skipped": "Readable source 未进入 Evidence extraction, 并记录原因。",
+            }
+            await self._append_event(
+                session,
+                run,
+                event_type=str(event["event_type"]),
+                public_summary=summaries[stage],
+                refs=cast(dict[str, object], event["refs"]),
             )
 
     async def page_already_processed(
@@ -2396,6 +4672,12 @@ class ResearchToolRepository:
 
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=requested_url,
+            )
             processed_source_ids = set(
                 (
                     await session.scalars(
@@ -2459,6 +4741,7 @@ class ResearchToolRepository:
                 ),
                 refs={
                     "question_id": target.question_id,
+                    "candidate_id": candidate.candidate_id,
                     "source_id": str(duplicate.id),
                     "requested_url": requested_url[:1000],
                     "final_url": page.final_url[:1000],
@@ -2466,7 +4749,995 @@ class ResearchToolRepository:
                 },
                 metrics={"fetch_budget_consumed": True, "extraction_budget_consumed": False},
             )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "candidate_skipped",
+                reason="already_processed",
+                public_summary="已处理候选未重复进入证据抽取。",
+            )
             return True
+
+    async def _align_and_evaluate_evidence(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        target: ResearchTarget,
+        evidence_ids: tuple[UUID, ...],
+    ) -> None:
+        """Wire persisted candidate evidence into the canonical Gap pipeline.
+
+        This is deliberately placed after evidence persistence and before the
+        surrounding transaction commits.  It consumes the existing acceptance
+        result, emits explanatory alignment events, and lets the existing
+        monotonic ClosureEvaluator update GapRequirement state.  It does not
+        alter search, acceptance, coverage, or recovery policy.
+        """
+
+        requirement_rows = await GapRequirementRepository.list_for_run(
+            session,
+            run.id,
+            plan_version=target.plan_version,
+        )
+        requirements_by_dimension = {
+            row.dimension_key: row
+            for row in requirement_rows
+            if row.question_id == target.question_id
+        }
+        for dimension_key, criterion in target.acceptance_dimensions:
+            if dimension_key in requirements_by_dimension:
+                continue
+            fallback = _runtime_gap_requirement(
+                run_id=run.id,
+                plan_version=target.plan_version,
+                question_id=target.question_id,
+                dimension_key=dimension_key,
+                criterion=criterion,
+            )
+            persisted = await GapRequirementRepository.upsert_many(
+                session, (fallback,)
+            )
+            if persisted:
+                persisted_row = await session.scalar(
+                    select(GapRequirementRow).where(
+                        GapRequirementRow.gap_id == persisted[0].gap_id
+                    )
+                )
+                if persisted_row is not None:
+                    requirements_by_dimension[dimension_key] = persisted_row
+
+        evidence_rows = list(
+            (
+                await session.scalars(
+                    select(ResearchEvidenceRow).where(
+                        ResearchEvidenceRow.id.in_(evidence_ids)
+                    )
+                )
+            ).all()
+        )
+        claim_ids = tuple(
+            row.claim_id for row in evidence_rows if row.claim_id is not None
+        )
+        claims = list(
+            (
+                await session.scalars(
+                    select(ResearchClaimRow).where(ResearchClaimRow.id.in_(claim_ids))
+                )
+            ).all()
+        ) if claim_ids else []
+        claims_by_id = {claim.id: claim for claim in claims}
+        evidence_by_dimension: dict[str, list[ResearchEvidenceRow]] = {}
+        evaluated_feedback_ids_by_gap: dict[str, str] = {}
+        for row in evidence_rows:
+            claim = (
+                claims_by_id.get(row.claim_id)
+                if row.claim_id is not None
+                else None
+            )
+            if claim is None or claim.question_id != target.question_id:
+                continue
+            evidence_by_dimension.setdefault(claim.dimension_key, []).append(row)
+
+        for dimension_key, batch in evidence_by_dimension.items():
+            requirement_row = requirements_by_dimension.get(dimension_key)
+            if requirement_row is None:
+                continue
+            requirement = _gap_requirement_from_row(requirement_row)
+            batch_ids = tuple(item.id for item in batch)
+            after_count = int(
+                await session.scalar(
+                    select(func.count(ResearchEvidenceRow.id))
+                    .select_from(ResearchEvidenceRow)
+                    .join(
+                        ResearchClaimRow,
+                        ResearchEvidenceRow.claim_id == ResearchClaimRow.id,
+                    )
+                    .where(
+                        ResearchEvidenceRow.run_id == run.id,
+                        ResearchEvidenceRow.question_id == target.question_id,
+                        ResearchEvidenceRow.accepted.is_(True),
+                        ResearchClaimRow.dimension_key == dimension_key,
+                    )
+                )
+                or 0
+            )
+            before_count = int(
+                await session.scalar(
+                    select(func.count(ResearchEvidenceRow.id))
+                    .select_from(ResearchEvidenceRow)
+                    .join(
+                        ResearchClaimRow,
+                        ResearchEvidenceRow.claim_id == ResearchClaimRow.id,
+                    )
+                    .where(
+                        ResearchEvidenceRow.run_id == run.id,
+                        ResearchEvidenceRow.question_id == target.question_id,
+                        ResearchEvidenceRow.accepted.is_(True),
+                        ResearchClaimRow.dimension_key == dimension_key,
+                        ResearchEvidenceRow.id.not_in(batch_ids),
+                    )
+                )
+                or 0
+            )
+            after_owners = set(
+                (
+                    await session.scalars(
+                        select(ResearchSourceRow.source_owner_key)
+                        .select_from(ResearchEvidenceRow)
+                        .join(
+                            ResearchSourceRow,
+                            ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                        )
+                        .join(
+                            ResearchClaimRow,
+                            ResearchEvidenceRow.claim_id == ResearchClaimRow.id,
+                        )
+                        .where(
+                            ResearchEvidenceRow.run_id == run.id,
+                            ResearchEvidenceRow.question_id == target.question_id,
+                            ResearchEvidenceRow.accepted.is_(True),
+                            ResearchClaimRow.dimension_key == dimension_key,
+                        )
+                    )
+                ).all()
+            )
+            before_owners = set(
+                (
+                    await session.scalars(
+                        select(ResearchSourceRow.source_owner_key)
+                        .select_from(ResearchEvidenceRow)
+                        .join(
+                            ResearchSourceRow,
+                            ResearchEvidenceRow.source_id == ResearchSourceRow.id,
+                        )
+                        .join(
+                            ResearchClaimRow,
+                            ResearchEvidenceRow.claim_id == ResearchClaimRow.id,
+                        )
+                        .where(
+                            ResearchEvidenceRow.run_id == run.id,
+                            ResearchEvidenceRow.question_id == target.question_id,
+                            ResearchEvidenceRow.accepted.is_(True),
+                            ResearchClaimRow.dimension_key == dimension_key,
+                            ResearchEvidenceRow.id.not_in(batch_ids),
+                        )
+                    )
+                ).all()
+            )
+            base_version = requirement.state_version
+            if (
+                requirement.current_evidence_count != before_count
+                or requirement.current_independent_sources != len(before_owners)
+            ):
+                base_version = max(base_version, requirement_row.state_version + 1)
+            requirement = replace(
+                requirement,
+                current_evidence_count=before_count,
+                current_independent_sources=len(before_owners),
+                state_version=base_version,
+            )
+
+            alignments = []
+            for item in batch:
+                claim = (
+                    claims_by_id.get(item.claim_id)
+                    if item.claim_id is not None
+                    else None
+                )
+                extraction_id = uuid5(
+                    NAMESPACE_URL, f"live-extraction:{run.id}:{item.id}"
+                )
+                reader_execution_id = uuid5(
+                    NAMESPACE_URL, f"live-reader:{run.id}:{item.source_id}"
+                )
+                request = EvidenceAlignmentRequest(
+                    alignment_request_id=uuid5(
+                        NAMESPACE_URL, f"live-alignment-request:{run.id}:{item.id}"
+                    ),
+                    extraction_id=extraction_id,
+                    reader_execution_id=reader_execution_id,
+                    source_id=str(item.source_id),
+                    evidence_id=item.id,
+                    run_id=run.id,
+                    question_id=target.question_id,
+                    gap_id=requirement.gap_id,
+                    dimension_key=dimension_key,
+                    requirement_type=requirement.requirement_type.value,
+                    claim_id=str(claim.id) if claim is not None else None,
+                    candidate_evidence=f"{item.claim}\n{item.exact_quote}",
+                )
+                execution = EvidenceAlignmentExecutor.execute(
+                    request,
+                    requirement=requirement,
+                    evidence_dimension_key=dimension_key,
+                    evidence_quality_passed=item.accepted,
+                    # Claim verification independence is judged from this
+                    # dimension-scoped, accepted-only distinct source-owner
+                    # count; it is no longer gated on a hard-coded boolean.
+                    independent_source_count=len(after_owners),
+                )
+                if execution.alignment is None:
+                    continue
+                alignments.append(execution.alignment)
+                for event in execution.events:
+                    await self._append_event(
+                        session,
+                        run,
+                        event_type=event.event_type.value,
+                        public_summary="Evidence Alignment 已完成。",
+                        refs={
+                            "run_id": str(run.id),
+                            "question_id": event.question_id,
+                            "gap_id": str(event.gap_id),
+                            "evidence_id": str(event.evidence_id),
+                            "extraction_id": str(event.extraction_id),
+                            "reader_execution_id": str(request.reader_execution_id),
+                            "alignment_id": str(event.alignment_id),
+                            "alignment_request_id": str(
+                                request.alignment_request_id
+                            ),
+                            "result": (
+                                execution.alignment.alignment_status.value
+                                if execution.alignment is not None
+                                else None
+                            ),
+                            "reason": event.reason,
+                        },
+                        metrics={
+                            "alignment_status": execution.alignment.alignment_status.value,
+                            "satisfies_requirement": execution.alignment.satisfies_requirement,
+                        },
+                    )
+
+            if not alignments:
+                continue
+            context = ClosureEvaluationContext.from_alignments(
+                gap_id=requirement.gap_id,
+                before_snapshot=ClosureSnapshot(
+                    coverage=requirement.current_coverage,
+                    evidence_count=before_count,
+                    independent_sources=len(before_owners),
+                    verification_status=requirement.verification_status,
+                ),
+                evidence_alignments=tuple(alignments),
+                independent_source_count=len(after_owners),
+            )
+            closure = ClosureEvaluator.evaluate(context, requirement=requirement)
+            updated_requirement = replace(
+                closure.requirement,
+                current_evidence_count=after_count,
+                current_independent_sources=len(after_owners),
+            )
+            persisted = await GapRequirementRepository.upsert_many(
+                session, (updated_requirement,)
+            )
+            persisted_requirement = persisted[0] if persisted else updated_requirement
+            for closure_event in closure.events:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type=closure_event.event_type.value,
+                    public_summary="Gap Closure Evaluation 已完成。",
+                    refs={
+                        "run_id": str(run.id),
+                        "question_id": closure_event.question_id,
+                        "gap_id": str(closure_event.gap_id),
+                        "evaluation_id": str(closure_event.evaluation_id),
+                        "before_status": closure_event.before_status.value,
+                        "after_status": closure_event.after_status.value,
+                        "state_version": persisted_requirement.state_version,
+                        "transition_reason": closure_event.transition_reason,
+                    },
+                    metrics={
+                        "evaluation_id": str(closure_event.evaluation_id),
+                        "previous_status": closure_event.before_status.value,
+                        "new_status": closure_event.after_status.value,
+                        "state_version": persisted_requirement.state_version,
+                        "transition_reason": closure_event.transition_reason,
+                        "aligned_evidence_count": closure.result.aligned_evidence_count,
+                        "partial_evidence_count": closure.result.partial_evidence_count,
+                    },
+                )
+
+            if requirement.requirement_type.value == "claim_verification":
+                identity_keys = sorted(str(owner) for owner in after_owners)
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="claim.verification.evaluated",
+                    public_summary="Claim Verification 独立来源评估已完成。",
+                    refs={
+                        "run_id": str(run.id),
+                        "question_id": requirement.question_id,
+                        "gap_id": str(requirement.gap_id),
+                        "dimension_key": requirement.dimension_key,
+                    },
+                    metrics={
+                        "required_independent_sources": (
+                            requirement.required_independent_sources
+                        ),
+                        "observed_independent_sources": len(after_owners),
+                        "source_identity_keys": identity_keys[:20],
+                        "source_identity_key_count": len(identity_keys),
+                        "verification_result": closure.requirement.closure_status.value,
+                        "independence_satisfied": (
+                            len(after_owners)
+                            >= requirement.required_independent_sources
+                        ),
+                        "reason": closure.result.transition_reason,
+                    },
+                )
+
+            # Phase 15.1 Task O observability (Branch B, run-flag gated): record
+            # whether this batch's freshly accepted evidence brought a genuinely
+            # NEW independent source owner to a still-short independence
+            # requirement, versus a same-owner duplicate that stays usable for
+            # *other* requirements.  It is a pure, auditable event: it changes no
+            # acceptance decision, drops no evidence, and reweights no ranking.
+            if _independent_source_targeting_enabled(run) and requirement.requirement_type in {
+                GapRequirementType.CLAIM_VERIFICATION,
+                GapRequirementType.INDEPENDENT_SOURCE,
+            }:
+                existing_owners = {str(owner) for owner in before_owners}
+                after_owner_keys = {str(owner) for owner in after_owners}
+                newly_independent = sorted(after_owner_keys - existing_owners)
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="research.independent_source.eligibility_evaluated",
+                    public_summary="独立来源候选的需求级独立性与新增来源已评估。",
+                    refs={
+                        "run_id": str(run.id),
+                        "question_id": requirement.question_id,
+                        "gap_id": str(requirement.gap_id),
+                        "dimension_key": requirement.dimension_key,
+                        "requirement_type": requirement.requirement_type.value,
+                    },
+                    metrics={
+                        "required_independent_sources": requirement.required_independent_sources,
+                        "existing_source_owners": sorted(existing_owners)[:20],
+                        "distinct_source_owners": len(after_owner_keys),
+                        "newly_independent_source_owners": newly_independent[:20],
+                        "advanced_independence": bool(newly_independent),
+                        "independence_satisfied": (
+                            len(after_owners) >= requirement.required_independent_sources
+                        ),
+                    },
+                )
+
+            chain_feedbacks = await self._emit_closure_feedback_chain(
+                session,
+                run,
+                requirement=closure.requirement,
+                closure=closure,
+                alignments=tuple(alignments),
+                observed_source_owners=tuple(sorted(str(owner) for owner in after_owners)),
+            )
+            for chain_feedback in chain_feedbacks:
+                evaluated_feedback_ids_by_gap[str(chain_feedback.gap_id)] = str(
+                    chain_feedback.feedback_id
+                )
+
+        await self._run_feedback_completeness_pass(
+            session,
+            run,
+            question_id=target.question_id,
+            plan_version=target.plan_version,
+            in_call_feedback_ids_by_gap=evaluated_feedback_ids_by_gap,
+        )
+
+    async def _emit_closure_feedback_chain(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        requirement: GapRequirement,
+        closure: ClosureEvaluationExecution,
+        alignments: tuple[EvidenceAlignment, ...],
+        observed_source_owners: tuple[str, ...] = (),
+    ) -> tuple[ClosureFeedback, ...]:
+        """Project partial closure into explanatory future-research artifacts.
+
+        This is deliberately an event-only bridge.  It does not enqueue work,
+        invoke Search, or consume Budget; the generated artifacts explain why
+        a future Recovery could be useful.
+        """
+
+        feedbacks = ClosureFeedbackGenerator.generate(closure)
+        if feedbacks:
+            # Phase 14.0: attach the generic evidence-quality / claim-support
+            # explanation as additive feedback metadata.  The persisted event
+            # payload only gains a new "metadata" key; the downstream chain
+            # (dispatcher -> need -> action -> intent) is unchanged.
+            analysis_metadata = build_feedback_analysis(requirement, alignments)
+            # Phase 15.1 Branch B: when a claim-verification / independent-source
+            # requirement is STILL short on distinct owners after Branch A's
+            # identity-correct closure, and the run opted into the experiment,
+            # carry the already-counted source owners as *exclusion* metadata so
+            # the follow-up need/candidate targets a genuinely new publisher.  The
+            # owners travel as execution metadata (never stitched into query
+            # text).  Flag off -> byte-identical Phase 15.0 feedback payload.
+            targeting_metadata = self._independent_source_targeting_metadata(
+                run,
+                requirement=requirement,
+                observed_source_owners=observed_source_owners,
+            )
+            if targeting_metadata is not None:
+                analysis_metadata = {**analysis_metadata, **targeting_metadata}
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="research.independent_source.targeting_recorded",
+                    public_summary="已为仍缺独立来源的 Requirement 记录来源排除上下文。",
+                    refs={
+                        "run_id": str(run.id),
+                        "question_id": requirement.question_id,
+                        "gap_id": str(requirement.gap_id),
+                        "dimension_key": requirement.dimension_key,
+                        "requirement_type": requirement.requirement_type.value,
+                    },
+                    metrics={
+                        "existing_source_owners": targeting_metadata[EXISTING_SOURCE_OWNERS_KEY],
+                        "required_source_count": targeting_metadata[REQUIRED_SOURCE_COUNT_KEY],
+                        "missing_source_count": targeting_metadata[MISSING_SOURCE_COUNT_KEY],
+                    },
+                )
+            feedbacks = tuple(
+                replace(feedback, metadata=analysis_metadata)
+                for feedback in feedbacks
+            )
+        dispatcher = self._closure_feedback_dispatcher(run)
+        for feedback in feedbacks:
+            await self._dispatch_closure_feedback(
+                session,
+                run,
+                feedback=feedback,
+                requirement=requirement,
+                alignments=alignments,
+                dispatcher=dispatcher,
+            )
+        return feedbacks
+
+    @staticmethod
+    def _independent_source_targeting_metadata(
+        run: ResearchRunRow,
+        *,
+        requirement: GapRequirement,
+        observed_source_owners: tuple[str, ...],
+    ) -> dict[str, object] | None:
+        """Build Branch B exclusion metadata, or ``None`` when it does not apply.
+
+        Applies only when the run opted into the experiment (declared factor
+        stamped in its benchmark block), the requirement is a still-open
+        independence bar (claim verification or independent source), and the
+        distinct-owner count is genuinely below ``required_independent_sources``
+        after Branch A.  The count is never lowered and the closure bar is never
+        touched: this only records *which owners are already used* so the next
+        query can prefer a new publisher.
+        """
+
+        if not _independent_source_targeting_enabled(run):
+            return None
+        if requirement.requirement_type not in {
+            GapRequirementType.CLAIM_VERIFICATION,
+            GapRequirementType.INDEPENDENT_SOURCE,
+        }:
+            return None
+        if requirement.closure_status is GapClosureStatus.CLOSED:
+            return None
+        required = int(requirement.required_independent_sources or 0)
+        owners = tuple(sorted({owner for owner in observed_source_owners if owner}))
+        observed = len(owners)
+        if required <= 0 or observed >= required:
+            return None
+        return {
+            EXISTING_SOURCE_OWNERS_KEY: list(owners),
+            REQUIRED_SOURCE_COUNT_KEY: required,
+            MISSING_SOURCE_COUNT_KEY: required - observed,
+            TARGET_CLAIM_ID_KEY: None,
+        }
+
+    @staticmethod
+    def _closure_feedback_dispatcher(
+        run: ResearchRunRow,
+    ) -> ClosureFeedbackDispatcher:
+        """Rebuild the idempotent dispatcher from the run's persisted state."""
+
+        dispatched_feedback_ids = [
+            str(value)
+            for value in run.usage_snapshot.get("dispatched_feedback_ids", ())
+            if value
+        ]
+        return ClosureFeedbackDispatcher(
+            already_dispatched_feedback_ids=frozenset(dispatched_feedback_ids)
+        )
+
+    async def _dispatch_closure_feedback(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        feedback: ClosureFeedback,
+        requirement: GapRequirement,
+        alignments: tuple[EvidenceAlignment, ...],
+        dispatcher: ClosureFeedbackDispatcher,
+    ) -> None:
+        """Route one ClosureFeedback through the dispatcher into the pipeline.
+
+        Shared by the closure-evaluation path and the Phase 13.3 completeness
+        pass so both feedback sources converge on the identical
+        need -> action -> intent -> plan -> candidate chain.
+        """
+
+        await self._append_event(
+            session,
+            run,
+            event_type="closure.feedback.generated",
+            public_summary="Gap Closure 未完成, 已生成后续研究反馈。",
+            refs=feedback.as_dict(),
+            metrics={
+                "failure_reason": feedback.failure_reason.value,
+                "recommended_need_type": feedback.recommended_need_type.value,
+            },
+        )
+        dispatch = dispatcher.dispatch(
+            feedback,
+            requirement,
+            alignments=alignments,
+        )
+        await self._append_event(
+            session,
+            run,
+            event_type="research.feedback.dispatched",
+            public_summary="Closure Feedback 已由 Dispatcher 接入 Research Pipeline。",
+            refs=dispatch.as_event_refs(),
+            metrics={"dispatch_status": dispatch.dispatch_status.value},
+        )
+        if dispatch.research_need_id is not None:
+            dispatched_feedback_ids = [
+                str(value)
+                for value in run.usage_snapshot.get("dispatched_feedback_ids", ())
+                if value
+            ]
+            if str(feedback.feedback_id) not in dispatched_feedback_ids:
+                dispatched_feedback_ids.append(str(feedback.feedback_id))
+            usage = dict(run.usage_snapshot)
+            usage["dispatched_feedback_ids"] = dispatched_feedback_ids
+            run.usage_snapshot = usage
+        feedback_execution_count = _as_int(
+            run.usage_snapshot.get("feedback_execution_count", 0)
+        )
+        for need in dispatch.research_needs:
+            await self._append_event(
+                session,
+                run,
+                event_type="research.need.generated",
+                public_summary="Closure Feedback 已生成 Research Need。",
+                refs={**need.as_dict(), "source_feedback_id": str(feedback.feedback_id)},
+                metrics={"need_type": need.need_type.value},
+            )
+            if not need.research_context.is_empty:
+                # Phase 14.1: observable proof that the evidence-deficit
+                # analysis reached the research need.  Additive event only; the
+                # existing need/dispatch events keep their previous shape.
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="research.need.refined",
+                    public_summary="Evidence 缺陷分析已精化该 Research Need 的查询方向。",
+                    refs={
+                        "feedback_id": str(feedback.feedback_id),
+                        "research_need_id": str(need.need_id),
+                        "missing_evidence_type": need.missing_evidence_type,
+                        "refined_need_type": need.refined_need_type,
+                    },
+                    metrics={"query_hints_count": len(need.query_hints)},
+                )
+            actions = dispatch.suggested_actions
+            for action in actions:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="research.action.suggested",
+                    public_summary="Research Need 已生成 Suggested Research Action。",
+                    refs={
+                        **action.as_dict(),
+                        "source_feedback_id": str(feedback.feedback_id),
+                    },
+                    metrics={"action_type": action.action_type.value},
+                )
+                intents = ResearchQueryIntentGenerator.generate(
+                    action,
+                    requirement=requirement,
+                    research_context=need.research_context,
+                )
+                for intent in intents:
+                    await self._append_event(
+                        session,
+                        run,
+                        event_type="research.query_intent.generated",
+                        public_summary="Suggested Action 已生成 Query Intent。",
+                        refs=intent.as_dict(),
+                        metrics={"intent_type": intent.intent_type.value},
+                    )
+                    plans = ResearchQueryPlanGenerator.generate(
+                        intent,
+                        requirement=requirement,
+                        priority=action.priority,
+                    )
+                    for plan in plans:
+                        await self._append_event(
+                            session,
+                            run,
+                            event_type="research.query_plan.generated",
+                            public_summary="Query Intent 已生成 Query Plan。",
+                            refs=plan.as_dict(),
+                            metrics={
+                                "search_strategy_type": plan.search_strategy_type.value
+                            },
+                        )
+                        validations = QueryPlanValidator.validate(
+                            plan,
+                            requirement=requirement,
+                        )
+                        if not validations:
+                            continue
+                        validation = validations[0]
+                        candidates = QueryCandidateGenerator.generate(
+                            plan,
+                            requirement=requirement,
+                            validation=validation,
+                            feedback=feedback,
+                        )
+                        for candidate in candidates:
+                            await self._append_event(
+                                session,
+                                run,
+                                event_type="research.query_candidate.generated",
+                                public_summary=(
+                                    "Query Plan 已生成带 Closure Feedback 的 Query Candidate。"
+                                ),
+                                refs=candidate.as_dict(),
+                                metrics={
+                                    "feedback_id": str(feedback.feedback_id),
+                                    "avoid_previous_failure_reason": (
+                                        candidate.avoid_previous_failure_reason
+                                    ),
+                                },
+                            )
+                            candidate_validations = QueryCandidateValidator.validate(
+                                candidate,
+                                plan=plan,
+                                requirement=requirement,
+                            )
+                            if not candidate_validations:
+                                continue
+                            candidate_validation = candidate_validations[0]
+                            if not need.research_context.is_empty:
+                                # Phase 14.2: project the validated refinement
+                                # onto the run so the next Planner main-path
+                                # query can resolve it through the explicit
+                                # ``ResearchContextResolver`` interface instead
+                                # of reading the snapshot ad hoc.
+                                usage = ResearchContextResolver.record(
+                                    run.usage_snapshot,
+                                    question_id=candidate.question_id,
+                                    context=need.research_context,
+                                    research_need_id=need.need_id,
+                                    query_plan_id=plan.query_plan_id,
+                                    query_candidate_id=candidate.query_candidate_id,
+                                )
+                                run.usage_snapshot = usage
+                                # Phase 14.3: audit-only marker that makes the
+                                # H2 chain (need.refined -> context.recorded ->
+                                # query.context.enriched) observable end to end.
+                                # No research behavior reads this event.
+                                await self._append_event(
+                                    session,
+                                    run,
+                                    event_type="research.context.recorded",
+                                    public_summary="ResearchContext 已按问题投影到本轮运行快照。",
+                                    refs={
+                                        "question_id": candidate.question_id,
+                                        "research_need_id": str(need.need_id),
+                                        "query_plan_id": str(plan.query_plan_id),
+                                        "query_candidate_id": str(candidate.query_candidate_id),
+                                    },
+                                    metrics={
+                                        "hint_count": len(need.research_context.query_hints)
+                                    },
+                                )
+                            rankings = QueryCandidateRanker.rank(
+                                (candidate,),
+                                validations={
+                                    candidate.query_candidate_id: candidate_validation
+                                },
+                                requirement=requirement,
+                            )
+                            feedback_context = FeedbackExecutionContext.create(
+                                feedback_id=feedback.feedback_id,
+                                run_id=candidate.run_id,
+                                question_id=candidate.question_id,
+                                gap_id=candidate.gap_id,
+                                dimension_key=candidate.dimension_key,
+                                requirement_type=candidate.requirement_type,
+                                research_need_id=need.need_id,
+                                query_candidate_id=candidate.query_candidate_id,
+                            )
+                            requests = QueryExecutionAdapter.create_request(
+                                candidate,
+                                validation=candidate_validation,
+                                ranking=rankings[0] if rankings else None,
+                                requirement=requirement,
+                                feedback_context=feedback_context,
+                            )
+                            if not requests:
+                                continue
+                            if not feedback_execution_allowed(
+                                execution_count=feedback_execution_count,
+                                limit=2,
+                            ):
+                                await self._append_event(
+                                    session,
+                                    run,
+                                    event_type="feedback.query.execution.blocked",
+                                    public_summary="Feedback Query 达到本轮执行上限。",
+                                    refs={
+                                        **feedback_context.as_dict(),
+                                        "stop_reason": "feedback_recovery_limit",
+                                    },
+                                    metrics={
+                                        "feedback_execution_count": feedback_execution_count,
+                                    },
+                                )
+                                continue
+                            request = requests[0]
+                            feedback_execution_count += 1
+                            usage = dict(run.usage_snapshot)
+                            usage["feedback_execution_count"] = feedback_execution_count
+                            run.usage_snapshot = usage
+                            execution_refs = {
+                                **feedback_context.as_dict(),
+                                **request.as_dict(),
+                                "result": "handoff_to_query_executor",
+                            }
+                            await self._append_event(
+                                session,
+                                run,
+                                event_type="feedback.query.execution.started",
+                                public_summary="Closure Feedback Query 已交给 Query Executor。",
+                                refs=execution_refs,
+                                metrics={
+                                    "trigger_reason": request.trigger_reason,
+                                    "execution_handoff": True,
+                                },
+                            )
+                            await self._append_event(
+                                session,
+                                run,
+                                event_type="query.execution.started",
+                                public_summary="Feedback Query Execution 已开始。",
+                                refs=execution_refs,
+                                metrics={
+                                    "feedback_execution": True,
+                                    "feedback_id": str(feedback.feedback_id),
+                                },
+                            )
+
+    async def _run_feedback_completeness_pass(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        question_id: str,
+        plan_version: int,
+        in_call_feedback_ids_by_gap: Mapping[str, str],
+    ) -> None:
+        """Phase 13.3: backfill feedback for gaps without closure evaluation.
+
+        Runs after the closure-evaluation loop completes.  Every OPEN/PARTIAL
+        requirement that still has no ClosureFeedback receives one generic
+        feedback from the completeness pass, and each generated feedback is
+        dispatched through the same ``ClosureFeedbackDispatcher`` chain so it
+        re-enters the Research Pipeline without bypassing Rule 4.
+        """
+
+        rows = (
+            await session.scalars(
+                select(GapRequirementRow).where(
+                    GapRequirementRow.run_id == run.id,
+                    GapRequirementRow.question_id == question_id,
+                    GapRequirementRow.plan_version == plan_version,
+                )
+            )
+        ).all()
+        requirements = tuple(_gap_requirement_from_row(row) for row in rows)
+        if not requirements:
+            return
+        existing_feedback_ids_by_gap = await self._closure_feedback_ids_by_gap(
+            session,
+            run_id=run.id,
+            question_id=question_id,
+        )
+        existing_feedback_ids_by_gap.update(in_call_feedback_ids_by_gap)
+        pass_result = run_closure_feedback_completeness_pass(
+            requirements,
+            existing_feedback_ids_by_gap,
+        )
+        for verdict in pass_result.verdicts:
+            await self._append_event(
+                session,
+                run,
+                event_type="research.feedback.completeness.checked",
+                public_summary="Gap Feedback 完整性检查已完成。",
+                refs=verdict.as_event_refs(run_id=run.id, question_id=question_id),
+                metrics={
+                    "status": verdict.status.value,
+                    "reason": verdict.reason,
+                    **pass_result.as_event_metrics(),
+                },
+            )
+        requirements_by_gap = {
+            str(requirement.gap_id): requirement for requirement in requirements
+        }
+        await self._dispatch_backfilled_closure_feedbacks(
+            session,
+            run,
+            generated_feedbacks=pass_result.generated_feedbacks,
+            requirements_by_gap=requirements_by_gap,
+        )
+
+    async def _dispatch_backfilled_closure_feedbacks(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        generated_feedbacks: tuple[ClosureFeedback, ...],
+        requirements_by_gap: Mapping[str, GapRequirement],
+    ) -> None:
+        """Dispatch backfilled feedbacks through the shared dispatcher chain.
+
+        Used by both the Phase 13.3 completeness pass and the Phase 13.4 run
+        finalizer so backfilled feedback re-enters the Research Pipeline via
+        exactly the same ``ClosureFeedbackDispatcher`` path (no bypass, no
+        second set of events).
+        """
+
+        if not generated_feedbacks:
+            return
+        dispatcher = self._closure_feedback_dispatcher(run)
+        for feedback in generated_feedbacks:
+            feedback_requirement = requirements_by_gap.get(str(feedback.gap_id))
+            if feedback_requirement is None:
+                continue
+            await self._dispatch_closure_feedback(
+                session,
+                run,
+                feedback=feedback,
+                requirement=feedback_requirement,
+                alignments=(),
+                dispatcher=dispatcher,
+            )
+
+    async def _finalize_run_closure_feedback(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        stop_reason: str | None,
+    ) -> None:
+        """Phase 13.4: leave no OPEN/PARTIAL gap unexplained at run end.
+
+        Runs when the research phase terminates (entering writing) and scans
+        every ``GapRequirement`` of the current plan.  Gaps that never carry
+        feedback and are not covered by an explicit terminal reason receive a
+        generic completeness feedback which is dispatched through the shared
+        ``ClosureFeedbackDispatcher`` chain.
+        """
+
+        rows = (
+            await session.scalars(
+                select(GapRequirementRow).where(
+                    GapRequirementRow.run_id == run.id,
+                    GapRequirementRow.plan_version == run.plan_version,
+                )
+            )
+        ).all()
+        requirements = tuple(_gap_requirement_from_row(row) for row in rows)
+        if not requirements:
+            return
+        existing_feedback_ids_by_gap = await self._closure_feedback_ids_by_gap(
+            session,
+            run_id=run.id,
+        )
+        terminal_reasons = (
+            {
+                str(requirement.gap_id): stop_reason
+                for requirement in requirements
+            }
+            if stop_reason is not None
+            and is_terminal_run_stop_reason(stop_reason)
+            else {}
+        )
+        finalization = finalize_run_closure_feedback(
+            run_id=run.id,
+            gap_requirements=requirements,
+            existing_feedback_ids_by_gap=existing_feedback_ids_by_gap,
+            terminal_reasons=terminal_reasons,
+        )
+        await self._append_event(
+            session,
+            run,
+            event_type="research.feedback.finalization.completed",
+            public_summary="Run 收尾前已完成 Gap Closure Feedback 最终检查。",
+            refs={"run_id": str(run.id)},
+            metrics={
+                "total_gaps": finalization.total_gaps,
+                "generated_feedback_count": len(finalization.generated_feedbacks),
+                "existing_feedback_count": len(finalization.existing_feedbacks),
+                "terminal_gap_count": len(finalization.terminal_gaps),
+                "blocked_gap_count": len(finalization.blocked_gaps),
+            },
+        )
+        await self._dispatch_backfilled_closure_feedbacks(
+            session,
+            run,
+            generated_feedbacks=finalization.generated_feedbacks,
+            requirements_by_gap={
+                str(requirement.gap_id): requirement for requirement in requirements
+            },
+        )
+
+    @staticmethod
+    async def _closure_feedback_ids_by_gap(
+        session: AsyncSession,
+        *,
+        run_id: UUID,
+        question_id: str | None = None,
+    ) -> dict[str, str]:
+        """Map gap id -> feedback id from feedback events already emitted."""
+
+        mapping: dict[str, str] = {}
+        event_refs = (
+            await session.execute(
+                select(AgentEventRow.refs).where(
+                    AgentEventRow.run_id == run_id,
+                    AgentEventRow.event_type == "closure.feedback.generated",
+                )
+            )
+        ).all()
+        for (refs,) in event_refs:
+            if not isinstance(refs, dict):
+                continue
+            if question_id is not None and refs.get("question_id") != question_id:
+                continue
+            gap_id = refs.get("gap_id")
+            feedback_id = refs.get("feedback_id")
+            if gap_id is not None and feedback_id is not None:
+                mapping.setdefault(str(gap_id), str(feedback_id))
+        return mapping
 
     async def record_page(
         self,
@@ -2485,6 +5756,12 @@ class ResearchToolRepository:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             canonical_url = normalize_source_url(page.final_url)
+            candidate_identity = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=page.final_url,
+            )
             url_hash = hashlib.sha256(canonical_url.encode()).hexdigest()
             source = await session.scalar(
                 select(ResearchSourceRow).where(
@@ -2504,7 +5781,7 @@ class ResearchToolRepository:
                     url_hash=url_hash,
                     domain=(urlsplit(canonical_url).hostname or "unknown")[:255],
                     source_owner_key=source_owner_key(canonical_url),
-                    title=page.title,
+                    title=nul_safe_text(page.title),
                     source_type="webpage",
                     reliability=reliability,
                     artifact_uri=artifact_uri,
@@ -2537,15 +5814,16 @@ class ResearchToolRepository:
                 await session.flush()
             inserted = 0
             accepted = 0
+            inserted_evidence_ids: list[UUID] = []
             graph_claim_ids: set[UUID] = set()
             graph_chunk_ids: set[UUID] = set()
             now = datetime.now(UTC)
             for item in evidence:
-                candidate = item.candidate
+                evidence_candidate = item.candidate
                 evidence_hash = hashlib.sha256(
                     (
-                        f"{target.question_id}\n{source.id}\n{candidate.claim}\n"
-                        f"{candidate.exact_quote}\n{candidate.relation.value}"
+                        f"{target.question_id}\n{source.id}\n{evidence_candidate.claim}\n"
+                        f"{evidence_candidate.exact_quote}\n{evidence_candidate.relation.value}"
                     ).encode()
                 ).hexdigest()
                 exists = await session.scalar(
@@ -2557,7 +5835,7 @@ class ResearchToolRepository:
                 if exists is not None:
                     continue
 
-                claim_hash = claim_fingerprint(candidate.claim)
+                claim_hash = claim_fingerprint(evidence_candidate.claim)
                 claim = await session.scalar(
                     select(ResearchClaimRow).where(
                         ResearchClaimRow.run_id == run_id,
@@ -2565,7 +5843,7 @@ class ResearchToolRepository:
                         ResearchClaimRow.claim_hash == claim_hash,
                     )
                 )
-                chunk_window = build_evidence_chunk(page.clean_text, candidate.exact_quote)
+                chunk_window = build_evidence_chunk(page.clean_text, evidence_candidate.exact_quote)
                 accepted_by_graph = item.accepted and chunk_window is not None
                 rejection_reason = item.rejection_reason
                 if item.accepted and chunk_window is None:
@@ -2573,8 +5851,8 @@ class ResearchToolRepository:
                 if claim is None:
                     dimension_key = _evidence_dimension_key(
                         target,
-                        candidate.dimension_key,
-                        f"{candidate.claim} {candidate.exact_quote}",
+                        evidence_candidate.dimension_key,
+                        f"{evidence_candidate.claim} {evidence_candidate.exact_quote}",
                     )
                     criterion_by_dimension = dict(target.acceptance_dimensions)
                     claim = ResearchClaimRow(
@@ -2583,16 +5861,16 @@ class ResearchToolRepository:
                         plan_version=target.plan_version,
                         question_id=target.question_id,
                         dimension_key=dimension_key,
-                        atomic_claim=candidate.claim,
+                        atomic_claim=nul_safe_text(evidence_candidate.claim),
                         claim_hash=claim_hash,
                         claim_type=infer_claim_type(
-                            criterion_by_dimension.get(dimension_key, candidate.claim)
+                            criterion_by_dimension.get(dimension_key, evidence_candidate.claim)
                         ),
                         importance=0.8 if accepted_by_graph else 0.5,
                         status=derive_claim_status(
                             has_accepted_evidence=accepted_by_graph,
                             has_refuting_evidence=(
-                                accepted_by_graph and candidate.relation.value == "refutes"
+                                accepted_by_graph and evidence_candidate.relation.value == "refutes"
                             ),
                             independent_source_count=1 if accepted_by_graph else 0,
                         ),
@@ -2623,7 +5901,7 @@ class ResearchToolRepository:
                             heading_path=None,
                             char_start=chunk_window.char_start,
                             char_end=chunk_window.char_end,
-                            text=chunk_window.text,
+                            text=nul_safe_text(chunk_window.text),
                             token_count=chunk_window.token_count,
                             chunk_hash=chunk_window.chunk_hash,
                         )
@@ -2638,11 +5916,11 @@ class ResearchToolRepository:
                     claim_id=claim.id,
                     snapshot_id=snapshot.id,
                     chunk_id=chunk.id if chunk is not None else None,
-                    claim=candidate.claim,
-                    exact_quote=candidate.exact_quote,
-                    relation=candidate.relation.value,
-                    relevance=candidate.relevance,
-                    confidence=candidate.confidence,
+                    claim=nul_safe_text(evidence_candidate.claim),
+                    exact_quote=nul_safe_text(evidence_candidate.exact_quote),
+                    relation=evidence_candidate.relation.value,
+                    relevance=evidence_candidate.relevance,
+                    confidence=evidence_candidate.confidence,
                     source_reliability=item.source_reliability,
                     evidence_score=item.evidence_score,
                     accepted=accepted_by_graph,
@@ -2652,6 +5930,36 @@ class ResearchToolRepository:
                 )
                 session.add(evidence_row)
                 await session.flush()
+                if item.input_quality is not None:
+                    await self._append_event(
+                        session,
+                        run,
+                        event_type="evidence.input_quality.evaluated",
+                        public_summary=(
+                            "Evidence input quality assessed before canonical "
+                            "acceptance."
+                        ),
+                        refs={
+                            "evidence_id": str(evidence_row.id),
+                            "source_id": str(source.id),
+                            "source": source.canonical_url,
+                            "question_id": target.question_id,
+                            "claim_id": str(claim.id),
+                            "requirement_id": str(target.gap_id),
+                            "dimension_key": claim.dimension_key,
+                            "original_quote_state": item.input_quality.get(
+                                "original_quote_state", "unknown"
+                            ),
+                            "input_quality_decision": item.input_quality.get(
+                                "input_quality_decision", "unknown"
+                            ),
+                            "final_quote_state": item.input_quality.get(
+                                "final_quote_state", "unknown"
+                            ),
+                        },
+                        metrics=cast(dict[str, object], item.input_quality),
+                    )
+                inserted_evidence_ids.append(evidence_row.id)
                 independent_source_count = await session.scalar(
                     select(func.count(distinct(ResearchSourceRow.source_owner_key)))
                     .select_from(ResearchEvidenceRow)
@@ -2688,6 +5996,13 @@ class ResearchToolRepository:
                     run_id=run_id,
                     question_id=target.question_id,
                     touched_claim_ids=graph_claim_ids,
+                )
+            if inserted_evidence_ids:
+                await self._align_and_evaluate_evidence(
+                    session,
+                    run,
+                    target=target,
+                    evidence_ids=tuple(inserted_evidence_ids),
                 )
             usage_snapshot = dict(run.usage_snapshot)
             usage_snapshot["pages_extracted"] = (
@@ -2758,16 +6073,28 @@ class ResearchToolRepository:
                 refs={
                     "source_id": str(source.id),
                     "question_id": target.question_id,
+                    "candidate_id": candidate_identity.candidate_id,
                     "plan_version": target.plan_version,
                 },
                 metrics={"clean_chars": len(page.clean_text), "truncated": page.truncated},
+            )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate_identity,
+                "readable",
+                public_summary="候选来源正文可读取并进入证据链。",
             )
             await self._append_event(
                 session,
                 run,
                 event_type="context.assembled",
                 public_summary="Context Manager 已选择当前问题与必要网页片段。",
-                refs={"source_id": str(source.id), "question_id": target.question_id},
+                refs={
+                    "source_id": str(source.id),
+                    "question_id": target.question_id,
+                    "candidate_id": candidate_identity.candidate_id,
+                },
                 metrics=cast(dict[str, object], context_manifest),
             )
             await self._append_event(
@@ -2781,6 +6108,7 @@ class ResearchToolRepository:
                     "source_id": str(source.id),
                     "snapshot_id": str(snapshot.id),
                     "question_id": target.question_id,
+                    "candidate_id": candidate_identity.candidate_id,
                 },
                 metrics={
                     "claim_count": len(graph_claim_ids),
@@ -2822,7 +6150,11 @@ class ResearchToolRepository:
                 run,
                 event_type="evidence.extracted",
                 public_summary=f"提取 {inserted} 条候选证据, 其中 {accepted} 条通过验证。",
-                refs={"source_id": str(source.id), "question_id": target.question_id},
+                refs={
+                    "source_id": str(source.id),
+                    "question_id": target.question_id,
+                    "candidate_id": candidate_identity.candidate_id,
+                },
                 metrics={"candidate_count": inserted, "accepted_count": accepted},
             )
             return inserted, accepted
@@ -2844,6 +6176,12 @@ class ResearchToolRepository:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             canonical_url = normalize_source_url(page.final_url)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=page.final_url,
+            )
             url_hash = hashlib.sha256(canonical_url.encode()).hexdigest()
             source = await session.scalar(
                 select(ResearchSourceRow).where(
@@ -2862,7 +6200,7 @@ class ResearchToolRepository:
                     url_hash=url_hash,
                     domain=(urlsplit(canonical_url).hostname or "unknown")[:255],
                     source_owner_key=source_owner_key(canonical_url),
-                    title=page.title,
+                    title=nul_safe_text(page.title),
                     source_type="webpage",
                     reliability=0.72,
                     artifact_uri=artifact_uri,
@@ -2953,7 +6291,11 @@ class ResearchToolRepository:
                 run,
                 event_type="source.read",
                 public_summary=f"已读取来源: {page.title[:300]}",
-                refs={"source_id": str(source.id), "question_id": target.question_id},
+                refs={
+                    "source_id": str(source.id),
+                    "question_id": target.question_id,
+                    "candidate_id": candidate.candidate_id,
+                },
                 metrics={"clean_chars": len(page.clean_text), "truncated": page.truncated},
             )
             await self._append_event(
@@ -2961,7 +6303,11 @@ class ResearchToolRepository:
                 run,
                 event_type="context.assembled",
                 public_summary="Context Manager 已选择当前问题与必要网页片段。",
-                refs={"source_id": str(source.id), "question_id": target.question_id},
+                refs={
+                    "source_id": str(source.id),
+                    "question_id": target.question_id,
+                    "candidate_id": candidate.candidate_id,
+                },
                 metrics={
                     "source_chars": len(page.clean_text),
                     "selected_chars": min(len(page.clean_text), 14_000),
@@ -2976,10 +6322,19 @@ class ResearchToolRepository:
                 refs={
                     "source_id": str(source.id),
                     "question_id": target.question_id,
+                    "candidate_id": candidate.candidate_id,
                     "error_code": error_code[:100],
                     "plan_version": target.plan_version,
                     **({"detail_code": detail_code[:100]} if detail_code is not None else {}),
                 },
+            )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "extraction_failed",
+                failure_reason=error_code,
+                public_summary="候选来源证据抽取失败。",
             )
 
     async def record_page_failure(
@@ -2994,6 +6349,12 @@ class ResearchToolRepository:
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            candidate = await self._candidate_identity_for_url(
+                session,
+                run_id=run_id,
+                target=target,
+                url=url,
+            )
             usage_snapshot = dict(run.usage_snapshot)
             owners_raw = usage_snapshot.get("page_slots_reserved_by_worker", {})
             owners = dict(owners_raw) if isinstance(owners_raw, dict) else {}
@@ -3007,14 +6368,11 @@ class ResearchToolRepository:
             usage_snapshot["page_slots_reserved"] = max(
                 0, _as_int(usage_snapshot.get("page_slots_reserved", 0)) - settled
             )
-            # A failed HTTP attempt still consumed network capacity, latency,
-            # and one fetched-page reservation. Count it against the hard fetch
-            # budget even though it did not yield a readable page.
+            # A failed HTTP attempt consumes the separate attempt pool, but
+            # does not consume the successful-page evidence budget. This keeps
+            # transient 403/timeout failures from starving readable sources.
             usage_snapshot["page_fetch_attempts"] = (
                 _as_int(usage_snapshot.get("page_fetch_attempts", 0)) + 1
-            )
-            usage_snapshot["pages_fetched"] = (
-                _as_int(usage_snapshot.get("pages_fetched", usage_snapshot.get("pages", 0))) + 1
             )
             usage_snapshot["page_fetch_latency_ms"] = _as_int(
                 usage_snapshot.get("page_fetch_latency_ms", 0)
@@ -3023,6 +6381,21 @@ class ResearchToolRepository:
                 int(usage_snapshot.get("page_read_failures", 0)) + 1
             )
             run.usage_snapshot = _usage_with_resource_pools(run, usage_snapshot)
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "fetch_started",
+                public_summary="候选来源开始抓取。",
+            )
+            await self._append_candidate_event(
+                session,
+                run,
+                candidate,
+                "fetch_failed",
+                failure_reason=error_code,
+                public_summary="候选来源抓取失败。",
+            )
             await self._append_event(
                 session,
                 run,
@@ -3030,6 +6403,8 @@ class ResearchToolRepository:
                 public_summary="候选来源未通过安全读取或内容校验。",
                 refs={
                     "question_id": target.question_id,
+                    "candidate_id": candidate.candidate_id,
+                    "normalized_url": candidate.normalized_url,
                     "domain": (urlsplit(url).hostname or "unknown")[:255],
                     "url": url[:1000],
                     "error_code": error_code[:100],
@@ -3079,11 +6454,14 @@ class ResearchToolRepository:
                     plan_item.status = question_status
                 gap = await session.get(ResearchGapRow, target.gap_id)
                 if gap is not None:
-                    gap.status = "open"
                     gap.description = (
                         "本题 Token 预算已达到保护阈值; 已让出后续检索, 避免在同一问题上循环消耗。"
                     )
-                    gap.updated_at = datetime.now(UTC)
+                    await self._sync_legacy_gap_projection(
+                        run,
+                        gap,
+                        question_id=target.question_id,
+                    )
                 await self._append_event(
                     session,
                     run,
@@ -3180,11 +6558,23 @@ class ResearchToolRepository:
                 str(dimension_key): (int(evidence_count), int(owner_count))
                 for dimension_key, evidence_count, owner_count in target_dimension_counts
             }
+            target_claims = (
+                await session.scalars(
+                    select(ResearchClaimRow).where(
+                        ResearchClaimRow.run_id == run_id,
+                        ResearchClaimRow.question_id == target.question_id,
+                    )
+                )
+            ).all()
+            target_high_risk_dimension_keys = {
+                claim.dimension_key for claim in target_claims if _claim_is_high_risk(claim)
+            }
             requirements_met = _requirements_satisfied(
                 target.question_id,
                 [str(value) for value in (plan_item.evidence_requirements if plan_item else [])],
                 target_counts_by_dimension,
                 accepted_for_question=accepted_for_question,
+                high_risk_dimension_keys=target_high_risk_dimension_keys,
             )
             usage = dict(run.usage_snapshot)
             technical_failures = dict(usage.get("technical_failures_by_question", {}))
@@ -3239,8 +6629,11 @@ class ResearchToolRepository:
                 exhausted_strategies[target.question_id] = True
                 usage["query_strategy_exhausted_by_question"] = exhausted_strategies
             if gap is not None:
-                gap.status = "open" if retry_current else "resolved" if requirements_met else "open"
-                gap.updated_at = datetime.now(UTC)
+                await self._sync_legacy_gap_projection(
+                    run,
+                    gap,
+                    question_id=target.question_id,
+                )
 
             plan_items = (
                 await session.scalars(
@@ -3313,6 +6706,14 @@ class ResearchToolRepository:
                     max_reliability,
                 ) in dimension_counts
             }
+            all_claims = (
+                await session.scalars(
+                    select(ResearchClaimRow).where(ResearchClaimRow.run_id == run_id)
+                )
+            ).all()
+            high_risk_dimension_keys = {
+                claim.dimension_key for claim in all_claims if _claim_is_high_risk(claim)
+            }
             coverage_map: list[_CoverageMapEntry] = []
             weighted_coverage = 0.0
             total_weight = 0.0
@@ -3336,7 +6737,12 @@ class ResearchToolRepository:
                             (0, 0, 0.0),
                         )
                     )
-                    required_sources = 2 if _requires_independent_sources(criterion) else 1
+                    required_sources = (
+                        2
+                        if _requires_independent_sources(criterion)
+                        or dimension_key in high_risk_dimension_keys
+                        else 1
+                    )
                     score = (
                         1.0
                         if dimension_evidence > 0 and dimension_sources >= required_sources
@@ -3473,6 +6879,7 @@ class ResearchToolRepository:
                 for item in plan_items
                 for index, criterion in enumerate(item.evidence_requirements, start=1)
                 if _requires_independent_sources(str(criterion))
+                or f"{item.question_id}:d{index}" in high_risk_dimension_keys
             ]
             corroborated_dimensions = sum(
                 1
@@ -3525,9 +6932,9 @@ class ResearchToolRepository:
                 if isinstance(previous_streaks_raw, dict)
                 else {}
             )
-            previous_low_gain_streak = previous_streaks.get(
+            previous_low_gain_streak = _question_low_gain_streak(
+                previous_quality,
                 target.question_id,
-                _as_int(previous_quality.get("low_information_gain_streak", 0)),
             )
             low_information_gain_streak = (
                 previous_low_gain_streak
@@ -3636,6 +7043,12 @@ class ResearchToolRepository:
                 if int(dimension["priority"]) == 1
             ]
             priority_one_coverage = min(priority_one_coverages) if priority_one_coverages else 0.0
+            priority_one_average_coverage = (
+                sum(priority_one_coverages) / len(priority_one_coverages)
+                if priority_one_coverages
+                else 0.0
+            )
+            priority_one_completed = sum(value >= 1.0 for value in priority_one_coverages)
             recent_distinct: list[dict[str, object]] = []
             for item in reversed(question_outcomes):
                 if not recent_distinct or recent_distinct[-1].get("family") != item.get("family"):
@@ -3648,6 +7061,10 @@ class ResearchToolRepository:
                 and len(recent_distinct) == 2
                 and all(_as_int(item.get("accepted_evidence", 0)) == 0 for item in recent_distinct)
                 and all(_as_float(item.get("utility", 0.0)) < 0.01 for item in recent_distinct)
+                and _query_space_exhausted_for_freeze(
+                    executed_families=executed_families,
+                    question=target.question,
+                )
             ):
                 frozen_raw = usage.get("frozen_questions", [])
                 frozen = list(frozen_raw) if isinstance(frozen_raw, list) else []
@@ -3732,11 +7149,6 @@ class ResearchToolRepository:
                 if freshness_scores
                 else 1.0
             )
-            all_claims = (
-                await session.scalars(
-                    select(ResearchClaimRow).where(ResearchClaimRow.run_id == run_id)
-                )
-            ).all()
             unresolved_claims = [
                 claim
                 for claim in all_claims
@@ -3842,7 +7254,36 @@ class ResearchToolRepository:
                 )
                 for item in plan_items
             }
-            open_gap_by_question = {gap.question_id: gap for gap in open_gaps}
+            # GapRequirement is the canonical source.  The old rows above are
+            # retained only as a compatibility fallback for pre-migration runs.
+            claim_risk_states = {
+                claim_id: state.as_dict() for claim_id, state in claim_states.items()
+            }
+            gap_requirements = project_gap_requirements(
+                run_id=run_id,
+                plan_version=run.plan_version,
+                state_version=run.state_version,
+                coverage_map=coverage_map,
+                claim_states=claim_risk_states,
+                now=datetime.now(UTC),
+            )
+            gap_requirements = await GapRequirementRepository.upsert_many(
+                session,
+                gap_requirements,
+            )
+            gap_projections = project_research_gaps(
+                gap_requirements,
+                plan_version=run.plan_version,
+            )
+            open_gap_by_question: dict[str, object] = {
+                projection.question_id: projection
+                for projection in gap_projections
+                if projection.unresolved
+            }
+            if not gap_projections:
+                open_gap_by_question = {
+                    gap.question_id: gap for gap in open_gaps
+                }
             exhausted_by_question = usage.get("question_budget_exhausted_by_question", {})
             strategy_exhausted = usage.get("query_strategy_exhausted_by_question", {})
             frozen_questions = {
@@ -3892,21 +7333,50 @@ class ResearchToolRepository:
                 ).as_dict()
                 for item in plan_items
             }
-            claim_risk_states = {
-                claim_id: state.as_dict() for claim_id, state in claim_states.items()
-            }
-            gap_risk_states = {
-                str(gap.id): classify_gap_risk(
-                    gap_id=str(gap.id),
-                    question_id=gap.question_id,
-                    gap_status=gap.status,
-                    gap_type=gap.gap_type,
-                    severity=float(gap.severity or 0.0),
-                    resolution_attempts=int(gap.resolution_attempts or 0),
-                    blocked=gap.question_id in blocked_questions,
-                ).as_dict()
-                for gap in all_gaps
-            }
+            legacy_gap_by_question = {gap.question_id: gap for gap in all_gaps}
+            if gap_projections:
+                gap_risk_states = {
+                    str(projection.gap_id): classify_gap_risk(
+                        gap_id=str(projection.gap_id),
+                        question_id=projection.question_id,
+                        gap_status=projection.legacy_status,
+                        gap_type=(
+                            next(
+                                (
+                                    requirement.requirement_type.value
+                                    for requirement in gap_requirements
+                                    if requirement.gap_id == projection.gap_id
+                                ),
+                                "missing",
+                            )
+                        ),
+                        severity=float(
+                            legacy_gap_by_question[projection.question_id].severity or 0.5
+                            if projection.question_id in legacy_gap_by_question
+                            else 0.5
+                        ),
+                        resolution_attempts=int(
+                            legacy_gap_by_question[projection.question_id].resolution_attempts
+                            if projection.question_id in legacy_gap_by_question
+                            else 0
+                        ),
+                        blocked=projection.question_id in blocked_questions,
+                    ).as_dict()
+                    for projection in gap_projections
+                }
+            else:
+                gap_risk_states = {
+                    str(gap.id): classify_gap_risk(
+                        gap_id=str(gap.id),
+                        question_id=gap.question_id,
+                        gap_status=gap.status,
+                        gap_type=gap.gap_type,
+                        severity=float(gap.severity or 0.0),
+                        resolution_attempts=int(gap.resolution_attempts or 0),
+                        blocked=gap.question_id in blocked_questions,
+                    ).as_dict()
+                    for gap in all_gaps
+                }
             conflict_risk_states = {
                 str(conflict.id): {
                     "conflict_id": str(conflict.id),
@@ -3926,9 +7396,22 @@ class ResearchToolRepository:
                 "low_information_gain_streak": low_information_gain_streak,
                 "low_information_gain_streak_by_question": previous_streaks,
                 "coverage_map": coverage_map,
+                "gap_state_source": (
+                    "gap_requirement" if gap_projections else "legacy_compatibility"
+                ),
+                "gap_state_source_priority": list(GAP_STATE_SOURCE_PRIORITY),
+                "gap_requirements": [
+                    requirement.as_dict() for requirement in gap_requirements
+                ],
+                "research_gap_projections": [
+                    projection.as_dict() for projection in gap_projections
+                ],
                 "source_quality": round(source_quality, 4),
                 "independent_source_count": owner_count,
                 "priority_one_coverage": round(priority_one_coverage, 4),
+                "priority_one_average_coverage": round(priority_one_average_coverage, 4),
+                "priority_one_completed": priority_one_completed,
+                "priority_one_total": len(priority_one_coverages),
                 "source_independence": round(owner_count / source_count, 4)
                 if source_count
                 else 0.0,
@@ -4010,9 +7493,12 @@ class ResearchToolRepository:
                 question_status = "partial"
                 plan_item.status = "partial"
                 if gap is not None:
-                    gap.status = "open"
                     gap.description = "该问题的具体证据维度仍可改善来源质量或交叉验证质量门。"
-                    gap.updated_at = datetime.now(UTC)
+                    await self._sync_legacy_gap_projection(
+                        run,
+                        gap,
+                        question_id=target.question_id,
+                    )
             iteration_consumed = _research_attempt_consumes_iteration(
                 attempt_outcome,
                 technical_outcome=technical_outcome,
@@ -4151,12 +7637,22 @@ class ResearchToolRepository:
             if attempt_outcome == "deadline_exhausted":
                 decision = "stop_budget"
                 stop_reason = "deadline_exhausted"
-            elif budget_stop_reason is not None:
+            elif (
+                budget_stop_reason is not None
+                and not _search_acquisition_budget_exhausted(budget_stop_reason)
+            ):
                 decision = "stop_budget"
                 stop_reason = budget_stop_reason
             elif quality_met:
                 decision = "ready_to_write"
                 stop_reason = "quality_met"
+            elif _search_acquisition_budget_exhausted(budget_stop_reason):
+                # Search acquisition is exhausted, but already-discovered
+                # candidates and fetched artifacts may still yield evidence.
+                # prepare_target owns the cache-drain decision and enters
+                # writing only when no reusable work remains.
+                decision = "continue_cached"
+                stop_reason = None
             elif replan_needed:
                 decision = "replan"
                 stop_reason = None
@@ -4265,7 +7761,7 @@ class ResearchToolRepository:
                 run.status = RunStatus.RUNNING.value
                 run.phase = RunPhase.RESEARCHING.value
                 run.termination_reason = None
-                run.lease_until = now + timedelta(seconds=300)
+                run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
                 await self._append_event(
                     session,
                     run,
@@ -4295,7 +7791,7 @@ class ResearchToolRepository:
             run.status = RunStatus.RUNNING.value
             run.phase = RunPhase.WRITING.value
             run.termination_reason = stop_reason
-            run.lease_until = now + timedelta(seconds=300)
+            run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
             await self._append_event(
                 session,
                 run,
@@ -4308,12 +7804,17 @@ class ResearchToolRepository:
                         if stop_reason == "stagnation"
                         else (
                             "计划已遍历但仍有未满足的验收条件; 使用现有证据生成带限制报告。"
-                            if stop_reason == "sources_exhausted"
+                            if stop_reason in {"sources_exhausted", "source_space_exhausted"}
                             else "全部质量门已满足; 自动进入报告写作。"
                         )
                     )
                 ),
                 refs={"reason": run.termination_reason},
+            )
+            await self._finalize_run_closure_feedback(
+                session,
+                run,
+                stop_reason=stop_reason,
             )
             return IterationEvaluation(
                 continue_research=False,
@@ -4553,7 +8054,7 @@ class ResearchToolRepository:
         run.status = RunStatus.RUNNING.value
         run.phase = RunPhase.WRITING.value
         run.termination_reason = reason
-        run.lease_until = now + timedelta(seconds=300)
+        run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
         run.updated_at = now
         run.state_version += 1
         await self._append_event(
@@ -4563,6 +8064,48 @@ class ResearchToolRepository:
             public_summary=summary,
             refs={"reason": reason},
         )
+        await self._finalize_run_closure_feedback(
+            session,
+            run,
+            stop_reason=reason,
+        )
+
+    @staticmethod
+    async def _sync_legacy_gap_projection(
+        run: ResearchRunRow,
+        gap: ResearchGapRow,
+        *,
+        question_id: str,
+    ) -> None:
+        """Mirror canonical GapRequirement state into the legacy row.
+
+        No business decision is made here.  If the current run has canonical
+        projections, their aggregate status is copied for old foreign-key
+        consumers.  Historical runs without the new snapshot are left
+        untouched until the next evaluator projection is available.
+        """
+
+        raw_projections = run.quality_snapshot.get("research_gap_projections", [])
+        projections = (
+            [item for item in raw_projections if isinstance(item, dict)]
+            if isinstance(raw_projections, list)
+            else []
+        )
+        question_projections = [
+            item for item in projections if str(item.get("question_id")) == question_id
+        ]
+        if not question_projections:
+            return
+        canonical_status = (
+            "resolved"
+            if all(
+                str(item.get("status")) == GapClosureStatus.CLOSED.value
+                for item in question_projections
+            )
+            else "open"
+        )
+        gap.status = canonical_status
+        gap.updated_at = datetime.now(UTC)
 
     @staticmethod
     async def _locked_run(
@@ -4589,6 +8132,49 @@ class ResearchToolRepository:
         refs: dict[str, object],
         metrics: dict[str, object] | None = None,
     ) -> None:
+        active_recovery_context = run.usage_snapshot.get("recovery_context")
+        if isinstance(active_recovery_context, dict):
+            context = RecoveryContext(
+                run_id=run.id,
+                question_id=str(active_recovery_context.get("recovery_question_id", "")),
+                plan_version=_as_int(active_recovery_context.get("recovery_plan_version", 0)),
+                recovery_attempt_id=UUID(
+                    str(active_recovery_context["recovery_attempt_id"])
+                ),
+                trigger_reason=str(
+                    active_recovery_context.get("recovery_trigger_reason", "")
+                ),
+                coverage_before=_as_float(
+                    active_recovery_context.get("recovery_coverage_before", 0.0)
+                ),
+                gap_before=tuple(
+                    str(value)
+                    for value in active_recovery_context.get("recovery_gap_before", [])
+                    if value is not None
+                ),
+                created_at=datetime.fromisoformat(
+                    str(active_recovery_context["recovery_context_created_at"])
+                ),
+            )
+            refs = merge_recovery_context(refs, context)
+        active_feedback_context = run.usage_snapshot.get("feedback_query_context")
+        if (
+            isinstance(active_feedback_context, dict)
+            and event_type in _RECOVERY_PROPAGATED_EVENT_TYPES
+            and (
+                not refs.get("question_id")
+                or refs.get("question_id")
+                == active_feedback_context.get("feedback_question_id")
+            )
+        ):
+            refs = {
+                **refs,
+                "feedback_id": active_feedback_context.get("feedback_id"),
+                "feedback_execution_id": active_feedback_context.get(
+                    "feedback_execution_id"
+                ),
+                "query_execution_id": active_feedback_context.get("query_execution_id"),
+            }
         sequence = run.next_event_seq
         run.next_event_seq += 1
         session.add(
@@ -4710,6 +8296,32 @@ def _as_int(value: object) -> int:
         return 0
 
 
+def _independent_source_targeting_enabled(run: ResearchRunRow) -> bool:
+    """Read the Phase 15.1 Branch B declared experiment factor off one run.
+
+    The factor is run-local provenance stamped into the run's own benchmark
+    block at creation, so an ordinary (non-benchmark) run or a frozen Phase
+    15.0 golden run — neither of which ever recorded it — resolves to ``False``
+    and keeps the closure-feedback payload byte-identical.  Nothing is inferred
+    from global settings: the experiment is scoped strictly to the run that
+    opted in, which is what makes the A/B faithful.
+    """
+
+    budget = getattr(run, "budget_snapshot", None)
+    if not isinstance(budget, Mapping):
+        return False
+    block = budget.get("benchmark")
+    if not isinstance(block, Mapping):
+        return False
+    flags = block.get("feature_flags")
+    if not isinstance(flags, Mapping):
+        return False
+    value = flags.get("independent_source_targeting_enabled")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _as_float(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float, str, bytes, bytearray)):
         return 0.0
@@ -4751,6 +8363,54 @@ def _update_query_family_usage(
     current["latency_ms"] = _as_int(current.get("latency_ms", 0)) + max(0, latency_ms)
     stats[family] = current
     usage["query_family_stats"] = stats
+
+
+def _update_provider_health_usage(
+    usage: dict[str, object],
+    *,
+    healthy: int,
+    unresponsive: int,
+    productive: int,
+) -> None:
+    """Keep transport attempts separate from useful provider responses."""
+
+    usage["search_provider_healthy_responses"] = _as_int(
+        usage.get("search_provider_healthy_responses", 0)
+    ) + max(0, healthy)
+    usage["search_provider_unresponsive_responses"] = _as_int(
+        usage.get("search_provider_unresponsive_responses", 0)
+    ) + max(0, unresponsive)
+    usage["search_provider_productive_responses"] = _as_int(
+        usage.get("search_provider_productive_responses", 0)
+    ) + max(0, productive)
+
+
+_PROVIDER_OBSERVABILITY_FIELDS = (
+    "provider_requests",
+    "healthy_responses",
+    "unresponsive_responses",
+    "timeout_count",
+    "network_error_count",
+    "http_error_count",
+    "empty_response_count",
+    "invalid_response_count",
+    "fallback_attempts",
+    "fallback_successes",
+    "circuit_open_count",
+)
+
+
+def _update_provider_observability_usage(
+    usage: dict[str, object], metrics: Mapping[str, object]
+) -> None:
+    """Accumulate typed search-provider telemetry without changing control flow."""
+
+    raw_snapshot = usage.get("provider_observability", {})
+    snapshot = dict(raw_snapshot) if isinstance(raw_snapshot, Mapping) else {}
+    for field in _PROVIDER_OBSERVABILITY_FIELDS:
+        value = _as_int(metrics.get(field, 0))
+        snapshot[field] = _as_int(snapshot.get(field, 0)) + max(0, value)
+    usage["provider_observability"] = snapshot
 
 
 def _query_family_order(*, prefer_authoritative: bool) -> tuple[QueryFamily, ...]:
@@ -4829,6 +8489,16 @@ def _budget_exhaustion_reason(run: ResearchRunRow) -> str | None:
             _as_int(budget.get("max_pages_fetched", budget.get("max_pages", 0))),
         ),
         (
+            "page_fetch_attempt_budget_exhausted",
+            _as_int(usage.get("page_fetch_attempts", usage.get("pages_fetched", 0))),
+            _as_int(
+                budget.get(
+                    "max_page_fetch_attempts",
+                    budget.get("max_pages_fetched", budget.get("max_pages", 0)),
+                )
+            ),
+        ),
+        (
             "extracted_page_budget_exhausted" if has_split_page_budget else "page_budget_exhausted",
             _as_int(usage.get("pages_extracted", usage.get("pages", 0))),
             _as_int(budget.get("max_pages_extracted", budget.get("max_pages", 0))),
@@ -4904,6 +8574,7 @@ def _budget_stop_summary(reason: str) -> str:
         "logical_query_budget_exhausted": "逻辑查询预算已耗尽",
         "provider_request_budget_exhausted": "上游搜索请求预算已耗尽",
         "fetched_page_budget_exhausted": "页面抓取预算已耗尽",
+        "page_fetch_attempt_budget_exhausted": "页面读取尝试预算已耗尽",
         "extracted_page_budget_exhausted": "页面抽取预算已耗尽",
         "extraction_call_budget_exhausted": "证据抽取调用预算已耗尽",
         "verification_call_budget_exhausted": "验证调用预算已耗尽",
@@ -4923,12 +8594,147 @@ def _replan_reserve_reached(run: ResearchRunRow) -> bool:
     return maximum > 0 and maximum - used <= reserve
 
 
+def _gap_requirement_from_row(row: GapRequirementRow) -> GapRequirement:
+    """Convert the canonical persistence row to the domain state model."""
+
+    return GapRequirement(
+        gap_id=row.gap_id,
+        run_id=row.run_id,
+        question_id=row.question_id,
+        dimension_key=row.dimension_key,
+        requirement_type=GapRequirementType(row.requirement_type),
+        criterion=row.criterion,
+        required_evidence_count=row.required_evidence_count,
+        required_independent_sources=row.required_independent_sources,
+        current_evidence_count=row.current_evidence_count,
+        current_independent_sources=row.current_independent_sources,
+        verification_status=VerificationStatus(row.verification_status),
+        closure_status=GapClosureStatus(row.closure_status),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        state_version=row.state_version,
+        current_coverage=row.current_coverage,
+        required_coverage=row.required_coverage,
+        transition_reason=row.transition_reason,
+        plan_version=row.plan_version,
+        migration_source=row.migration_source,
+    )
+
+
+def _runtime_gap_requirement(
+    *,
+    run_id: UUID,
+    plan_version: int,
+    question_id: str,
+    dimension_key: str,
+    criterion: str,
+) -> GapRequirement:
+    """Create a conservative canonical requirement when a row is absent."""
+
+    timestamp = datetime.now(UTC)
+    independent = _requires_independent_sources(criterion)
+    return GapRequirement(
+        gap_id=gap_requirement_id(run_id, plan_version, dimension_key),
+        run_id=run_id,
+        question_id=question_id,
+        dimension_key=dimension_key,
+        requirement_type=(
+            GapRequirementType.INDEPENDENT_SOURCE
+            if independent
+            else GapRequirementType.EVIDENCE_QUALITY
+        ),
+        criterion=criterion,
+        required_evidence_count=1,
+        required_independent_sources=2 if independent else 1,
+        current_evidence_count=0,
+        current_independent_sources=0,
+        verification_status=VerificationStatus.REQUIRED,
+        closure_status=GapClosureStatus.OPEN,
+        created_at=timestamp,
+        updated_at=timestamp,
+        state_version=1,
+        current_coverage=0.0,
+        required_coverage=1.0,
+        transition_reason="runtime_evidence_alignment",
+        plan_version=plan_version,
+    )
+
+
+def _evaluate_recovery_closure(
+    *,
+    quality_snapshot: Mapping[str, object],
+    run_id: UUID,
+    plan_version: int,
+    state_version: int,
+    gap_before: tuple[str, ...],
+    coverage_before: float,
+    accepted_evidence_before: int,
+    independent_sources_before: int,
+) -> tuple[list[ClosureEvaluation], tuple[str, ...], tuple[str, ...]]:
+    """Evaluate Recovery against the Evaluator's current requirements."""
+
+    raw_coverage_map = quality_snapshot.get("coverage_map", [])
+    coverage_map = (
+        [item for item in raw_coverage_map if isinstance(item, Mapping)]
+        if isinstance(raw_coverage_map, list)
+        else []
+    )
+    raw_risk_state = quality_snapshot.get("risk_state", {})
+    risk_state = raw_risk_state if isinstance(raw_risk_state, Mapping) else {}
+    raw_claim_states = risk_state.get("claims", {})
+    claim_states = raw_claim_states if isinstance(raw_claim_states, Mapping) else {}
+    requirements = project_gap_requirements(
+        run_id=run_id,
+        plan_version=plan_version,
+        state_version=state_version,
+        coverage_map=coverage_map,
+        claim_states=claim_states,
+    )
+    requirements_by_dimension = {
+        requirement.dimension_key: requirement for requirement in requirements
+    }
+    evaluations: list[ClosureEvaluation] = []
+    closed_gap_ids: set[str] = set()
+    closed_dimensions: set[str] = set()
+    for dimension_key in gap_before:
+        requirement = requirements_by_dimension.get(dimension_key)
+        if requirement is None:
+            continue
+        evaluation = ClosureEvaluation.evaluate(
+            requirement,
+            before_snapshot=ClosureSnapshot(
+                coverage=max(0.0, min(1.0, coverage_before)),
+                evidence_count=max(0, accepted_evidence_before),
+                independent_sources=max(0, independent_sources_before),
+                verification_status=VerificationStatus.REQUIRED,
+            ),
+            after_snapshot=ClosureSnapshot(
+                coverage=requirement.current_coverage,
+                evidence_count=requirement.current_evidence_count,
+                independent_sources=requirement.current_independent_sources,
+                verification_status=requirement.verification_status,
+            ),
+        )
+        evaluations.append(evaluation)
+        if evaluation.closure_status is GapClosureStatus.CLOSED:
+            closed_dimensions.add(dimension_key)
+            closed_gap_ids.add(str(requirement.gap_id))
+    remaining_dimensions = tuple(
+        str(requirements_by_dimension[dimension_key].gap_id)
+        for dimension_key in gap_before
+        if dimension_key in requirements_by_dimension
+        and dimension_key not in closed_dimensions
+    )
+    return evaluations, tuple(sorted(closed_gap_ids)), remaining_dimensions
+
+
 def _requirements_satisfied(
     question_id: str,
     requirements: list[str],
     counts_by_dimension: Mapping[str, tuple[int, int]],
     *,
     accepted_for_question: int,
+    high_risk_dimension_keys: set[str] | frozenset[str] = frozenset(),
 ) -> bool:
     """Determine completion from the planned dimensions and their source policy."""
 
@@ -4939,10 +8745,110 @@ def _requirements_satisfied(
             f"{question_id}:d{index}",
             (0, 0),
         )
-        required_sources = 2 if _requires_independent_sources(criterion) else 1
+        dimension_key = f"{question_id}:d{index}"
+        required_sources = (
+            2
+            if _requires_independent_sources(criterion)
+            or dimension_key in high_risk_dimension_keys
+            else 1
+        )
         if evidence_count < 1 or owner_count < required_sources:
             return False
     return True
+
+
+def _protected_page_schedule_key(
+    *,
+    attempts: int,
+    coverage: float,
+    priority: int,
+    question_id: str,
+) -> tuple[int, int, float, int, str]:
+    """Keep untouched questions ahead of retries while protecting open gaps."""
+
+    return (
+        0 if attempts == 0 else 1,
+        0,
+        coverage,
+        priority,
+        question_id,
+    )
+
+
+def _p1_variant_schedule_key(
+    *,
+    attempts: int,
+    coverage: float,
+    priority: int,
+    question_id: str,
+) -> tuple[int, int, float, int, str]:
+    """Prioritize the weakest P1 before expected-yield optimizations."""
+
+    return (
+        1,
+        int(max(0.0, min(1.0, coverage)) * 1_000_000),
+        float(max(0, attempts)),
+        priority,
+        question_id,
+    )
+
+
+def _zero_yield_retry_deprioritized(
+    *,
+    search_budget_exhausted: bool,
+    attempts: int,
+    coverage: float,
+    accepted_evidence: int,
+    is_corroboration_target: bool,
+) -> bool:
+    """Move a fruitless retry behind useful work without making it terminal."""
+
+    return (
+        not search_budget_exhausted
+        and attempts >= 2
+        and coverage <= 0.0
+        and accepted_evidence <= 0
+        and not is_corroboration_target
+    )
+
+
+def _query_space_exhausted_for_freeze(
+    *,
+    executed_families: Iterable[str],
+    question: str,
+) -> bool:
+    """Freeze a zero-yield question only after every bounded family ran.
+
+    The two-low-gain threshold is useful for scheduling priority, but it must
+    not turn into a terminal decision while alternate-language and
+    contradiction searches remain untried.
+    """
+
+    valid_families = {family.value for family in QUERY_FAMILIES}
+    attempted = {str(value) for value in executed_families} & valid_families
+    return len(attempted) >= _query_strategy_limit(question)
+
+
+def _query_family_capacity_remaining(*, question: str, attempted_families: int) -> bool:
+    """Keep protected scheduling aligned with the configured family count."""
+
+    return max(0, attempted_families) < _query_strategy_limit(question)
+
+
+def _question_low_gain_streak(
+    quality_snapshot: Mapping[str, object], question_id: str
+) -> int:
+    """Read a per-question streak without leaking another question's value."""
+
+    raw_streaks = quality_snapshot.get("low_information_gain_streak_by_question")
+    if isinstance(raw_streaks, Mapping):
+        if question_id in raw_streaks:
+            return max(0, _as_int(raw_streaks.get(question_id, 0)))
+        if raw_streaks:
+            return 0
+    # Legacy snapshots did not have the per-question ledger. Preserve their
+    # active question's streak only until the first keyed entry is written.
+    return max(0, _as_int(quality_snapshot.get("low_information_gain_streak", 0)))
 
 
 def _search_query_for_attempt(
@@ -5045,6 +8951,33 @@ def _quality_repair_targets(
     return targets
 
 
+def _select_unmet_requirement(
+    requirement_statuses: list[object],
+) -> tuple[str, str] | None:
+    """Choose the least-covered atomic dimension, not merely the first one."""
+
+    candidates: list[tuple[float, int, int, str, str]] = []
+    for raw in requirement_statuses:
+        if not isinstance(raw, dict) or not raw.get("criterion"):
+            continue
+        coverage = _as_float(raw.get("coverage", 0.0))
+        if coverage >= 1.0:
+            continue
+        candidates.append(
+            (
+                coverage,
+                _as_int(raw.get("accepted_evidence", 0)),
+                _as_int(raw.get("independent_sources", 0)),
+                str(raw.get("dimension_key", "")),
+                str(raw.get("criterion")),
+            )
+        )
+    if not candidates:
+        return None
+    _coverage, _accepted, _sources, dimension_key, criterion = min(candidates)
+    return dimension_key, criterion
+
+
 def _source_hint_for_requirement(criterion: str) -> str:
     """Map an unmet dimension to a source genre before repeating a search.
 
@@ -5088,6 +9021,15 @@ def _source_hint_for_requirement(criterion: str) -> str:
         for token in ("原理", "principle", "算法", "algorithm", "技术", "technology")
     ):
         return "官方技术文档 技术论文" if chinese else "official technical paper application note"
+    if any(
+        token in normalized
+        for token in ("厂商", "厂家", "产品", "vendor", "manufacturer", "product")
+    ):
+        return (
+            "厂商官网 产品页 客户案例"
+            if chinese
+            else "manufacturer official product page customer case study"
+        )
     if any(
         token in normalized
         for token in ("案例", "部署", "deployment", "case", "应用", "application")
@@ -5184,6 +9126,9 @@ def _evaluation_summary(decision: str, question_id: str) -> str:
             f"问题 {question_id} 遇到临时搜索服务故障; 不消耗研究尝试并调度技术重试。"
         ),
         "continue_plan": f"问题 {question_id} 已完成评估; 自动推进下一个研究问题。",
+        "continue_cached": (
+            "新搜索预算已耗尽; 继续读取和抽取已发现候选, 避免遗失可用证据。"
+        ),
         "replan": "连续低信息增益或预算进入预留区; 对原问题执行定向补证。",
         "ready_to_write": "全部研究质量门已满足; 进入报告写作。",
         "write_with_limitations": (

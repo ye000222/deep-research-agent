@@ -5,7 +5,13 @@ import pytest
 import respx
 from app.domain.research_tools import SearchResult
 from app.tools.errors import ToolExecutionError
-from app.tools.web_search import SearXNGSearchProvider, _is_relevant_candidate
+from app.tools.web_search import (
+    _ACADEMIC_ENGINES,
+    SearXNGSearchProvider,
+    _is_relevant_candidate,
+    _map_result,
+    _strategies_for_query,
+)
 
 
 def test_authority_boilerplate_cannot_make_an_unrelated_result_relevant() -> None:
@@ -21,6 +27,51 @@ def test_authority_boilerplate_cannot_make_an_unrelated_result_relevant() -> Non
     )
 
     assert _is_relevant_candidate(query, unrelated) is False
+
+
+def test_provider_metadata_is_bounded_before_search_result_validation() -> None:
+    mapped = _map_result(
+        {
+            "title": "Industrial inspection " * 200,
+            "url": "https://example.org/paper",
+            "content": "<jats:p>industrial defect inspection</jats:p>" * 500,
+            "publishedDate": "2026-09-15" * 20,
+        },
+        rank=1,
+    )
+
+    assert mapped is not None
+    assert len(mapped.title) == 1_000
+    assert len(mapped.snippet) == 4_000
+    assert mapped.published_at is not None
+    assert len(mapped.published_at) == 100
+
+
+def test_provider_result_with_oversized_url_is_discarded() -> None:
+    assert (
+        _map_result(
+            {
+                "title": "Industrial inspection",
+                "url": "https://example.org/" + "a" * 4_001,
+            },
+            rank=1,
+        )
+        is None
+    )
+
+
+def test_vendor_and_market_queries_use_general_search_before_academic() -> None:
+    vendor = _strategies_for_query(
+        "工业视觉缺陷检测 厂商 产品 客户案例",
+        "industrial visual inspection vendors products customer cases",
+    )
+    technical = _strategies_for_query(
+        "工业视觉缺陷检测 深度学习方法",
+        "industrial visual defect inspection deep learning methods",
+    )
+
+    assert vendor[0][0].get("engines", "").casefold() != _ACADEMIC_ENGINES.casefold()
+    assert technical[0][0]["engines"] == _ACADEMIC_ENGINES
 
 
 def test_industrial_defect_query_rejects_generic_vision_method_overlap() -> None:
@@ -52,6 +103,19 @@ def test_visual_guard_is_scoped_to_visual_queries() -> None:
     )
 
     assert _is_relevant_candidate(control_query, control_result) is True
+
+
+def test_arxiv_pdf_result_is_normalized_to_readable_abstract_page() -> None:
+    result = _map_result(
+        {
+            "title": "Industrial defect detection paper",
+            "url": "https://arxiv.org/pdf/2406.00501.pdf",
+        },
+        rank=1,
+    )
+
+    assert result is not None
+    assert result.url == "https://arxiv.org/abs/2406.00501"
 
 
 @pytest.mark.asyncio
@@ -214,7 +278,7 @@ async def test_searxng_normalizes_invalid_payload_to_safe_error() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_searxng_falls_back_to_sogou_when_general_engines_are_degraded() -> None:
+async def test_searxng_falls_back_to_general_when_academic_engines_are_degraded() -> None:
     route = respx.get("http://searxng.test/search").mock(
         side_effect=[
             httpx.Response(
@@ -246,7 +310,8 @@ async def test_searxng_falls_back_to_sogou_when_general_engines_are_degraded() -
 
     assert route.call_count == 2
     assert results[0].url == "https://example.cn/inspection"
-    assert route.calls[1].request.url.params["engines"] == "sogou"
+    assert route.calls[0].request.url.params["engines"] == _ACADEMIC_ENGINES
+    assert route.calls[1].request.url.params.get("engines") is None
 
 
 @pytest.mark.asyncio
@@ -271,16 +336,12 @@ async def test_searxng_reports_provider_degradation_instead_of_false_empty_succe
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_searxng_retries_transient_fallback_degradation_once() -> None:
+async def test_searxng_rotates_unhealthy_strategies_without_same_engine_retry() -> None:
     route = respx.get("http://searxng.test/search").mock(
         side_effect=[
             httpx.Response(
                 200,
                 json={"results": [], "unresponsive_engines": [["general", "timeout"]]},
-            ),
-            httpx.Response(
-                200,
-                json={"results": [], "unresponsive_engines": [["sogou", "timeout"]]},
             ),
             httpx.Response(
                 200,
@@ -303,7 +364,7 @@ async def test_searxng_retries_transient_fallback_degradation_once() -> None:
     async with httpx.AsyncClient() as client:
         results = await SearXNGSearchProvider(client, "http://searxng.test").search("topic")
 
-    assert route.call_count == 4
+    assert route.call_count == 3
     assert results[0].title == "Recovered result"
 
 
@@ -343,7 +404,7 @@ async def test_fast_hedged_primary_timeout_is_counted() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         engine = request.url.params.get("engines") or "default"
         requests.append(engine)
-        if engine == "default":
+        if engine == _ACADEMIC_ENGINES:
             raise httpx.ReadTimeout("primary timed out", request=request)
         return httpx.Response(
             200,
@@ -367,10 +428,195 @@ async def test_fast_hedged_primary_timeout_is_counted() -> None:
         )
 
     assert results
-    assert requests == ["default", "sogou"]
+    assert requests == [_ACADEMIC_ENGINES, "default"]
     assert provider.last_request_count == 2
     assert provider.last_timeout_count == 1
     assert provider.last_fallback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_academic_strategy_uses_alternate_language_query() -> None:
+    requests: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (request.url.params.get("engines") or "default", request.url.params["q"])
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Industrial visual defect inspection benchmark",
+                        "url": "https://arxiv.org/abs/1234.5678",
+                        "content": "industrial visual defect inspection methods benchmark",
+                    }
+                ],
+                "unresponsive_engines": [],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        results = await provider.search(
+            "工业视觉缺陷检测 方法",
+            alternate_query="industrial visual defect inspection methods",
+            max_provider_requests=1,
+        )
+
+    assert results
+    assert requests == [
+        (
+            _ACADEMIC_ENGINES,
+            "industrial visual defect inspection methods filetype:pdf",
+        )
+    ]
+    assert provider.last_healthy_response_count == 1
+    assert provider.last_productive_response_count == 1
+
+
+@pytest.mark.asyncio
+async def test_search_filters_excluded_owners_from_payload_not_only_query_text() -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.params["q"])
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Blocked industrial inspection source",
+                        "url": "https://papers.blocked.example/article/1",
+                        "content": "industrial machine vision defect inspection methods",
+                    },
+                    {
+                        "title": "Readable industrial inspection source",
+                        "url": "https://public.example.org/inspection",
+                        "content": "industrial machine vision defect inspection methods",
+                    },
+                ],
+                "unresponsive_engines": [],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        results = await provider.search(
+            "industrial machine vision defect inspection methods",
+            limit=1,
+            max_provider_requests=1,
+            exclude_domains=("blocked.example",),
+        )
+
+    assert [result.url for result in results] == [
+        "https://public.example.org/inspection"
+    ]
+    assert "-site:blocked.example" in requests[0]
+
+
+@pytest.mark.asyncio
+async def test_search_filters_failed_redirect_entry_url_from_fresh_results() -> None:
+    failed_doi = "https://doi.org/10.1000/failed"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Failed redirected industrial inspection paper",
+                        "url": failed_doi,
+                        "content": "industrial machine vision defect inspection methods",
+                    },
+                    {
+                        "title": "Alternative industrial inspection paper",
+                        "url": "https://open.example.org/paper",
+                        "content": "industrial machine vision defect inspection methods",
+                    },
+                ],
+                "unresponsive_engines": [],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        results = await provider.search(
+            "industrial machine vision defect inspection methods",
+            limit=1,
+            max_provider_requests=1,
+            exclude_urls=(failed_doi,),
+        )
+
+    assert [result.url for result in results] == ["https://open.example.org/paper"]
+
+
+@pytest.mark.asyncio
+async def test_technical_search_reserves_room_for_non_academic_sources() -> None:
+    requested_engines: list[str] = []
+    requested_queries: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        engine = request.url.params.get("engines") or "default"
+        requested_engines.append(engine)
+        requested_queries.append(request.url.params["q"])
+        prefix = "academic" if engine == _ACADEMIC_ENGINES else "public"
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": f"Industrial defect inspection {prefix} source {index}",
+                        "url": f"https://{prefix}{index}.source{index}.org/inspection",
+                        "content": "industrial machine vision defect inspection methods",
+                    }
+                    for index in range(8)
+                ],
+                "unresponsive_engines": [],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        results = await provider.search(
+            "工业视觉缺陷检测 方法",
+            alternate_query="industrial machine vision defect inspection methods",
+            limit=8,
+            max_provider_requests=2,
+        )
+
+    assert requested_engines == [_ACADEMIC_ENGINES, "default"]
+    assert requested_queries == [
+        "industrial machine vision defect inspection methods filetype:pdf",
+        "industrial machine vision defect inspection methods",
+    ]
+    assert sum("academic" in result.url for result in results) == 4
+    assert sum("public" in result.url for result in results) == 4
+
+
+@pytest.mark.asyncio
+async def test_unresponsive_strategies_are_circuit_broken_for_later_questions() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"results": [], "unresponsive_engines": [["engine", "captcha"]]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError):
+            await provider.search("industrial inspection")
+        assert calls == 3
+        assert provider.last_unresponsive_response_count == 3
+
+        with pytest.raises(ToolExecutionError):
+            await provider.search("another industrial inspection question")
+        assert calls == 3
+        assert provider.last_request_count == 0
 
 
 @pytest.mark.asyncio
@@ -427,3 +673,106 @@ async def test_hedged_fallback_is_not_requested_twice(monkeypatch: pytest.Monkey
     assert requests.count("sogou") == 1
     assert provider.last_request_count == 3
     assert provider.last_fallback_count == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_preserves_typed_failure_telemetry() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("provider timed out", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider.search("industrial inspection")
+
+    assert caught.value.code == "SEARCH_PROVIDER_DEGRADED"
+    assert caught.value.details["provider"] == "SearXNG"
+    events = caught.value.details["failure_events"]
+    assert any(event["failure_type"] == "timeout" for event in events)
+    assert caught.value.details["metrics"]["timeout_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_provider_http_error_preserves_status_code() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider._request("industrial inspection", strategy={"engines": "default"})
+
+    details = caught.value.details
+    assert details["provider"] == "SearXNG"
+    assert details["failure_type"] == "http_error"
+    assert details["context"]["http_status"] == 503
+    assert details["context"]["fallback_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_empty_provider_response_is_not_classified_as_network_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = SearXNGSearchProvider(client, "https://search.example")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider.search("industrial inspection")
+
+    details = caught.value.details
+    assert any(
+        event["failure_type"] == "empty_response"
+        for event in details["failure_events"]
+    )
+    assert details["metrics"]["empty_response_count"] >= 1
+    assert details["metrics"]["network_error_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_records_success_and_failure() -> None:
+    bing_html = (
+        '<li class="b_algo"><h2><a href="https://example.org/inspection">'
+        "Industrial inspection source</a></h2><p>industrial inspection</p></li>"
+    )
+
+    async def successful_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "searxng":
+            return httpx.Response(
+                200,
+                json={"results": [], "unresponsive_engines": [["engine", "down"]]},
+            )
+        return httpx.Response(200, text=bing_html)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(successful_handler)
+    ) as client:
+        provider = SearXNGSearchProvider(client, "http://searxng")
+        results = await provider.search(
+            "industrial inspection", limit=1, max_provider_requests=1
+        )
+
+    assert results
+    assert provider.last_fallback_attempt_count == 1
+    assert provider.last_fallback_success_count == 1
+
+    async def failed_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "searxng":
+            return httpx.Response(
+                200,
+                json={"results": [], "unresponsive_engines": [["engine", "down"]]},
+            )
+        return httpx.Response(502)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(failed_handler)) as client:
+        provider = SearXNGSearchProvider(client, "http://searxng")
+        with pytest.raises(ToolExecutionError) as caught:
+            await provider.search("industrial inspection", limit=1, max_provider_requests=1)
+
+    details = caught.value.details
+    assert details["failure_type"] == "fallback_failure"
+    assert any(
+        event["provider"] == "Bing" and event["failure_type"] == "http_error"
+        for event in details["failure_events"]
+    )
+    assert details["metrics"]["fallback_attempts"] >= 1
+    assert details["metrics"]["fallback_successes"] == 0

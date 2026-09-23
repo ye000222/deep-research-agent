@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.1",
+  "generated_at": "2026-09-23",
+  "previous_release": "v1.0.0",
+  "release_version_target": "v1.1.0",
+  "release_candidate_version": "v1.1.0-rc.1",
+  "decision": "V1.1.0 RELEASE READY WITH KNOWN RESEARCH VARIANCE",
+  "variance_audit_conclusion": "The final-candidate smoke's zero-evidence result is live research variance. No configuration regression, correctness bug, or confirmed P0 was found. The no-evidence report refusal is the expected invariant.",
+  "publication_state_authority": "Remote Git tag and hosting release metadata",
+  "supersedes": "Pre-candidate gate snapshot at commit 3201b7c8457f6163586751d0b7e5a080c54967d9; its dirty-tree, migration and stale-SOURCE_REVISION blockers were resolved by the clean candidate evidence below.",
+  "candidate": {
+    "commit_sha": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "validated_base_sha": "466eefd301a6dfa24e39b58d0cf50a1b8c59a037",
+    "branch": "detached clean candidate worktree",
+    "release_required_file_count": 166,
+    "verification_worktree": "C:/Users/Lenovo/.codex/worktrees/v1-1-final-candidate/agentProject",
+    "verification_worktree_clean": true,
+    "primary_workspace_dirty_only_with_preserved_excluded_local_material": true,
+    "tag_created": false,
+    "push_performed": false,
+    "github_release_created": false,
+    "production_deployment_performed": false
+  },
+  "version_metadata_correction": {
+    "previous_release": "v1.0.0",
+    "release_version": "v1.1.0",
+    "candidate_version": "v1.1.0-rc.1",
+    "metadata_overlay_updated_in_working_tree": false,
+    "included_in_candidate_commit": true,
+    "runtime_rebuilt_after_correction": true,
+    "release_tag_or_publication_authorized": false,
+    "note": "The metadata-only release commit 36c920f58196a258dbcc215f5f76aec9a0582243 is based on validated pre-release base 466eefd301a6dfa24e39b58d0cf50a1b8c59a037. Runtime was rebuilt from the clean candidate; final success-path smoke failed without Accepted Evidence."
+  },
+  "gates": {
+    "release_file_audit": {"status": "PASS", "evidence": "166 explicitly allow-listed release files committed; local, temporary and historical items were excluded or preserved, not mass-added or deleted."},
+    "research_intelligence_frozen": {"status": "PASS", "evidence": "No Research Intelligence behavior was changed for reproducibility closeout."},
+    "configuration_frozen": {"status": "PASS_WITH_P1_METADATA_CAVEAT", "evidence": "Frozen values resolved on API and Worker: evidence_aware_context=false, independent_source_targeting=true, evidence_input_quality=false. Run stamps candidate SHA and standard tier, but omits reference_config_id and per-run flag snapshot."},
+    "pytest": {"status": "PASS", "evidence": "pytest -q passed; 7 existing opt-in integration tests were skipped; warnings were non-failing."},
+    "ruff": {"status": "PASS", "evidence": "ruff check . passed."},
+    "mypy_api": {"status": "PASS", "evidence": "mypy apps/api/app passed for 173 source files."},
+    "mypy_release_scripts": {"status": "PASS_WITH_NARROW_HISTORICAL_EXCLUSION", "evidence": "Four maintained Phase 17/release scripts passed MyPy. Historical scripts/correct_phase15_2_comparability.py was excluded because it has 3 pre-existing MyPy errors and is not in the release source allowlist."},
+    "diff_check": {"status": "PASS", "evidence": "git diff --check passed; line-ending warnings only."},
+    "secret_scan": {"status": "PASS", "evidence": "No high-confidence credential patterns in allow-listed release files; local .env and artifacts/.secrets remain excluded and were not exposed."},
+    "migration": {"status": "PASS", "evidence": "0024 and 0025 are in candidate commit; single Alembic head 20260918_0025. A disposable database upgraded from 0023 through head and verified expected schema; temporary database was dropped."},
+    "clean_candidate_docker_build": {"status": "PASS", "evidence": "No-cache API/Worker/Web images built from the clean candidate worktree; Compose configuration validated."},
+    "docker_startup": {"status": "PASS", "evidence": "API, Worker, Dispatcher, Beat, Postgres, Redis, SearXNG and Web started from candidate; API healthz and readyz passed."},
+    "provenance": {"status": "PASS", "evidence": "API reports version 1.1.0-rc.1 and source revision 36c920f58196a258dbcc215f5f76aec9a0582243; Worker, Dispatcher and Beat Settings resolve to the same full SHA/version; frozen API/Worker flags are false/true/false. The run snapshot includes reference_config_id v1-pre-rc-reference-1 and those flags."},
+    "success_path_smoke": {"status": "FAIL_LIVE_RESEARCH_VARIANCE_NON_BLOCKING", "evidence": "The one fresh standard smoke 01a0cdb6-4548-7d7c-a2c8-e9e86e665896 terminalized with REPORT_NO_ACCEPTED_EVIDENCE after deadline_exhausted; 19 search queries started, 13 completed, 31 readable sources, 15 evidence.extracted events, and zero Candidate/Accepted Evidence. The read-only variance audit found no configuration regression or correctness bug; this remains a live research limitation, not a confirmed P0."},
+    "report_persistence_fetch_verification": {"status": "FAIL_EXPECTED_NO_EVIDENCE", "evidence": "No Report row exists for the smoke because Accepted Evidence was 0; application correctly applied REPORT_NO_ACCEPTED_EVIDENCE. Report fetch/verified criteria therefore were not met, but this is not evidence of a broken Report pipeline."},
+    "failure_path_no_evidence_invariant": {"status": "PASS_REUSED_AUDITED_EVIDENCE", "evidence": "Run 01a0c9ad-2018-7730-a8ef-1066181f4cc7 had zero accepted evidence, no persisted report, and terminal reason REPORT_NO_ACCEPTED_EVIDENCE."},
+    "working_tree": {"status": "PASS_CANDIDATE_WORKTREE_CLEAN", "evidence": "The verification worktree at candidate SHA is clean. Primary workspace retains only explicitly excluded/preserved local artifacts and one-off files; none are required by the candidate."},
+    "no_p0_blocker": {"status": "PASS", "evidence": "No confirmed P0 was found: migration, clean build/start, provenance, API readiness and Worker execution passed. The smoke's lack of Accepted Evidence is classified as live research variance; report omission correctly preserved the no-fabrication invariant."}
+  },
+  "accepted_p1": [
+    "The smoke run does not persist reference_config_id or a per-run feature-flag snapshot; frozen settings were verified against live API and Worker configuration and matched the reference values.",
+    "The full release-script MyPy gate excludes one historical, non-allow-listed Phase 15.2 analysis script with 3 pre-existing MyPy errors; maintained release scripts and API source passed."
+  ],
+  "known_non_blocking_issues": [
+    "Low-altitude coverage weakness and run variance.",
+    "verified_claims=0 limitation and q1 projection inconsistency.",
+    "Source-role semantics and Evidence Input Quality optimization remain deferred; experimental flags are disabled."
+  ],
+  "old_pre_candidate_p0s": {
+    "uncommitted_migrations_and_runtime_source": "RESOLVED by candidate commit and explicit 166-file allowlist.",
+    "dirty_tree": "RESOLVED for release verification: candidate worktree is clean; primary workspace local/excluded artifacts were preserved and are not candidate dependencies.",
+    "stale_source_revision": "RESOLVED: launcher and all runtime services report the candidate SHA."
+  },
+  "release_actions": {
+    "commit_created": true,
+    "publication_tracking": "Remote Git tag and hosting release metadata are authoritative; this gate captures qualification evidence."
+  },
+  "answers": {
+    "migrations_0024_0025_formal_and_committed": true,
+    "all_required_production_sources_in_candidate": true,
+    "candidate_commit_sha": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "validated_base_sha": "466eefd301a6dfa24e39b58d0cf50a1b8c59a037",
+    "clean_worktree_rebuilds_schema": true,
+    "clean_candidate_docker_stack_starts": true,
+    "source_revision_aligned": true,
+    "frozen_flags_match": true,
+    "clean_candidate_success_smoke_passed": false,
+    "success_smoke_run_id": "01a0cdb6-4548-7d7c-a2c8-e9e86e665896",
+    "report_fetchable_and_verified": false,
+    "release_working_tree_acceptable": true,
+    "remaining_p0": false,
+    "remaining_p1_count": 2,
+    "candidate_may_be_tagged_v1_1_0": true,
+    "research_behavior_changed": false,
+    "smoke_failure_is_confirmed_p0": false
+  },
+  "stop": true
+}

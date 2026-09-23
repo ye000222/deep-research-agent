@@ -4,7 +4,17 @@ import httpx
 import pytest
 import respx
 from app.tools.errors import ToolExecutionError
-from app.tools.web_reader import PublicWebReader
+from app.tools.web_reader import PublicWebReader, _public_fallback_url
+
+
+def test_public_fallback_url_uses_known_public_document_endpoints() -> None:
+    assert _public_fallback_url("https://www.mdpi.com/2076-3417/16/14/7096") == (
+        "https://www.mdpi.com/2076-3417/16/14/7096/pdf"
+    )
+    assert _public_fallback_url("https://www.ssrn.com/abstract=5938793") == (
+        "https://papers.ssrn.com/sol3/Delivery.cfm?abstractid=5938793"
+    )
+    assert _public_fallback_url("https://example.com/report") is None
 
 
 def public_dns(*args: object, **kwargs: object) -> list[tuple[object, ...]]:
@@ -35,6 +45,65 @@ async def test_reader_extracts_public_html_and_hashes_clean_text(
     assert "traceable results" in page.clean_text
     assert len(page.content_hash) == 64
     assert page.final_url == "https://example.com/report"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reader_extracts_bounded_public_pdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", public_dns)
+    monkeypatch.setattr(
+        "app.tools.web_reader._extract_pdf_text",
+        lambda body: "Industrial defect detection benchmark evidence. " * 5,
+    )
+    respx.get("https://example.com/paper.pdf").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "application/pdf"},
+            content=b"%PDF-1.7 test fixture",
+        )
+    )
+
+    async with httpx.AsyncClient() as client:
+        page = await PublicWebReader(client).read("https://example.com/paper.pdf")
+
+    assert page.title == "paper.pdf"
+    assert "benchmark evidence" in page.clean_text
+    assert page.final_url == "https://example.com/paper.pdf"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reader_uses_standard_metadata_when_javascript_shell_has_no_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", public_dns)
+    abstract = (
+        "This peer reviewed study compares traditional image processing with "
+        "deep learning for industrial surface defect inspection, describes the "
+        "benchmark dataset, and reports traceable evaluation results. " * 3
+    )
+    respx.get("https://publisher.example/paper").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text=(
+                "<html><head>"
+                '<meta name="citation_title" content="Industrial inspection study">'
+                f'<meta name="citation_abstract" content="{abstract}">'
+                '<meta name="citation_keywords" content="ignored field">'
+                "</head><body><script>renderApp()</script></body></html>"
+            ),
+        )
+    )
+
+    async with httpx.AsyncClient() as client:
+        page = await PublicWebReader(client).read("https://publisher.example/paper")
+
+    assert page.title == "Industrial inspection study"
+    assert "traditional image processing" in page.clean_text
+    assert len(page.clean_text) >= 300
 
 
 @pytest.mark.asyncio

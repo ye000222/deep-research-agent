@@ -22,6 +22,7 @@ REQUIRED = (
     "apps/api/app/retrieval/projections.py",
     "apps/api/app/evaluation/report_verifier.py",
     "evals/datasets/v1_golden.json",
+    "scripts/verify_v1_real_runs.py",
 )
 
 
@@ -159,8 +160,26 @@ def main() -> int:
     parser.add_argument("--skip-integration", action="store_true")
     parser.add_argument("--skip-web", action="store_true")
     parser.add_argument("--skip-static", action="store_true")
+    parser.add_argument("--v1-closeout", action="store_true")
+    parser.add_argument("--v1-owner-hash")
+    parser.add_argument("--v1-source-revision")
     parser.add_argument("--report-path", type=Path)
     args = parser.parse_args()
+    if args.v1_closeout and any(
+        (args.skip_compose, args.skip_integration, args.skip_web, args.skip_static)
+    ):
+        parser.error("--v1-closeout does not allow any --skip-* option")
+    owner_hash = args.v1_owner_hash or os.getenv("V1_ACCEPTANCE_OWNER_HASH")
+    source_revision = args.v1_source_revision or os.getenv("SOURCE_REVISION")
+    if args.v1_closeout and not owner_hash:
+        parser.error("--v1-owner-hash or V1_ACCEPTANCE_OWNER_HASH is required")
+    if args.v1_closeout and (
+        not source_revision
+        or source_revision.strip().casefold() in {"development", "unknown"}
+    ):
+        parser.error(
+            "--v1-source-revision or SOURCE_REVISION must identify the candidate build"
+        )
     missing = check_files()
     mysql = check_mysql_references()
     compose_ok = True if args.skip_compose else check_compose()
@@ -194,6 +213,37 @@ def main() -> int:
         commands.append(
             _run("web_build", [PNPM, "--filter", "@deep-research/web", "build"])
         )
+    real_acceptance: dict[str, object] = {
+        "name": "real_v1_acceptance",
+        "requested": args.v1_closeout,
+        "passed": False,
+        "returncode": 2,
+        "output_tail": "not requested; static checks cannot establish V1 closeout",
+    }
+    if args.v1_closeout:
+        assert owner_hash is not None
+        assert source_revision is not None
+        acceptance_report = (
+            args.report_path.with_name("v1_real_acceptance.json")
+            if args.report_path is not None
+            else ROOT / "artifacts" / "v1_real_acceptance.json"
+        )
+        acceptance_command = [
+            PYTHON,
+            "scripts/verify_v1_real_runs.py",
+            "--owner-hash",
+            owner_hash,
+            "--count",
+            "3",
+            "--report-path",
+            str(acceptance_report),
+            "--expected-source-revision",
+            source_revision,
+        ]
+        real_acceptance = {
+            **_run("real_v1_acceptance", acceptance_command),
+            "requested": True,
+        }
     secret_hits = check_secret_scan()
     golden = check_golden_eval()
     head_revision, _ = migration_head()
@@ -207,13 +257,17 @@ def main() -> int:
         "golden_eval": bool(golden["passed"]),
         "secret_scan": not secret_hits,
     }
+    if args.v1_closeout:
+        checks["real_v1_acceptance"] = bool(real_acceptance["passed"])
     payload = {
         "passed": all(checks.values()),
+        "scope": "v1_closeout" if args.v1_closeout else "static_release_checks",
         "checks": checks,
         "missing_files": missing,
         "forbidden_references": mysql,
         "commands": commands,
         "golden_eval": golden,
+        "real_v1_acceptance": real_acceptance,
         "secret_hits": secret_hits,
     }
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)

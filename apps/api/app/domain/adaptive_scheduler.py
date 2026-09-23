@@ -27,15 +27,128 @@ def query_family_for_attempt(attempt_index: int) -> QueryFamily | None:
     return QUERY_FAMILIES[attempt_index]
 
 
+def _compact_search_hint(hint: str) -> str:
+    """Keep planner hints query-shaped instead of carrying audit prose.
+
+    Replanning can feed the previous criterion back into ``search_hints``.
+    That text is useful for evaluation but harmful as a search anchor (it often
+    contains a whole question followed by requirements such as "independent
+    source" or "official report").
+    """
+
+    compact = " ".join(hint.strip().split())
+    if not compact:
+        return ""
+    # A question mark is a reliable boundary between a topic and appended
+    # audit instructions in both Chinese and English planner output.
+    compact = re.split(r"[?\uff1f]", compact, maxsplit=1)[0].strip()
+    # Replan hint banks intentionally rotate the *semantic* search angle.
+    # Keep the useful nouns from those banks while dropping only the audit
+    # qualifiers; otherwise every rotated hint collapses back to the same
+    # topic anchor and the run appears to exhaust its source space without
+    # ever issuing a new query.
+    compact = re.sub(
+        r"\bindependent\s+market\s+report\s+methodology\b",
+        "market report methodology",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"\bofficial\s+report\s+benchmark\s+independent\s+source\b",
+        "report benchmark source",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"\bsurvey\s+comparative\s+study\s+evidence\b",
+        "comparative study evidence",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"\bgovernment\s+forecast\s+primary\s+data\b",
+        "forecast primary data",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"\bpeer[- ]reviewed\s+evaluation\s+dataset\b",
+        "evaluation dataset",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"\bcomparative\s+benchmark\s+results\s+study\b",
+        "benchmark results study",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"\bindustry\s+outlook\s+adoption\s+statistics\b",
+        "industry adoption statistics",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.split(
+        r"(?:原文|逐字|直接)(?:中)?(?:列出|描述|说明|给出|包含|提供)?|"
+        r"(?:official|authoritative|independent|benchmark|comparative|survey)\s+"
+        r"(?:report|source|study|evidence|data)?|"
+        r"(?:industry|market)\s+outlook|adoption\s+statistics|"
+        r"government\s+forecast\s+primary\s+data|"
+        r"independent\s+market\s+report\s+methodology|"
+        r"official\s+report\s+benchmark\s+independent\s+source|"
+        r"survey\s+comparative\s+study\s+evidence|"
+        r"systematic\s+review\s+validation\s+evidence|"
+        r"peer[- ]reviewed\s+evaluation\s+dataset|"
+        r"comparative\s+benchmark\s+results\s+study|"
+        r"industry\s+outlook\s+adoption\s+statistics|"
+        r"manufacturer\s+product(?:\s+page)?|vendor\s+solution|"
+        r"customer\s+case(?:\s+study)?|field\s+trial|evaluation\s+report|"
+        r"technical\s+specification|peer[- ]reviewed",
+        compact,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    compact = " ".join(compact.split())
+    return compact[:160]
+
+
 def build_family_query(
     *,
     question: str,
     criterion: str = "",
     hints: tuple[str, ...] = (),
     family: QueryFamily,
+    prefer_alternate_hint: bool = False,
 ) -> str:
-    base = next((hint.strip() for hint in hints if hint.strip()), question.strip())
-    chinese = any("\u4e00" <= char <= "\u9fff" for char in question)
+    usable_hints = tuple(
+        compact
+        for compact in (_compact_search_hint(hint) for hint in hints)
+        if compact
+    )
+    use_alternate_hint = prefer_alternate_hint or family is QueryFamily.ALTERNATE
+    hint_index = 0
+    if use_alternate_hint and usable_hints:
+        first_language = any("\u4e00" <= char <= "\u9fff" for char in usable_hints[0])
+        alternate_indexes = [
+            index
+            for index, hint in enumerate(usable_hints[1:], start=1)
+            if any("\u4e00" <= char <= "\u9fff" for char in hint) != first_language
+        ]
+        # Prefer a genuinely different language; if the planner supplied only
+        # one language, the shortest compact hint is the least polluted anchor.
+        hint_index = alternate_indexes[0] if alternate_indexes else min(
+            range(len(usable_hints)), key=lambda index: len(usable_hints[index])
+        )
+    base = (
+        usable_hints[min(hint_index, len(usable_hints) - 1)]
+        if usable_hints
+        else question.strip()
+    )
+    base_is_chinese = any("\u4e00" <= char <= "\u9fff" for char in base)
+    chinese = base_is_chinese if use_alternate_hint and usable_hints else any(
+        "\u4e00" <= char <= "\u9fff" for char in question
+    )
     suffixes = {
         QueryFamily.SCOPE: "范围 定义 数据" if chinese else "scope definition data",
         QueryFamily.AUTHORITATIVE: (
@@ -52,7 +165,28 @@ def build_family_query(
             "失败 局限 反例 争议" if chinese else "failure limitations counterexample contradiction"
         ),
     }
-    parts = (base, question, criterion.strip(), suffixes[family])
+    # Planner hints already carry the topic anchor.  A scope query should stay
+    # compact: appending prose such as "原文列出……的表述" substantially lowers
+    # recall in Chinese engines.  Follow-up families retain only the useful
+    # middle of that criterion, with audit-oriented boilerplate removed.
+    compact_criterion = re.sub(
+        r"(?:原文|逐字|直接)(?:中)?|(?:列出|描述|说明|给出|包含|提供)|(?:的)?表述|"
+        r"at\s+least\s+two\s+independent\s+sources|original\s+(?:text|source)|"
+        r"(?:describe|list|state|show|provide)(?:s|d|ed|ing)?",
+        " ",
+        criterion,
+        flags=re.IGNORECASE,
+    )
+    compact_criterion = " ".join(compact_criterion.split())[:100]
+    if use_alternate_hint and usable_hints and base_is_chinese != any(
+        "\u4e00" <= char <= "\u9fff" for char in compact_criterion
+    ):
+        compact_criterion = ""
+    parts = (
+        (base,)
+        if family is QueryFamily.SCOPE and usable_hints
+        else (base, compact_criterion, suffixes[family])
+    )
     seen: set[str] = set()
     unique: list[str] = []
     for part in parts:
@@ -60,7 +194,7 @@ def build_family_query(
         if normalized and normalized not in seen:
             unique.append(part)
             seen.add(normalized)
-    return " ".join(unique)[:500]
+    return " ".join(unique)[:320]
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +249,12 @@ _LOW_VALUE_RE = re.compile(
     r"版权所有.{0,20}广告)",
     re.IGNORECASE,
 )
+# Match standalone numeric values, not digits embedded in semantic tokens
+# such as ``3D``, ``2D`` or ``3C``. Those tokens are common in qualitative
+# research criteria and must not become numeric-scope requirements.
 _NUMBER_RE = re.compile(
-    r"(?:19|20)\d{2}|[-+]?\d+(?:[.,]\d+)?\s*(?:亿美元|亿元|万元|人民币|美元|欧元|英镑|%|\uff05|ms|s|秒|kg|吨|万|亿|元)?",
+    r"(?<![A-Za-z0-9])(?:19|20)\d{2}(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])[-+]?\d+(?:[.,]\d+)?\s*(?:亿美元|亿元|万元|人民币|美元|欧元|英镑|%|\uff05|ms|s|秒|kg|吨|万|亿|元)?(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -125,6 +263,7 @@ def cheap_triage(
     *,
     question: str,
     criteria: tuple[str, ...],
+    query_hints: tuple[str, ...] = (),
     text: str,
     url: str,
 ) -> TriageResult:
@@ -137,7 +276,11 @@ def cheap_triage(
         return TriageResult(False, 0.0, "prompt_injection_detected", role)
     if _LOW_VALUE_RE.search(text[:4_000]) and len(text) < 2_000:
         return TriageResult(False, 0.1, "login_or_navigation_page", role)
-    objective = _tokens(" ".join((question, *criteria)))
+    # The plan may be authored in Chinese while the authoritative source is
+    # English. Include the exact bilingual search anchors that retrieved the
+    # page; otherwise a relevant paper is deterministically rejected before
+    # the model ever sees it.
+    objective = _tokens(" ".join((question, *criteria, *query_hints)))
     observed = _tokens(text[:40_000])
     overlap = len(objective & observed) / max(1, min(12, len(objective)))
     traceability = 1.0 if _traceability_markers(text) >= 2 else 0.6
@@ -182,6 +325,19 @@ def classify_source_role(url: str, *, text: str = "") -> str:
         )
     ):
         return "academic"
+    if (
+        any(part in path for part in ("/bitstream/", "/portalfiles/", "/eprints/"))
+        or (
+            path.endswith(".pdf")
+            and "abstract" in sample
+            and any(marker in sample for marker in ("doi", "keywords", "references"))
+        )
+    ):
+        # Institutional repositories frequently use country-code domains
+        # rather than .edu (for example university portals under .dk/.my).
+        # Repository paths or a conventional scholarly PDF front matter are
+        # stronger role signals than the TLD alone.
+        return "academic"
     if any(part in host for part in ("iso.org", "iec.ch", "nist.gov", "standards.")):
         return "standard"
     if any(part in host for part in ("blog", "wenku", "baike", "zhihu", "csdn", "medium.com")):
@@ -211,6 +367,52 @@ def classify_source_role(url: str, *, text: str = "") -> str:
         return "association"
     if any(
         marker in sample for marker in ("doi:", "methodology", "方法", "references", "参考文献")
+    ):
+        return "independent_research"
+    # Market-statistic pages are often hosted by ordinary publisher domains
+    # rather than a dedicated research-index host.  Promote only pages whose
+    # own title/body explicitly carries both a market-report signal and a
+    # quantitative market signal; generic news/blog pages remain publishers.
+    if (
+        any(
+            marker in sample
+            for marker in (
+                "market report",
+                "market research",
+                "行业报告",
+                "研究报告",
+                "研究机构",
+            )
+        )
+        and any(
+            marker in sample
+            for marker in ("market size", "cagr", "市场规模", "增长率", "年复合")
+        )
+    ):
+        return "independent_research"
+    # Some publishers expose numeric market pages whose body omits the
+    # literal phrase "market report" (the title/URL carries that context).
+    # Treat an explicit market path plus quantitative forecast language as an
+    # independent research source; this remains narrower than promoting every
+    # ordinary .com publisher and works for arbitrary market questions.
+    if (
+        any(
+            marker in f"{host}{path}"
+            for marker in ("market", "forecast", "industry-report")
+        )
+        and any(
+            marker in sample
+            for marker in (
+                "cagr",
+                "market size",
+                "market share",
+                "forecast",
+                "%",
+                "亿美元",
+                "million",
+                "billion",
+            )
+        )
     ):
         return "independent_research"
     if host.endswith(".com") or host.endswith(".cn"):
@@ -254,6 +456,16 @@ def infer_claim_type(value: str) -> str:
         return "market_statistic"
     if any(token in folded for token in ("accuracy", "f1", "precision", "性能", "准确率")):
         return "academic_performance"
+    vendor_marked = any(
+        token in folded
+        for token in ("vendor", "manufacturer", "supplier", "厂商", "厂家", "供应商")
+    )
+    product_marked = any(
+        token in folded
+        for token in ("product", "platform", "产品", "平台", "型号")
+    )
+    if vendor_marked and product_marked:
+        return "vendor_product"
     if any(token in folded for token in ("specification", "规格", "参数", "型号")):
         return "product_specification"
     if any(token in folded for token in ("compare", "versus", "领先", "优于", "比较")):
@@ -268,6 +480,7 @@ def source_role_fits_claim(*, claim_type: str, source_role: str) -> bool:
         "market_statistic": {"government", "academic", "independent_research", "association"},
         "academic_performance": {"academic", "independent_research"},
         "product_specification": {"manufacturer", "standard", "government"},
+        "vendor_product": {"manufacturer"},
         "comparative": {"academic", "independent_research", "government", "standard"},
         "numeric": {"government", "academic", "standard", "manufacturer", "independent_research"},
         "factual": {
@@ -286,16 +499,38 @@ def source_role_fits_claim(*, claim_type: str, source_role: str) -> bool:
 def claim_quote_entails(claim: str, quote: str) -> bool:
     claim_tokens = _tokens(claim)
     quote_tokens = _tokens(quote)
-    lexical = len(claim_tokens & quote_tokens) / max(1, min(10, len(claim_tokens)))
     claim_numbers = {_scope_number(item) for item in _NUMBER_RE.findall(claim)}
     quote_numbers = {_scope_number(item) for item in _NUMBER_RE.findall(quote)}
+    if _different_dominant_scripts(claim, quote):
+        # A lexical entailment check is undefined for a translated claim and
+        # its source-language quotation.  This path is reached only after the
+        # caller has proved that the quotation occurs in the fetched source;
+        # keep numeric assertions strict and let the existing relevance,
+        # confidence, role and score gates validate the extracted card.
+        return bool(quote_tokens) and claim_numbers.issubset(quote_numbers)
+    lexical = len(claim_tokens & quote_tokens) / max(1, min(10, len(claim_tokens)))
     return lexical >= 0.45 and claim_numbers.issubset(quote_numbers)
+
+
+def _different_dominant_scripts(left: str, right: str) -> bool:
+    def profile(value: str) -> tuple[int, int]:
+        cjk = sum("\u3400" <= character <= "\u9fff" for character in value)
+        latin = sum("a" <= character.casefold() <= "z" for character in value)
+        return cjk, latin
+
+    left_cjk, left_latin = profile(left)
+    right_cjk, right_latin = profile(right)
+    return (left_cjk >= 2 and right_latin >= 4 and right_cjk < 2) or (
+        right_cjk >= 2 and left_latin >= 4 and left_cjk < 2
+    )
 
 
 def numeric_scope_consistent(*, criterion: str, claim: str, quote: str) -> bool:
     observed_text = f"{claim}\n{quote}"
     required = {_scope_number(item) for item in _NUMBER_RE.findall(criterion)}
     observed = {_scope_number(item) for item in _NUMBER_RE.findall(observed_text)}
+    if not required:
+        return True
     if required and not required.issubset(observed):
         return False
 
@@ -359,7 +594,10 @@ def _traceability_markers(value: str) -> int:
 
 
 def _normalize_number(value: str) -> str:
-    return "".join(value.casefold().replace("\uff0c", ",").split())
+    compact = "".join(value.casefold().replace("\uff0c", ",").split())
+    # Treat a comma followed by a three-digit group as a thousands separator;
+    # retain decimal commas such as 1,5 for locales that use them.
+    return re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", compact)
 
 
 def _scope_number(value: str) -> tuple[str, str]:

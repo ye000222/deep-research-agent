@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     app_name: str = "DeepResearch Agent"
     app_env: str = "development"
-    app_version: str = "0.1.0"
+    app_version: str = "1.1.0-rc.1"
     source_revision: str = "development"
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
@@ -37,6 +37,43 @@ class Settings(BaseSettings):
     )
     redis_url: str = "redis://localhost:6379/0"
     searxng_base_url: str = "http://localhost:8080"
+    # Phase 12.4 provider pool. Brave is registered as a first-priority
+    # provider only when an API key is present; otherwise it is omitted from
+    # the registry. DuckDuckGo is a key-free fallback provider used in
+    # development / benchmark runs and can be disabled via configuration.
+    brave_api_key: SecretStr | None = None
+    duckduckgo_enabled: bool = True
+    # Phase 14.3 A/B switch: controls ONLY whether the Research Loop applies
+    # the Phase 14.2 ResearchContextEnricher transformation to SearchTarget
+    # queries.  Disabled keeps the Planner -> SearchTarget -> Provider path
+    # byte-identical to the Phase 12.4 baseline (no enrichment, no event).
+    # Phase 14.5 closeout: the 14.3 A/B showed no quality gain and 14.4
+    # attribution showed hint overlap 1.0 with the 14.1 candidate path, so the
+    # V1 default is disabled.  The flag stays available for experiments.
+    evidence_aware_context_enabled: bool = False
+    # Phase 15.1 Branch B targeting is part of the frozen V1 RC reference
+    # configuration. Explicitly set false only for historical/A-B runs.
+    # It controls ONLY whether a still-open
+    # independent-source / claim-verification requirement, after Branch A's
+    # identity-correct closure, carries its already-counted source *owners*
+    # (canonical registrable domains) as exclusion metadata so a follow-up query
+    # targets a genuinely NEW publisher and post-search candidates are scored for
+    # requirement-scoped independence. This is a *declared experiment factor*
+    # (see app.domain.benchmark_comparability), not baseline identity.
+    independent_source_targeting_enabled: bool = True
+    # Phase 15.2 experiment factor.  False preserves Phase 15.1 extraction
+    # behavior; true enables claim-aware input preparation and diagnostics.
+    evidence_input_quality_enabled: bool = False
+    # Consecutive failed cooldown re-probes before a provider is disabled for
+    # the whole run (bounds the probe -> fail -> probe loop).
+    provider_max_probe_failures: int = Field(default=3, ge=1)
+    # Optional Docker-reachable egress proxy for external model providers.
+    # Search traffic has its own SearXNG proxy configuration.
+    model_http_proxy: str | None = None
+    # Optional Docker-reachable egress proxy for public page reads.  Keep this
+    # separate from model_http_proxy: model and web traffic may intentionally
+    # use different routes (for example, direct model access plus proxied web).
+    public_web_http_proxy: str | None = None
     artifact_root: Path = Path("artifacts")
 
     langgraph_strict_msgpack: bool = True

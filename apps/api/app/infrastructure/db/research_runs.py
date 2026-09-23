@@ -25,6 +25,7 @@ from app.domain.research_budget import (
     model_token_pool_limits,
 )
 from app.domain.research_runs import (
+    EXECUTION_LEASE_SECONDS,
     TERMINAL_RUN_STATUSES,
     AgentEventView,
     ResearchRunView,
@@ -39,10 +40,47 @@ from app.infrastructure.db.run_models import (
     TaskDispatchOutboxRow,
 )
 
-_MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS = (30, 120, 600, 1800)
+_MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS = (30, 60, 120, 240)
 _MODEL_TRANSPORT_RETRY_PENDING = "model_transport_retry_pending"
-_SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS = (30, 120, 600, 1800)
+_SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS = (30, 60, 120, 240)
 _SEARCH_TRANSPORT_RETRY_PENDING = "search_transport_retry_pending"
+_RETRY_COMPLETION_RESERVE_SECONDS = 45
+_MIN_DURABLE_RETRY_DELAY_SECONDS = 5
+
+
+def _bounded_retry_delay(
+    budget_snapshot: Mapping[str, object],
+    requested_delay_seconds: int,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    """Keep a durable retry inside the run deadline with time left to finish.
+
+    A retry scheduled after ``deadline_at`` can never improve the research run;
+    it only leaves the UI queued for minutes before the graph immediately hits
+    its deadline. Preserve a small completion window for evaluation/reporting
+    and shorten the backoff when the remaining wall-clock budget is tight.
+    """
+
+    raw_deadline = budget_snapshot.get("deadline_at")
+    if not isinstance(raw_deadline, str) or not raw_deadline.strip():
+        return max(_MIN_DURABLE_RETRY_DELAY_SECONDS, requested_delay_seconds)
+    try:
+        deadline = datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
+    except ValueError:
+        return max(_MIN_DURABLE_RETRY_DELAY_SECONDS, requested_delay_seconds)
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
+    latest_retry_delay = int(
+        (deadline.astimezone(UTC) - current.astimezone(UTC)).total_seconds()
+    ) - _RETRY_COMPLETION_RESERVE_SECONDS
+    if latest_retry_delay < _MIN_DURABLE_RETRY_DELAY_SECONDS:
+        return None
+    return min(
+        max(_MIN_DURABLE_RETRY_DELAY_SECONDS, requested_delay_seconds),
+        latest_retry_delay,
+    )
 
 
 def _reset_plan_scoped_question_budget(
@@ -57,6 +95,7 @@ def _reset_plan_scoped_question_budget(
     clearing the whole map lets unrelated questions re-enter repeatedly.
     """
     usage = dict(usage_snapshot)
+    usage.pop("replan_requested", None)
     for field in (
         "question_budget_exhausted_by_question",
         "query_strategy_exhausted_by_question",
@@ -80,6 +119,26 @@ def _reset_plan_scoped_question_budget(
                 usage[field] = remaining
             else:
                 usage.pop(field, None)
+    families = usage.get("executed_query_families_by_question")
+    if isinstance(families, dict) and reset_question_ids:
+        # Family exhaustion is scoped to one plan version. Replanning changes
+        # the query anchors; exact duplicates remain blocked by the database
+        # hash constraint and run-level query/provider ceilings still bound
+        # the total number of rotations.
+        remaining_families = dict(families)
+        for question_id in reset_question_ids:
+            remaining_families.pop(question_id, None)
+        if remaining_families:
+            usage["executed_query_families_by_question"] = remaining_families
+        else:
+            usage.pop("executed_query_families_by_question", None)
+    frozen_raw = usage.get("frozen_questions")
+    if isinstance(frozen_raw, list) and reset_question_ids:
+        usage["frozen_questions"] = [
+            question_id
+            for question_id in frozen_raw
+            if str(question_id) not in reset_question_ids
+        ]
     return usage
 
 
@@ -516,17 +575,20 @@ class ResearchRunRepository:
                 else [],
             )
 
-    async def get_plan_for_execution(self, run_id: UUID) -> ResearchPlan | None:
+    async def get_plan_for_execution(
+        self, run_id: UUID, *, plan_version: int | None = None
+    ) -> ResearchPlan | None:
         async with self._sessions() as session:
             run = await session.get(ResearchRunRow, run_id)
             if run is None or run.plan_version < 1:
                 return None
+            selected_version = plan_version or run.plan_version
             rows = (
                 await session.scalars(
                     select(ResearchPlanItemRow)
                     .where(
                         ResearchPlanItemRow.run_id == run_id,
-                        ResearchPlanItemRow.plan_version == run.plan_version,
+                        ResearchPlanItemRow.plan_version == selected_version,
                     )
                     .order_by(ResearchPlanItemRow.priority, ResearchPlanItemRow.question_id)
                 )
@@ -552,12 +614,21 @@ class ResearchRunRepository:
                 else [],
             )
 
+    async def get_budget_snapshot_for_execution(self, run_id: UUID) -> dict[str, object]:
+        """Read the persisted run budget for internal graph decisions."""
+
+        async with self._sessions() as session:
+            run = await session.get(ResearchRunRow, run_id)
+            if run is None:
+                return {}
+            return dict(run.budget_snapshot)
+
     async def acquire_for_execution(
         self,
         run_id: UUID,
         *,
         worker_task_id: str,
-        lease_seconds: int = 300,
+        lease_seconds: int = EXECUTION_LEASE_SECONDS,
     ) -> bool:
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
@@ -623,6 +694,35 @@ class ResearchRunRepository:
                 },
                 metrics=None,
             )
+            return True
+
+    async def renew_execution_lease(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        lease_seconds: int = EXECUTION_LEASE_SECONDS,
+    ) -> bool:
+        """Extend a live worker lease while a graph invocation is in flight."""
+
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
+            )
+            now = datetime.now(UTC)
+            if (
+                run is None
+                or run.status != RunStatus.RUNNING.value
+                or run.worker_task_id != worker_task_id
+                # A delayed heartbeat must not resurrect an already stale
+                # execution.  Let the reconciler's takeover remain the sole
+                # owner transition once the lease deadline has passed.
+                or run.lease_until is None
+                or run.lease_until <= now
+            ):
+                return False
+            run.lease_until = now + timedelta(seconds=max(60, lease_seconds))
+            run.updated_at = now
             return True
 
     async def reconcile_expired_leases(self, *, limit: int = 100) -> list[UUID]:
@@ -921,7 +1021,11 @@ class ResearchRunRepository:
                         evidence_requirements=requirements,
                         search_hints=hints,
                     )
-                    hints = build_gap_resolution_hints(question, reasons)
+                    hints = build_gap_resolution_hints(
+                        question,
+                        reasons,
+                        rotation=plan_version,
+                    )
                     status = "pending"
                     reset_ids.append(row.question_id)
                 session.add(
@@ -1085,7 +1189,7 @@ class ResearchRunRepository:
             run.budget_snapshot = {**run.budget_snapshot, "allocation": allocation}
             updated_usage = _reset_plan_scoped_question_budget(
                 run.usage_snapshot,
-                reset_question_ids=tuple(question.id for question in additions),
+                reset_question_ids=tuple(question.id for question in revised.questions),
             )
             updated_usage["resource_pools"] = build_resource_pool_snapshot(
                 run.budget_snapshot, updated_usage
@@ -1224,7 +1328,7 @@ class ResearchRunRepository:
                 return False
             now = datetime.now(UTC)
             run.updated_at = now
-            run.lease_until = now + timedelta(seconds=300)
+            run.lease_until = now + timedelta(seconds=EXECUTION_LEASE_SECONDS)
             run.state_version += 1
             await self._append_event(
                 session,
@@ -1289,9 +1393,15 @@ class ResearchRunRepository:
             if completed_requeues >= len(_MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS):
                 return None
 
-            delay_seconds = _MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS[completed_requeues]
-            requeue_attempt = completed_requeues + 1
             now = datetime.now(UTC)
+            delay_seconds = _bounded_retry_delay(
+                run.budget_snapshot,
+                _MODEL_TRANSPORT_REQUEUE_DELAYS_SECONDS[completed_requeues],
+                now=now,
+            )
+            if delay_seconds is None:
+                return None
+            requeue_attempt = completed_requeues + 1
             retry_at = now + timedelta(seconds=delay_seconds)
             usage["model_transport_requeues"] = requeue_attempt
             usage["model_transport_retry_phase"] = retry_phase
@@ -1386,9 +1496,15 @@ class ResearchRunRepository:
             if completed_requeues >= len(_SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS):
                 return None
 
-            delay_seconds = _SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS[completed_requeues]
-            requeue_attempt = completed_requeues + 1
             now = datetime.now(UTC)
+            delay_seconds = _bounded_retry_delay(
+                run.budget_snapshot,
+                _SEARCH_TRANSPORT_REQUEUE_DELAYS_SECONDS[completed_requeues],
+                now=now,
+            )
+            if delay_seconds is None:
+                return None
+            requeue_attempt = completed_requeues + 1
             retry_at = now + timedelta(seconds=delay_seconds)
             usage["search_transport_requeues"] = requeue_attempt
             usage["search_transport_retry_phase"] = retry_phase

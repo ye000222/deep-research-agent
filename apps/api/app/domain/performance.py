@@ -51,6 +51,13 @@ def summarize_performance(
     pages_extracted = number(usage.get("pages_extracted", usage.get("pages", 0)))
     logical_queries = number(usage.get("logical_queries", usage.get("searches", 0)))
     provider_requests = number(usage.get("search_provider_requests", 0))
+    healthy_provider_responses = number(usage.get("search_provider_healthy_responses", 0))
+    productive_provider_responses = number(
+        usage.get("search_provider_productive_responses", 0)
+    )
+    unresponsive_provider_responses = number(
+        usage.get("search_provider_unresponsive_responses", 0)
+    )
     zero_yield = number(usage.get("zero_yield_pages", 0))
     accepted_evidence = number(usage.get("accepted_evidence", 0))
     quality = run.quality_snapshot
@@ -93,6 +100,14 @@ def summarize_performance(
         "pages_extracted": pages_extracted,
         "logical_queries": logical_queries,
         "provider_requests": provider_requests,
+        "healthy_provider_responses": healthy_provider_responses,
+        "productive_provider_responses": productive_provider_responses,
+        "unresponsive_provider_responses": unresponsive_provider_responses,
+        "productive_provider_response_rate": (
+            round(productive_provider_responses / provider_requests, 4)
+            if provider_requests
+            else None
+        ),
         "pages_per_logical_query": round(pages_fetched / logical_queries, 4)
         if logical_queries
         else None,

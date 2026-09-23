@@ -1,0 +1,206 @@
+{
+  "schema_version": "1.1",
+  "generated_at": "2026-09-23",
+  "previous_release": "v1.0.0",
+  "release_version_target": "v1.1.0",
+  "release_candidate_version": "v1.1.0-rc.1",
+  "release_decision": "V1.1.0 RELEASE READY WITH KNOWN RESEARCH VARIANCE",
+  "publication_state_authority": "Remote Git tag and hosting release metadata",
+  "historical_audit_snapshot": {
+    "commit": "3201b7c8457f6163586751d0b7e5a080c54967d9",
+    "meaning": "The original inventory below records the pre-candidate dirty workspace and is preserved as historical audit evidence. Its uncommitted-source/migration conclusions are superseded by the reproducibility closeout candidate evidence; do not treat those statuses as current.",
+    "superseded_by_candidate_commit": "466eefd301a6dfa24e39b58d0cf50a1b8c59a037"
+  },
+  "closeout_current": {
+    "candidate_commit": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "validated_base_sha": "466eefd301a6dfa24e39b58d0cf50a1b8c59a037",
+    "candidate_worktree_clean": true,
+    "release_required_files_committed": 166,
+    "migration_head": "20260918_0025",
+    "migration_chain_from_20260912_0023": "PASS",
+    "source_revision_aligned_across_launcher_and_services": true,
+    "clean_candidate_docker_build_and_start": "PASS",
+    "success_path_smoke_run_id": "01a0cdb6-4548-7d7c-a2c8-e9e86e665896",
+    "success_path_smoke_status": "FAIL",
+    "accepted_evidence": 0,
+    "verified_report_id": null,
+    "report_reason": "REPORT_NO_ACCEPTED_EVIDENCE; no report persisted by design",
+    "remaining_p0": false,
+    "accepted_p1": [
+      "One historical non-allow-listed Phase 15.2 analysis script has 3 existing MyPy errors and was excluded from maintained release-script checks."
+    ],
+    "publication_tracking": "Maintained by remote Git tag and hosting release metadata"
+  },
+  "git": {
+    "commit": "3201b7c8457f6163586751d0b7e5a080c54967d9",
+    "branch": "rescue/v1-before-closeout",
+    "working_tree": "dirty",
+    "staged_files": 0,
+    "porcelain_entries_at_audit": 182,
+    "tracked_modified_files": [
+      ".env.example", ".gitignore", "README.md", "apps/api/app/core/config.py",
+      "apps/api/app/domain/research_budget.py", "apps/api/app/domain/research_tools.py",
+      "apps/api/app/infrastructure/db/research_models.py", "apps/api/app/infrastructure/db/research_tools.py",
+      "apps/api/app/services/evidence_extractor.py", "apps/api/app/services/research_loop.py",
+      "apps/api/app/services/research_runs.py", "apps/api/app/tools/web_reader.py",
+      "apps/api/app/tools/web_search.py", "apps/api/app/worker/tasks.py", "apps/web/package.json",
+      "docker-compose.yml", "pyproject.toml", "scripts/__init__.py",
+      "tests/unit/test_evidence_extractor.py", "tests/unit/test_research_loop.py",
+      "tests/unit/test_search_provider_degraded_regression.py"
+    ],
+    "staged_paths": []
+  },
+  "release_inventory": [
+    {
+      "category": "Source Code",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "INCOMPLETE_UNCOMMITTED",
+      "why": "Current release candidate behavior depends on modified tracked files and many untracked domain/service files; these are not represented by the recorded Git commit.",
+      "paths": [
+        "apps/api/app/core/config.py", "apps/api/app/domain/research_budget.py", "apps/api/app/domain/research_tools.py",
+        "apps/api/app/infrastructure/db/research_models.py", "apps/api/app/infrastructure/db/research_tools.py",
+        "apps/api/app/services/evidence_extractor.py", "apps/api/app/services/research_loop.py",
+        "apps/api/app/services/research_runs.py", "apps/api/app/tools/web_reader.py", "apps/api/app/tools/web_search.py",
+        "apps/api/app/worker/tasks.py", "apps/api/app/domain/benchmark_comparability.py",
+        "apps/api/app/domain/claim_verification_analyzer.py", "apps/api/app/domain/closure_evaluation_context.py",
+        "apps/api/app/domain/closure_evaluator.py", "apps/api/app/domain/closure_feedback.py",
+        "apps/api/app/domain/closure_feedback_completeness.py", "apps/api/app/domain/closure_feedback_completeness_pass.py",
+        "apps/api/app/domain/closure_feedback_dispatcher.py", "apps/api/app/domain/evidence_alignment.py",
+        "apps/api/app/domain/evidence_alignment_executor.py", "apps/api/app/domain/evidence_alignment_request.py",
+        "apps/api/app/domain/evidence_extraction_request.py", "apps/api/app/domain/evidence_extractor.py",
+        "apps/api/app/domain/evidence_failure_classification.py", "apps/api/app/domain/evidence_input_quality.py",
+        "apps/api/app/domain/evidence_quality_analyzer.py", "apps/api/app/domain/evidence_routing.py",
+        "apps/api/app/domain/feedback_execution.py", "apps/api/app/domain/feedback_query_executor_adapter.py",
+        "apps/api/app/domain/gap_closure.py", "apps/api/app/domain/gap_projection.py",
+        "apps/api/app/domain/golden_baseline.py", "apps/api/app/domain/provider_adapter.py",
+        "apps/api/app/domain/provider_executor.py", "apps/api/app/domain/provider_failure_classification.py",
+        "apps/api/app/domain/provider_health.py", "apps/api/app/domain/provider_registry.py",
+        "apps/api/app/domain/provider_router.py", "apps/api/app/domain/query_candidate.py",
+        "apps/api/app/domain/query_candidate_ranking.py", "apps/api/app/domain/query_candidate_validation.py",
+        "apps/api/app/domain/query_execution.py", "apps/api/app/domain/query_executor.py",
+        "apps/api/app/domain/query_plan_validation.py", "apps/api/app/domain/question_research_state.py",
+        "apps/api/app/domain/reader_executor.py", "apps/api/app/domain/reader_request.py",
+        "apps/api/app/domain/recovery_execution.py", "apps/api/app/domain/recovery_trace.py",
+        "apps/api/app/domain/recovery_trace_collector.py", "apps/api/app/domain/research_action.py",
+        "apps/api/app/domain/research_context.py", "apps/api/app/domain/research_context_enricher.py",
+        "apps/api/app/domain/research_context_resolver.py", "apps/api/app/domain/research_need.py",
+        "apps/api/app/domain/research_need_refinement.py", "apps/api/app/domain/research_query_intent.py",
+        "apps/api/app/domain/research_query_plan.py", "apps/api/app/domain/run_closure_feedback_finalizer.py",
+        "apps/api/app/domain/search_result_alignment.py", "apps/api/app/infrastructure/db/gap_backfill.py",
+        "apps/api/app/infrastructure/db/gap_requirements.py", "apps/api/app/tools/brave_search.py",
+        "apps/api/app/tools/duckduckgo_search.py", "apps/api/app/tools/provider_adapters.py",
+        "apps/api/app/cli/start_golden_baseline_run.py"
+      ]
+    },
+    {
+      "category": "Database Migrations",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "P0_UNCOMMITTED_SCHEMA_DEPENDENCY",
+      "why": "Runtime database is at 20260918_0025, but both migration revisions are untracked and absent from commit 3201b7c; a clean checkout cannot recreate the runtime schema.",
+      "paths": ["apps/api/alembic/versions/20260918_0024_gap_requirements.py", "apps/api/alembic/versions/20260918_0025_gap_requirement_migration_source.py"]
+    },
+    {
+      "category": "Docker / Runtime Config",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "CONFIG_VALID_DIRTY",
+      "why": "Compose resolves and services are running; Compose and frozen feature-flag wiring are modified but uncommitted.",
+      "paths": ["docker-compose.yml", ".dockerignore", ".env.example", "infra/docker", "infra/postgres", "infra/searxng"]
+    },
+    {
+      "category": ".env.example",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "FROZEN_FLAGS_DOCUMENTED",
+      "why": "Template contains RC version and frozen flags; local credentials are not included. Duplicate evidence-aware flag was removed."
+    },
+    {
+      "category": "README / Documentation",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "UPDATED_UNCOMMITTED",
+      "why": "README now documents prerequisites, configuration, Compose startup, Run/status/report APIs, testing and benchmark entry points.",
+      "paths": ["README.md", "docs/adr/0003-evidence-aware-main-path-enrichment.md", "docs/architecture/0004-phase14-closeout-baseline-governance.md"]
+    },
+    {
+      "category": "Benchmark Definitions",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "UNTRACKED",
+      "why": "Golden baseline manifest is untracked and must be reviewed/included if retained as maintained V1 benchmark tooling.",
+      "paths": ["evals/benchmarks/v1_golden_baseline.v1.json"]
+    },
+    {
+      "category": "Release Gate Artifacts",
+      "classification": "RELEASE_ARTIFACT",
+      "v1": true,
+      "status": "GENERATED_IGNORED_RULES_UPDATED",
+      "why": "Final inventory, manifest, notes, known issues, and gate are selectively allow-listed; historical Phase 17 evidence is selectively allow-listed.",
+      "paths": ["artifacts/v1_release_inventory.json", "artifacts/v1_release_inventory.md", "artifacts/v1_release_manifest.json", "artifacts/v1_release_manifest.md", "artifacts/v1_release_notes.md", "artifacts/v1_known_issues.md", "artifacts/v1_final_release_gate.json", "artifacts/v1_final_release_gate.md"]
+    },
+    {
+      "category": "Known Issues",
+      "classification": "RELEASE_ARTIFACT",
+      "v1": true,
+      "status": "FROZEN_WITH_V1_ITEMS",
+      "why": "Contains required non-blocking limitations and feature classification; lease handoff is not listed as a blocker.",
+      "paths": ["artifacts/v1_known_issues.md"]
+    },
+    {
+      "category": "Evaluation / Provenance Artifacts",
+      "classification": "HISTORICAL_EVAL_ARTIFACT",
+      "v1": "reference_only",
+      "status": "PRESERVED",
+      "why": "Retained as qualification/provenance; do not use stale Phase 17.1 requirements-audit conclusions over the later corrected blocker-resolution artifact.",
+      "paths": ["artifacts/phase15_1_candidate_n3.json", "artifacts/phase15_2_corrected_final_report.json", "artifacts/phase16_hard_gap_audit.json", "artifacts/phase17_1_rc_blocker_resolution.json", "artifacts/phase17_1_requirements_audit.json", "artifacts/phase17_cross_benchmark_results.json", "artifacts/phase17_release_qualification_decision.json", "artifacts/phase17_release_quality_scorecard.json", "artifacts/phase17_stability_analysis.json"]
+    },
+    {
+      "category": "Development Tooling",
+      "classification": "DEV_TOOLING",
+      "v1": "selected scripts only after review",
+      "status": "MIXED_UNTRACKED",
+      "why": "Release/analysis scripts are currently untracked; historical one-off analyzers are not automatically part of runtime packaging. scripts/correct_phase15_2_comparability.py is HISTORICAL_ANALYSIS_TOOL and remains explicitly excluded only for E501/I001.",
+      "paths": ["scripts/release_gate.py", "scripts/analyze_phase17_1_rc.py", "scripts/analyze_phase17_release_quality.py", "scripts/start_phase17_screening.py", "scripts/correct_phase15_2_comparability.py", "scripts/analyze_gap_closure_bottleneck.py", "scripts/analyze_historical_baseline_regression.py", "scripts/analyze_phase14_3_ab.py", "scripts/analyze_phase14_4_enrichment_attribution.py", "scripts/analyze_phase15_1_source_independence.py", "scripts/analyze_phase15_2_evidence_input_quality.py", "scripts/analyze_phase15_conversion_funnel.py", "scripts/analyze_phase16_hard_gap_audit.py", "scripts/analyze_recovery_trace.py", "scripts/backfill_gap_requirements.py", "scripts/build_v1_golden_baseline_snapshot.py", "scripts/cancel_phase17_invalid_runs.py", "scripts/set_phase14_3_experiment_mode.py", "scripts/verify_evidence_analysis_chain.py"]
+    },
+    {
+      "category": "Tests",
+      "classification": "RELEASE_REQUIRED",
+      "v1": true,
+      "status": "UNTRACKED_TESTS_PRESENT",
+      "why": "Full pytest passes against current working tree, but new tests are not in the recorded commit and therefore are not reproducible from it.",
+      "path_prefixes": ["tests/unit/"]
+    },
+    {
+      "category": "Temporary Files",
+      "classification": "TEMPORARY",
+      "v1": false,
+      "status": "PRESERVE_UNTIL_OWNER_REVIEW",
+      "why": "Do not delete without confirming ownership/use; exclude from release source package.",
+      "paths": ["pytest_all.txt", "pytest_disp.txt", "pytest_p33.txt", "phase记录.md"]
+    },
+    {
+      "category": "Local Only / Secret",
+      "classification": "LOCAL_ONLY / SECRET / MUST_NOT_RELEASE",
+      "v1": false,
+      "status": "IGNORED",
+      "why": "Local .env and artifacts/.secrets are ignored; no secret material was found in the release text tree.",
+      "paths": [".env", "artifacts/.secrets/", ".venv/", "node_modules/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", "build/", "apps/web/dist/"]
+    },
+    {
+      "category": "Unclassified / Unknown",
+      "classification": "UNKNOWN",
+      "v1": false,
+      "status": "DO_NOT_DELETE",
+      "why": "Root-level historical notes, screenshots, and local evaluation captures remain preserved until owner classification.",
+      "paths": ["*.txt historical project notes", "artifacts/*.png", "artifacts/*.local.json", "artifacts/release_gate.local.json"]
+    }
+  ],
+  "gate_notes": [
+    "The legacy inventory rows below describe the pre-candidate audit state and are retained for provenance; current disposition is recorded in closeout_current and the final release gate.",
+    "The candidate worktree was clean. The primary workspace retains excluded local/history files without deleting UNKNOWN material.",
+    "The legacy inventory rows below are point-in-time pre-candidate evidence; current release disposition is recorded in closeout_current and the final release gate.",
+    "Publication state is authoritative in remote Git and hosting release metadata; this inventory is not a live publication-status tracker."
+  ]
+}

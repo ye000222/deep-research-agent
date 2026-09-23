@@ -45,6 +45,51 @@ class ResearchGapRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GapRequirementRow(Base):
+    """Canonical persisted GapRequirement state.
+
+    ``ResearchGapRow`` remains a legacy projection for existing foreign keys;
+    this table owns versioned requirement state for all new writes.
+    """
+
+    __tablename__ = "gap_requirements"
+    __table_args__ = (
+        Index(
+            "uq_gap_requirement_dimension",
+            "run_id",
+            "plan_version",
+            "dimension_key",
+            unique=True,
+        ),
+        Index("ix_gap_requirements_run_status", "run_id", "closure_status"),
+    )
+
+    gap_id: Mapped[UUID] = mapped_column(SQLUuid(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        SQLUuid(as_uuid=True),
+        ForeignKey("research_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    dimension_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    requirement_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    criterion: Mapped[str] = mapped_column(Text, nullable=False)
+    required_evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    required_independent_sources: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_independent_sources: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_coverage: Mapped[float] = mapped_column(Float, nullable=False)
+    required_coverage: Mapped[float | None] = mapped_column(Float)
+    verification_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    closure_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    transition_reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    migration_source: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ResearchToolCallRow(Base):
     __tablename__ = "research_tool_calls"
     __table_args__ = (

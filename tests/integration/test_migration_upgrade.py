@@ -9,6 +9,8 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy.engine import make_url
 
 pytestmark = pytest.mark.skipif(
@@ -17,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ALEMBIC_CONFIG = Config(os.path.join(ROOT, "alembic.ini"))
 
 
 def test_clean_database_upgrades_to_current_head() -> None:
@@ -63,7 +66,8 @@ def test_clean_database_upgrades_to_current_head() -> None:
         with psycopg.connect(target_dsn) as target:
             revision = target.execute("SELECT version_num FROM alembic_version").fetchone()
         assert revision is not None
-        assert revision[0] == "20260912_0023"
+        expected_head = ScriptDirectory.from_config(ALEMBIC_CONFIG).get_current_head()
+        assert revision[0] == expected_head
     finally:
         with psycopg.connect(admin_dsn, autocommit=True) as admin:
             admin.execute(

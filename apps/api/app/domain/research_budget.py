@@ -5,6 +5,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from app.domain.question_research_state import (
+    QuestionResearchState,
+    RecoveryEligibilityState,
+    ResearchOpportunityState,
+)
+
 ModelTokenPool = Literal["planner", "research", "verification", "writer", "safety"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
 RiskLifecycle = Literal["open", "mitigating", "blocked", "resolved"]
@@ -316,6 +322,13 @@ def build_resource_pool_snapshot(
             "pages",
             "max_pages_fetched",
             "pages_fetched",
+            "page_slots_reserved",
+        ),
+        (
+            "page_fetch_attempts",
+            "attempts",
+            "max_page_fetch_attempts",
+            "page_fetch_attempts",
             "page_slots_reserved",
         ),
         (
@@ -689,27 +702,95 @@ def decide_question_borrow(
     *,
     state: QuestionRiskState,
     all_first_passes_complete: bool,
+    research_state: QuestionResearchState | None = None,
     projected_spend: int,
     target_tokens: int,
     expected_utility: float,
     low_gain_streak: int,
+    has_untried_query_family: bool = False,
     utility_threshold: float = 0.005,
 ) -> QuestionBorrowDecision:
-    """Apply the V2 first-pass, risk, utility, and 150% borrowing contract."""
+    """Apply the V2 first-pass, state, risk, utility, and cap contract."""
 
     target_tokens = max(0, int(target_tokens))
     projected_spend = max(0, int(projected_spend))
     if projected_spend <= target_tokens:
         return QuestionBorrowDecision(True, "within_question_target")
-    if not all_first_passes_complete:
-        return QuestionBorrowDecision(False, "first_pass_floor_protected")
+    if research_state is None:
+        if not all_first_passes_complete:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+    else:
+        if research_state.research_opportunity == ResearchOpportunityState.NOT_STARTED:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+        if research_state.recovery_eligibility == RecoveryEligibilityState.NOT_EVALUATED:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+        if research_state.recovery_eligibility == RecoveryEligibilityState.DEFERRED:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+        if research_state.recovery_eligibility == RecoveryEligibilityState.DENIED:
+            return QuestionBorrowDecision(
+                False,
+                "recovery_ineligible",
+                freeze_question=True,
+            )
     borrow_cap = int(target_tokens * 1.5)
+    # A high-risk exception is a bounded recovery allowance, not a second
+    # unlimited budget.  Earlier versions let the exception bypass this cap
+    # entirely; one difficult P1 could then consume the whole research pool
+    # and starve unrelated questions.  Keep the normal 150% envelope, while
+    # allowing at most one additional half-target recovery window for a
+    # genuinely new query family.  The caller still enforces the run-level
+    # research pool and reservations remain the source of truth.
+    recovery_cap = int(target_tokens * 2.0)
     p1_high_risk_exception = state.priority == 1 and state.unresolved_high_risk
-    if projected_spend > borrow_cap and not p1_high_risk_exception:
+    # A high-risk question with an untried query family still has a bounded
+    # recovery action.  Permit that one additional family to draw from the
+    # global research pool instead of freezing it solely at the per-question
+    # 150% cap; the global pool and provider/page limits remain hard stops.
+    high_risk_recovery_exception = state.unresolved_high_risk and has_untried_query_family
+    # An acceptance gap is actionable even when the current evidence has not
+    # yet raised the question into the high-risk bucket.  Treating every such
+    # question as ``no_unresolved_high_risk_gap`` freezes ordinary P2/P3
+    # dimensions and can make the scheduler enter ``sources_exhausted`` while
+    # global search/page/token capacity is still available.
+    acceptance_gap_open = bool(state.gap_open or state.open_dimension_keys)
+    # Classify the gap before enforcing the per-question cap.  A fetched page
+    # for an open acceptance gap still needs an extractor call; rejecting it at
+    # 150% used to leave valid candidate pages unprocessed.  Recovery remains
+    # bounded by the low-gain guard below and by the run-level research pool.
+    acceptance_recovery_exception = acceptance_gap_open and has_untried_query_family
+    replanned_high_risk_exception = (
+        state.unresolved_high_risk
+        and acceptance_gap_open
+        and low_gain_streak < 2
+    )
+    recovery_exception = (
+        p1_high_risk_exception
+        or high_risk_recovery_exception
+        or acceptance_recovery_exception
+        or replanned_high_risk_exception
+    )
+    if projected_spend > borrow_cap and not recovery_exception:
         return QuestionBorrowDecision(False, "hard_question_token_limit", hard_limit=True)
-    if not state.unresolved_high_risk or not state.borrow_eligible:
+    if recovery_exception and projected_spend > recovery_cap:
+        return QuestionBorrowDecision(
+            False,
+            "bounded_recovery_limit",
+            hard_limit=True,
+            freeze_question=True,
+        )
+    if state.verification_state == "blocked":
+        return QuestionBorrowDecision(False, "verification_blocked", freeze_question=True)
+    if (not state.unresolved_high_risk and not acceptance_gap_open) or (
+        not state.borrow_eligible and not acceptance_gap_open
+    ):
         return QuestionBorrowDecision(False, "no_unresolved_high_risk_gap", freeze_question=True)
-    if low_gain_streak >= 2:
+    p1_recovery_variant = (
+        state.priority == 1
+        and state.unresolved_high_risk
+        and has_untried_query_family
+    )
+    acceptance_recovery_variant = acceptance_gap_open and has_untried_query_family
+    if low_gain_streak >= 2 and not (p1_recovery_variant or acceptance_recovery_variant):
         return QuestionBorrowDecision(False, "low_gain_streak", freeze_question=True)
     if expected_utility < utility_threshold:
         return QuestionBorrowDecision(

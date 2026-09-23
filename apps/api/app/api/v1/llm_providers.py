@@ -13,6 +13,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, SecretStr
 
+from app.core.config import Settings
 from app.domain.providers import (
     AdapterType,
     CanonicalModelRequest,
@@ -163,6 +164,7 @@ async def test_connection(payload: ConnectionTestRequest) -> ConnectionTestRespo
         context_manifest_id=uuid4(),
     )
     started = perf_counter()
+    settings = Settings()
     capabilities = CapabilityMatrix(
         basic_generation=False,
         structured_output=CapabilitySupport.UNKNOWN,
@@ -172,7 +174,11 @@ async def test_connection(payload: ConnectionTestRequest) -> ConnectionTestRespo
     )
     try:
         timeout = httpx.Timeout(30.0, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            proxy=settings.model_http_proxy or None,
+            trust_env=False,
+        ) as client:
             result = await LLMGateway(client).generate_structured(
                 adapter_type=payload.adapter_type,
                 base_url=payload.base_url.rstrip("/"),

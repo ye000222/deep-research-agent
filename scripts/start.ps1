@@ -88,41 +88,20 @@ function Invoke-DockerCompose {
 }
 
 function Get-SourceRevision {
-    $sourcePaths = @(
-        (Join-Path $Root "apps/api"),
-        (Join-Path $Root "apps/web/src"),
-        (Join-Path $Root "infra/docker"),
-        (Join-Path $Root "infra/searxng"),
-        (Join-Path $Root "docker-compose.yml"),
-        (Join-Path $Root "scripts/start.ps1"),
-        (Join-Path $Root "pyproject.toml"),
-        (Join-Path $Root "package.json"),
-        (Join-Path $Root "pnpm-lock.yaml")
-    )
-    $files = foreach ($path in $sourcePaths) {
-        if (Test-Path $path -PathType Container) {
-            Get-ChildItem $path -Recurse -File | Where-Object {
-                $_.FullName -notmatch "[\\/](__pycache__|dist)[\\/]"
-            }
-        } elseif (Test-Path $path -PathType Leaf) {
-            Get-Item $path
-        }
+    $revision = (& git -C $Root rev-parse --verify HEAD 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or $revision -notmatch "^[0-9a-f]{40}$") {
+        throw "Unable to determine the Git commit for SOURCE_REVISION."
     }
-    $manifest = $files |
-        Sort-Object FullName |
-        ForEach-Object {
-            $relative = $_.FullName.Substring($Root.Length).TrimStart([char[]]"\/")
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$relative=$hash"
-        }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($manifest -join "`n"))
-        $digest = $sha.ComputeHash($bytes)
-        return (-join ($digest | ForEach-Object { $_.ToString("x2") })).Substring(0, 12)
-    } finally {
-        $sha.Dispose()
+
+    $worktreeState = @(& git -C $Root status --porcelain --untracked-files=normal)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to determine whether the source worktree is clean."
     }
+    if ($worktreeState.Count -gt 0) {
+        return "$revision-dirty"
+    }
+
+    return $revision
 }
 
 function Wait-DockerEngine([int]$MaxSeconds = 120) {

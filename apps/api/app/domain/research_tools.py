@@ -76,6 +76,7 @@ class ScoredEvidence(BaseModel):
     evidence_score: float = Field(ge=0.0, le=1.0)
     accepted: bool
     rejection_reason: str | None = None
+    input_quality: dict[str, str] | None = None
 
 
 class EvidenceView(BaseModel):

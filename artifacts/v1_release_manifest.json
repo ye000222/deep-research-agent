@@ -1,0 +1,146 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-09-23",
+  "previous_release": "v1.0.0",
+  "release_version": "v1.1.0",
+  "release_candidate_version": "v1.1.0-rc.1",
+  "release_status": "V1.1.0 RELEASE READY WITH KNOWN RESEARCH VARIANCE",
+  "version_metadata_correction": {
+    "previous_release": "v1.0.0",
+    "release_version": "v1.1.0",
+    "candidate_version": "v1.1.0-rc.1",
+    "updated_in_working_tree": false,
+    "included_in_candidate_commit": true,
+    "runtime_rebuilt_after_correction": true,
+    "qualification_snapshot_scope": "Release qualification and runtime metadata correction record; publication state is maintained by remote Git and hosting release metadata."
+  },
+  "git": {
+    "commit_sha": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "validated_base_sha": "466eefd301a6dfa24e39b58d0cf50a1b8c59a037",
+    "branch": "detached clean candidate worktree",
+    "primary_workspace": "preserved local/history outputs and post-build audit artifacts remain untracked; not part of candidate commit",
+    "candidate_worktree": "clean",
+    "candidate_provenance": "FINAL RELEASE METADATA COMMIT; verified from isolated clean worktree",
+    "staged_files": 0,
+    "commit_file_count": 166
+  },
+  "reference_configuration": {
+    "reference_config_id": "v1-pre-rc-reference-1",
+    "tier": "standard",
+    "metric_definition_version": "coverage-v1",
+    "plan_policy": "frozen reference plan: questions=5, priority_one=4, priority_two=1",
+    "feature_flags": {
+      "evidence_aware_context_enabled": false,
+      "independent_source_targeting_enabled": true,
+      "evidence_input_quality_enabled": false
+    },
+    "feature_classification": {
+      "independent_source_targeting": "ACTIVE_V1",
+      "evidence_aware_context": "EXPERIMENTAL_DISABLED",
+      "evidence_input_quality": "EXPERIMENTAL_DISABLED"
+    },
+    "api_runtime_flags": "verified from running API Settings",
+    "worker_runtime_flags": "verified from running Worker Settings"
+  },
+  "runtime": {
+    "python_api": "3.12.14",
+    "python_worker": "3.12.14",
+    "api_reported_version": "1.1.0-rc.1",
+    "api_reported_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "worker_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "dispatcher_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "beat_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "web_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "launcher_reported_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "compose_config_sha256": "cc6e72913e7234155095681f73bf41a5f329b8376a4127febcbd008bf65b04d8",
+    "api_worker_image_id": "sha256:e1838d9c6580a22e45a8e9f4c72fadc4c5990a2b0fba6ebd706068030d2af4af",
+    "web_image_id": "sha256:7decfbc335b8501c58b01daf3f25a070f026fc49db1244895d4890eb7bc08aba",
+    "clean_no_cache_build": "PASS",
+    "compose_services": ["api", "worker", "dispatcher", "beat", "postgres", "redis", "searxng", "web"],
+    "api_healthz": "PASS",
+    "api_readyz": "PASS"
+  },
+  "database": {
+    "alembic_head": "20260918_0025",
+    "alembic_current": "20260918_0025",
+    "head_count": 1,
+    "pending_migrations": false,
+    "migration_files_in_git_commit": true,
+    "migration_gate": "PASS",
+    "clean_database_chain_test": {
+      "start_revision": "20260912_0023",
+      "applied_revisions": ["20260918_0024", "20260918_0025"],
+      "resulting_revision": "20260918_0025",
+      "single_head": true,
+      "gap_requirements_table": true,
+      "migration_source_column": true,
+      "temporary_database_dropped": true
+    }
+  },
+  "deployment_smoke": {
+    "run_id": "01a0cdb6-4548-7d7c-a2c8-e9e86e665896",
+    "run_label": "v1-1-final-candidate-smoke-20260923",
+    "task_source": "one fresh standard success-path deployment smoke using the exact goal and saved profile of previously successful standard smoke 01a0c9c9-f951-76f0-a801-a10b65806236; not a qualification benchmark run",
+    "tier": "standard",
+    "terminal_status": "failed",
+    "termination_reason": "REPORT_NO_ACCEPTED_EVIDENCE",
+    "runtime_seconds": 3710,
+    "search_queries_started": 19,
+    "searches_completed": 13,
+    "readable_sources": 31,
+    "evidence_extracted_events": 15,
+    "candidate_evidence": 0,
+    "accepted_evidence": 0,
+    "report_id": null,
+    "report_status": "not_created_by_no_accepted_evidence_invariant",
+    "report_persisted": false,
+    "report_fetched_via_application_service": false,
+    "report_verified": false,
+    "result": "FAIL_SUCCESS_PATH_SMOKE_NO_ACCEPTED_EVIDENCE_DEADLINE_EXHAUSTED",
+    "new_research_run_created": true,
+    "run_stamped_source_revision": "36c920f58196a258dbcc215f5f76aec9a0582243",
+    "run_stamped_tier": "standard",
+    "run_stamped_feature_flags": "not persisted as per-run fields; verified from API and Worker resolved settings",
+    "effective_feature_flags_verified_on_api_and_worker": {
+      "evidence_aware_context_enabled": false,
+      "independent_source_targeting_enabled": true,
+      "evidence_input_quality_enabled": false
+    },
+    "reference_config_id_in_run_snapshot": true,
+    "run_stamped_feature_flags": {
+      "evidence_aware_context_enabled": false,
+      "independent_source_targeting_enabled": true,
+      "evidence_input_quality_enabled": false
+    },
+    "deadline_at": "2026-09-23T11:01:09.616080+00:00",
+    "report_omission_is_expected_when_accepted_evidence_is_zero": true
+  },
+  "failure_path": {
+    "run_id": "01a0c9ad-2018-7730-a8ef-1066181f4cc7",
+    "accepted_evidence": 0,
+    "report_persisted": false,
+    "termination_reason": "REPORT_NO_ACCEPTED_EVIDENCE",
+    "result": "PASS_REUSED_PHASE17_1_EVIDENCE"
+  },
+  "quality_gates": {
+    "pytest_q": "PASS; 7 existing opt-in integration skips; non-failing warnings",
+    "ruff_check_all": "PASS",
+    "mypy_apps_api_app": "PASS; 173 source files",
+    "mypy_maintained_phase17_release_scripts": "PASS; 4 scripts",
+    "historical_script_exclusion": "scripts/correct_phase15_2_comparability.py excluded from release allowlist due 3 pre-existing MyPy errors",
+    "git_diff_check": "PASS; line-ending warnings only",
+    "secret_scan": "PASS; no high-confidence credentials in allow-listed release files"
+  },
+  "accepted_p1": [
+    "Smoke run snapshot omits reference_config_id and per-run feature flag values; effective flags were verified on API and Worker.",
+    "One historical, non-allow-listed Phase 15.2 analysis script has 3 existing MyPy errors and is excluded from maintained release-script checks."
+  ],
+  "artifacts": {
+    "inventory": "artifacts/v1_release_inventory.json",
+    "known_issues": "artifacts/v1_known_issues.md",
+    "release_notes": "artifacts/v1_release_notes.md",
+    "qualification": ["artifacts/v1_pre_rc_reference.json", "artifacts/phase17_cross_benchmark_results.json", "artifacts/phase17_release_qualification_decision.json", "artifacts/phase17_release_quality_scorecard.json", "artifacts/phase17_stability_analysis.json", "artifacts/phase17_1_rc_blocker_resolution.json"]
+  },
+  "release_gate": "V1.1.0 RELEASE READY WITH KNOWN RESEARCH VARIANCE; final-candidate live smoke yielded zero Accepted Evidence and correctly persisted no unsupported Report; variance audit found no confirmed configuration regression, correctness bug, or P0",
+  "publication_state_authority": "Remote Git tag and hosting release metadata"
+}

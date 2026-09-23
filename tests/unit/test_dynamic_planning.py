@@ -104,6 +104,81 @@ def test_gap_resolution_hints_target_independent_sources_without_new_question() 
     assert any("independent source" in hint for hint in hints)
 
 
+def test_gap_resolution_hints_preserve_compact_bilingual_topic_anchors() -> None:
+    question = _question("q1").model_copy(
+        update={
+            "question": "工业视觉缺陷检测中传统方法与深度学习路线分别是什么?",
+            "search_hints": [
+                "工业视觉缺陷检测 传统图像处理 深度学习",
+                "industrial visual defect detection traditional deep learning",
+            ],
+        }
+    )
+
+    first = build_gap_resolution_hints(question, ("缺少可验证网页原文证据",))
+    replanned = build_gap_resolution_hints(
+        question.model_copy(update={"search_hints": first}),
+        ("缺少第二个独立来源",),
+    )
+
+    assert replanned[0].startswith("工业视觉缺陷检测 传统图像处理 深度学习")
+    assert replanned[1].startswith(
+        "industrial visual defect detection traditional deep learning"
+    )
+    assert all("分别是什么" not in hint for hint in replanned)
+
+
+def test_gap_resolution_hints_do_not_accumulate_previous_search_suffixes() -> None:
+    question = _question("q5").model_copy(
+        update={
+            "question": (
+                "工业视觉缺陷检测领域有哪些代表性厂商与代表产品？"  # noqa: RUF001
+            ),
+            "search_hints": [
+                (
+                    "工业视觉缺陷检测 厂商 产品 方案 industry outlook adoption statistics "
+                    "manufacturer product page deployment"
+                ),
+                (
+                    "machine vision defect detection vendors products technical specification "
+                    "customer case field trial evaluation report"
+                ),
+            ],
+        }
+    )
+
+    hints = build_gap_resolution_hints(question, ("缺少可验证网页原文证据",), rotation=1)
+
+    assert hints[0].startswith("工业视觉缺陷检测 厂商 产品 方案")
+    assert "industry outlook" not in hints[0]
+    # The current rotation may intentionally add a new vendor-oriented suffix;
+    # the previous compound suffix must not remain in the topic anchor.
+    assert "adoption statistics" not in hints[0]
+    assert hints[1].startswith("machine vision defect detection vendors products")
+    assert "field trial evaluation report" not in hints[1]
+
+
+def test_gap_resolution_hints_strip_all_replan_audit_banks() -> None:
+    question = _question("q2").model_copy(
+        update={
+            "question": "全球工业视觉缺陷检测市场规模是多少？",  # noqa: RUF001
+            "search_hints": [
+                "全球工业视觉缺陷检测市场规模 2024 2026 government forecast primary data "
+                "government forecast primary data independent market report methodology"
+            ],
+        }
+    )
+
+    hints = build_gap_resolution_hints(
+        question,
+        ("至少两个独立来源给出规模数值",),
+        rotation=3,
+    )
+
+    assert all("government forecast primary data" not in hint.casefold() for hint in hints)
+    assert all("independent market report methodology" not in hint.casefold() for hint in hints)
+
+
 def _question(identifier: str) -> ResearchQuestion:
     return ResearchQuestion(
         id=identifier,

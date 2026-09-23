@@ -9,6 +9,7 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+coverage.xml
 
 # Node
 node_modules/
@@ -25,14 +26,46 @@ coverage/
 *.key
 
 # Runtime data
-artifacts/
+artifacts/*
+!artifacts/
+artifacts/.secrets/
+!artifacts/v1_release_inventory.json
+!artifacts/v1_release_inventory.md
+!artifacts/v1_release_required_files.json
+!artifacts/v1_release_required_files.md
+!artifacts/v1_release_manifest.json
+!artifacts/v1_release_manifest.md
+!artifacts/v1_release_notes.md
+!artifacts/v1_known_issues.md
+!artifacts/v1_final_release_gate.json
+!artifacts/v1_final_release_gate.md
+!artifacts/v1_pre_rc_reference.json
+!artifacts/v1_pre_rc_reference.md
+!artifacts/phase17_1_rc_blocker_resolution.json
+!artifacts/phase17_1_rc_blocker_resolution.md
+!artifacts/phase17_1_requirements_audit.json
+!artifacts/phase17_1_requirements_audit.md
+!artifacts/phase17_cross_benchmark_results.json
+!artifacts/phase17_cross_benchmark_results.md
+!artifacts/phase17_release_qualification_decision.json
+!artifacts/phase17_release_qualification_decision.md
+!artifacts/phase17_release_quality_scorecard.json
+!artifacts/phase17_release_quality_scorecard.md
+!artifacts/phase17_stability_analysis.json
+!artifacts/phase17_stability_analysis.md
 logs/
 tmp/
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+*.state
 .celerybeat-schedule
 
 # IDE / OS
 .idea/
 .vscode/
+.vs/
 .DS_Store
 Thumbs.db
 

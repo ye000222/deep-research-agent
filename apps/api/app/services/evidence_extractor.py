@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import unicodedata
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 
 from app.context.manager import ContextBudgetManager
 from app.context.source_selector import select_relevant_blocks
+from app.core.config import get_settings
 from app.domain.adaptive_scheduler import (
     claim_quote_entails,
     classify_source_role,
@@ -23,6 +25,7 @@ from app.domain.adaptive_scheduler import (
     source_role_fits_claim,
 )
 from app.domain.context import ContextCandidate, ContextItemType
+from app.domain.evidence_input_quality import assess_candidate, select_supporting_quote
 from app.domain.providers import (
     CanonicalModelRequest,
     ContentPart,
@@ -140,6 +143,7 @@ class EvidenceExtractorService:
                     reliability=source_reliability(
                         page.final_url, text=page.clean_text, title=page.title
                     ),
+                    input_quality_enabled=get_settings().evidence_input_quality_enabled,
                 )
                 return (
                     scored,
@@ -499,6 +503,7 @@ class EvidenceExtractorService:
             reliability=source_reliability(
                 page.final_url, text=page.clean_text, title=page.title
             ),
+            input_quality_enabled=get_settings().evidence_input_quality_enabled,
         )
         if (
             self._extraction_cache is not None
@@ -538,11 +543,27 @@ class EvidenceExtractorService:
         page: ReadPage,
         dimension_criteria: dict[str, str],
         reliability: float,
+        input_quality_enabled: bool = False,
     ) -> list[ScoredEvidence]:
         """Score and gate evidence candidates; re-run this on every cache hit."""
         normalized_page = _normalize_quote(page.clean_text)
         scored: list[ScoredEvidence] = []
         for candidate in batch.items:
+            original_quote = candidate.exact_quote
+            quote_decision = "disabled"
+            if input_quality_enabled and not claim_quote_entails(
+                candidate.claim, candidate.exact_quote
+            ):
+                replacement = select_supporting_quote(
+                    claim=candidate.claim, source_text=page.clean_text
+                )
+                if replacement is not None:
+                    candidate = candidate.model_copy(update={"exact_quote": replacement})
+                    quote_decision = "quote_improved"
+                else:
+                    quote_decision = "no_better_quote"
+            elif input_quality_enabled:
+                quote_decision = "quote_retained"
             quote_matched = _normalize_quote(candidate.exact_quote) in normalized_page
             # These values are quality dimensions, not independent event
             # probabilities. Multiplying them systematically compressed good
@@ -600,6 +621,39 @@ class EvidenceExtractorService:
                     evidence_score=score,
                     accepted=rejection_reason is None,
                     rejection_reason=rejection_reason,
+                    input_quality=(
+                        {
+                            **assess_candidate(
+                            claim=candidate.claim,
+                            quote=candidate.exact_quote,
+                            source_text=page.clean_text,
+                            claim_type=infer_claim_type(
+                                dimension_criteria.get(
+                                    str(candidate.dimension_key), candidate.claim
+                                )
+                            ),
+                            observed_role=classify_source_role(
+                                page.final_url,
+                                text=f"{page.title}\n{page.clean_text[:2_000]}",
+                            ),
+                            accepted=rejection_reason is None,
+                            ).as_dict(),
+                            "evaluation_executed": "true",
+                            "input_quality_decision": quote_decision,
+                            "original_quote_state": (
+                                "changed"
+                                if candidate.exact_quote != original_quote
+                                else "retained"
+                            ),
+                            "final_quote_state": (
+                                "quote_improved"
+                                if candidate.exact_quote != original_quote
+                                else "quote_retained"
+                            ),
+                        }
+                        if input_quality_enabled
+                        else None
+                    ),
                 )
             )
         return scored
@@ -881,7 +935,16 @@ def source_reliability(url: str, *, text: str = "", title: str = "") -> float:
 
 
 def _normalize_quote(value: str) -> str:
-    return " ".join(value.split())
+    # PDF text layers routinely alter whitespace, line breaks, hyphens and
+    # combining accents.  Preserve the exact alphanumeric sequence while
+    # ignoring those representation-only differences; word substitutions or
+    # reorderings still cannot pass this containment check.
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(
+        character
+        for character in decomposed
+        if character.isalnum() and not unicodedata.combining(character)
+    )
 
 
 def _contains_prompt_injection(value: str) -> bool:

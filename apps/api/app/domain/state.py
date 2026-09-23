@@ -268,7 +268,18 @@ class ResearchState(BaseModel):
         page_overrun_is_terminal = (
             self.status is RunStatus.FAILED and self.stop_reason is StopReason.BUDGET_EXHAUSTED
         )
-        if self.budget_usage.pages > self.budget_limits.max_pages and not page_overrun_is_terminal:
+        # V2 splits successful fetches from the legacy ``pages`` counter.
+        # When the split limit is present, validate against it; otherwise keep
+        # the V1 fallback.  Comparing against max_pages unconditionally made
+        # a valid 41st fetched page fail a standard run whose V2 fetch limit
+        # was 120 but whose dashboard compatibility max_pages stayed 40.
+        page_limit = (
+            self.budget_limits.max_pages_fetched
+            if self.budget_usage.pages_fetched > 0
+            else self.budget_limits.max_pages
+        )
+        page_usage = max(self.budget_usage.pages, self.budget_usage.pages_fetched)
+        if page_usage > page_limit and not page_overrun_is_terminal:
             raise ValueError("page budget exceeded")
         # Provider usage is known only after an in-flight model call returns. A
         # bounded final call may therefore report a small overrun. Preserve that

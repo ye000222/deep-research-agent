@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from uuid import UUID
@@ -36,12 +37,13 @@ from app.tools.gateway import ControlledToolGateway
 
 _BUDGETS: dict[str, dict[str, object]] = {
     "quick": {
-        "max_iterations": 5,
+        "max_iterations": 8,
         "max_searches": 6,
         "max_logical_queries": 6,
-        "max_provider_requests": 8,
+        "max_provider_requests": 18,
         "max_pages": 5,
         "max_pages_fetched": 10,
+        "max_page_fetch_attempts": 16,
         "max_pages_extracted": 5,
         "max_extraction_calls": 5,
         "max_verification_calls": 2,
@@ -50,32 +52,60 @@ _BUDGETS: dict[str, dict[str, object]] = {
         "max_wall_clock_seconds": 180,
     },
     "standard": {
-        "max_iterations": 20,
-        "max_searches": 14,
-        "max_logical_queries": 14,
-        "max_provider_requests": 24,
-        "max_pages": 14,
-        "max_pages_fetched": 30,
-        "max_pages_extracted": 14,
-        "max_extraction_calls": 14,
+        "max_iterations": 64,
+        # Eight planned questions need one first pass plus a corroboration /
+        # repair tail.  The earlier 28-query / 84-fetch envelope was reached
+        # mostly by failed or blocked pages before the final P1 repair pass.
+        # Keep the ceilings aligned so transport noise cannot consume the
+        # entire research window before useful evidence is extracted.
+        "max_searches": 56,
+        "max_logical_queries": 56,
+        "max_provider_requests": 168,
+        "max_pages": 40,
+        # Blocked publisher pages must not end the run while logical query,
+        # extraction and token pools still have useful capacity.
+        "max_pages_fetched": 120,
+        # Failed/blocked reads are tracked separately so they remain bounded
+        # without consuming the successful-page evidence budget.
+        "max_page_fetch_attempts": 160,
+        # A real V1 acceptance run needed 24 successful extractions to reach
+        # only 58% coverage while query, fetch and provider capacity remained.
+        # Keep enough extraction headroom for the uncovered-question repair
+        # pass instead of forcing an early transition to report writing.
+        "max_pages_extracted": 56,
+        "max_extraction_calls": 56,
         "max_verification_calls": 6,
-        "max_scheduler_actions": 60,
-        "max_tokens": 100_000,
-        "max_wall_clock_seconds": 480,
+        "max_scheduler_actions": 168,
+        # With the reserved planner/writer/verification/safety pools, a long
+        # V1 repair tail can spend roughly 100k research tokens before the
+        # final independent-source checks. Keep a generous pool so token
+        # protection cannot terminate with only one or two acceptance gaps
+        # remaining; downstream writer/verification/safety reserves stay
+        # explicit and protected.
+        "max_tokens": 220_000,
+        # A standard V1 run needs more than one 15-minute worker lease when
+        # page reads hit slow/blocked publishers.  The worker heartbeat keeps
+        # the lease alive while this wall-clock deadline protects runaway
+        # runs, leaving time for repair, verification and report generation.
+        # Arbitrary market/technical questions can require the full rotated
+        # query tail.  A 30-minute wall clock truncated the run while more
+        # than a third of the logical-query/page/extraction budget remained.
+        "max_wall_clock_seconds": 3_600,
     },
     "deep": {
-        "max_iterations": 30,
-        "max_searches": 24,
-        "max_logical_queries": 24,
-        "max_provider_requests": 48,
-        "max_pages": 28,
-        "max_pages_fetched": 60,
-        "max_pages_extracted": 28,
-        "max_extraction_calls": 28,
+        "max_iterations": 72,
+        "max_searches": 64,
+        "max_logical_queries": 64,
+        "max_provider_requests": 192,
+        "max_pages": 64,
+        "max_pages_fetched": 160,
+        "max_page_fetch_attempts": 224,
+        "max_pages_extracted": 64,
+        "max_extraction_calls": 64,
         "max_verification_calls": 10,
-        "max_scheduler_actions": 100,
-        "max_tokens": 220_000,
-        "max_wall_clock_seconds": 1_200,
+        "max_scheduler_actions": 192,
+        "max_tokens": 260_000,
+        "max_wall_clock_seconds": 4_800,
     },
 }
 
@@ -89,6 +119,8 @@ class ResearchRunServiceProtocol(Protocol):
         query: str,
         saved_profile_version_id: UUID,
         budget_tier: str,
+        plan_template_run_id: UUID | None = None,
+        benchmark: Mapping[str, object] | None = None,
     ) -> tuple[ResearchRunView, bool]: ...
 
     async def list_runs(self, owner_hash: str, *, limit: int) -> list[ResearchRunView]: ...
@@ -159,6 +191,7 @@ class ResearchRunService:
         memory_manager: ResearchMemoryManager,
         controlled_tools: ControlledToolGateway,
         llm_call_repository: LLMCallRepository,
+        source_revision: str = "development",
     ) -> None:
         self._repository = repository
         self._research_repository = research_repository
@@ -168,6 +201,7 @@ class ResearchRunService:
         self._memory_manager = memory_manager
         self._controlled_tools = controlled_tools
         self._llm_call_repository = llm_call_repository
+        self._source_revision = source_revision.strip() or "development"
 
     async def create_run(
         self,
@@ -177,6 +211,8 @@ class ResearchRunService:
         query: str,
         saved_profile_version_id: UUID,
         budget_tier: str,
+        plan_template_run_id: UUID | None = None,
+        benchmark: Mapping[str, object] | None = None,
     ) -> tuple[ResearchRunView, bool]:
         normalized = " ".join(query.split())
         if not normalized:
@@ -187,6 +223,7 @@ class ResearchRunService:
         if not key or len(key) > 200:
             raise ValueError("Idempotency-Key must contain 1 to 200 characters")
         budget = dict(_BUDGETS[budget_tier])
+        budget["source_revision"] = self._source_revision
         budget["deadline_at"] = (
             datetime.now(UTC)
             + timedelta(seconds=cast(int, budget["max_wall_clock_seconds"]))
@@ -198,6 +235,12 @@ class ResearchRunService:
         budget["adaptive_scheduler_enabled"] = True
         budget["cheap_triage_enabled"] = True
         budget["cross_question_search_cache_enabled"] = True
+        if plan_template_run_id is not None:
+            # Acceptance runs may pin the already-audited baseline plan.  This
+            # keeps repeated ordinals comparable; ordinary API runs remain
+            # model-planned when the option is omitted.
+            budget["plan_template_run_id"] = str(plan_template_run_id)
+            budget["plan_template_plan_version"] = 1
         budget["max_evidence_call_tokens"] = 12_000
         budget["allocation"] = allocate_budget_shares(
             max_iterations=cast(int, budget["max_iterations"]),
@@ -238,6 +281,13 @@ class ResearchRunService:
                 "wall_clock": "deadline_at",
             },
         }
+        if benchmark is not None:
+            # Phase 15.0 golden baseline: stamp the registered benchmark identity
+            # onto the run's own budget_snapshot so the run carries its
+            # comparability key from creation.  This is pure benchmark/experiment
+            # metadata; it changes no research behaviour and defaults to absent
+            # for every ordinary run.
+            budget["benchmark"] = dict(benchmark)
         return await self._repository.create(
             owner_hash,
             idempotency_key=key,

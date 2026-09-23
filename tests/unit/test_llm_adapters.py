@@ -47,6 +47,8 @@ def request() -> CanonicalModelRequest:
     [
         ("api.deepseek.com", "deepseek-v4-flash", False, True),
         ("api.deepseek.com", "deepseek-v4-pro", False, True),
+        ("api.deepseek.com", "deepseek-flash", False, True),
+        ("api.deepseek.com", "DeepSeek-Flash", False, True),
         ("compatible.example.com", "deepseek-v4-flash", False, False),
         ("api.deepseek.com", "other-model", False, False),
         ("api.deepseek.com", "deepseek-v4-flash", True, False),
