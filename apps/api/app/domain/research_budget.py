@@ -5,6 +5,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from app.domain.question_research_state import (
+    QuestionResearchState,
+    RecoveryEligibilityState,
+    ResearchOpportunityState,
+)
+
 ModelTokenPool = Literal["planner", "research", "verification", "writer", "safety"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
 RiskLifecycle = Literal["open", "mitigating", "blocked", "resolved"]
@@ -696,6 +702,7 @@ def decide_question_borrow(
     *,
     state: QuestionRiskState,
     all_first_passes_complete: bool,
+    research_state: QuestionResearchState | None = None,
     projected_spend: int,
     target_tokens: int,
     expected_utility: float,
@@ -703,14 +710,28 @@ def decide_question_borrow(
     has_untried_query_family: bool = False,
     utility_threshold: float = 0.005,
 ) -> QuestionBorrowDecision:
-    """Apply the V2 first-pass, risk, utility, and 150% borrowing contract."""
+    """Apply the V2 first-pass, state, risk, utility, and cap contract."""
 
     target_tokens = max(0, int(target_tokens))
     projected_spend = max(0, int(projected_spend))
     if projected_spend <= target_tokens:
         return QuestionBorrowDecision(True, "within_question_target")
-    if not all_first_passes_complete:
-        return QuestionBorrowDecision(False, "first_pass_floor_protected")
+    if research_state is None:
+        if not all_first_passes_complete:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+    else:
+        if research_state.research_opportunity == ResearchOpportunityState.NOT_STARTED:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+        if research_state.recovery_eligibility == RecoveryEligibilityState.NOT_EVALUATED:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+        if research_state.recovery_eligibility == RecoveryEligibilityState.DEFERRED:
+            return QuestionBorrowDecision(False, "first_pass_floor_protected")
+        if research_state.recovery_eligibility == RecoveryEligibilityState.DENIED:
+            return QuestionBorrowDecision(
+                False,
+                "recovery_ineligible",
+                freeze_question=True,
+            )
     borrow_cap = int(target_tokens * 1.5)
     # A high-risk exception is a bounded recovery allowance, not a second
     # unlimited budget.  Earlier versions let the exception bypass this cap

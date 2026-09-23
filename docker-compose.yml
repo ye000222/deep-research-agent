@@ -53,6 +53,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
     environment:
       APP_ENV: development
+      APP_VERSION: ${APP_VERSION:-1.0.0-rc.1}
       SOURCE_REVISION: ${SOURCE_REVISION:-development}
       PYTHONPATH: /app/apps/api
       DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
@@ -70,6 +71,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
     environment:
       APP_ENV: development
+      APP_VERSION: ${APP_VERSION:-1.0.0-rc.1}
       SOURCE_REVISION: ${SOURCE_REVISION:-development}
       PYTHONPATH: /app/apps/api
       DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
@@ -79,6 +81,9 @@ services:
       MODEL_HTTP_PROXY: ${MODEL_HTTP_PROXY:-}
       PUBLIC_WEB_HTTP_PROXY: ${PUBLIC_WEB_HTTP_PROXY:-}
       SEARXNG_PREFERRED_ENGINES: ${SEARXNG_PREFERRED_ENGINES:-}
+      EVIDENCE_AWARE_CONTEXT_ENABLED: ${EVIDENCE_AWARE_CONTEXT_ENABLED:-false}
+      INDEPENDENT_SOURCE_TARGETING_ENABLED: ${INDEPENDENT_SOURCE_TARGETING_ENABLED:-true}
+      EVIDENCE_INPUT_QUALITY_ENABLED: ${EVIDENCE_INPUT_QUALITY_ENABLED:-false}
       ARTIFACT_ROOT: /app/artifacts
       PERSIST_PROVIDER_CREDENTIALS: "true"
       SECRET_MASTER_KEY_FILE: /app/artifacts/.secrets/provider_master_key
@@ -106,6 +111,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
     environment:
       APP_ENV: development
+      APP_VERSION: ${APP_VERSION:-1.0.0-rc.1}
       SOURCE_REVISION: ${SOURCE_REVISION:-development}
       PYTHONPATH: /app/apps/api
       DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
@@ -115,6 +121,9 @@ services:
       MODEL_HTTP_PROXY: ${MODEL_HTTP_PROXY:-}
       PUBLIC_WEB_HTTP_PROXY: ${PUBLIC_WEB_HTTP_PROXY:-}
       SEARXNG_PREFERRED_ENGINES: ${SEARXNG_PREFERRED_ENGINES:-}
+      EVIDENCE_AWARE_CONTEXT_ENABLED: ${EVIDENCE_AWARE_CONTEXT_ENABLED:-false}
+      INDEPENDENT_SOURCE_TARGETING_ENABLED: ${INDEPENDENT_SOURCE_TARGETING_ENABLED:-true}
+      EVIDENCE_INPUT_QUALITY_ENABLED: ${EVIDENCE_INPUT_QUALITY_ENABLED:-false}
       ARTIFACT_ROOT: /app/artifacts
       PERSIST_PROVIDER_CREDENTIALS: "true"
       SECRET_MASTER_KEY_FILE: /app/artifacts/.secrets/provider_master_key
@@ -144,6 +153,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
     environment:
       APP_ENV: development
+      APP_VERSION: ${APP_VERSION:-1.0.0-rc.1}
       SOURCE_REVISION: ${SOURCE_REVISION:-development}
       PYTHONPATH: /app/apps/api
       DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research
@@ -166,6 +176,7 @@ services:
       dockerfile: infra/docker/api.Dockerfile
     environment:
       APP_ENV: development
+      APP_VERSION: ${APP_VERSION:-1.0.0-rc.1}
       SOURCE_REVISION: ${SOURCE_REVISION:-development}
       PYTHONPATH: /app/apps/api
       DATABASE_URL: postgresql+psycopg://deep_research:deep_research@postgres:5432/deep_research

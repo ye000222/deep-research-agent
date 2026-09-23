@@ -1,1 +1,1 @@
-"""Operational scripts that can also be exercised by integration tests."""
+"""Repository-maintained release and analysis tooling."""

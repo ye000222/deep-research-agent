@@ -244,6 +244,7 @@ async def test_exhausted_provider_retry_persists_current_terminal_failure(
             public_web_http_proxy=None,
             searxng_base_url="http://unused",
             artifact_root="artifacts",
+            evidence_aware_context_enabled=True,
         ),
     )
     monkeypatch.setattr(worker_tasks, "PostgresRuntime", FakeDatabase)
@@ -261,7 +262,9 @@ async def test_exhausted_provider_retry_persists_current_terminal_failure(
         lambda *args, **kwargs: FailingGraph(),
     )
     monkeypatch.setattr(worker_tasks, "LLMCallRepository", lambda *_: FakeLLMCalls())
-    monkeypatch.setattr(worker_tasks, "ResearchToolRepository", lambda *_: object())
+    monkeypatch.setattr(
+        worker_tasks, "ResearchToolRepository", lambda *args, **kwargs: object()
+    )
     monkeypatch.setattr(worker_tasks, "ReportRepository", lambda *_: object())
     monkeypatch.setattr(worker_tasks, "RunProviderBindingRepository", lambda *_: object())
     monkeypatch.setattr(worker_tasks, "ContextBudgetManager", lambda *_: object())

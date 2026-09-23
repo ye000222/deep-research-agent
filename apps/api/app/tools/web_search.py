@@ -318,7 +318,19 @@ class SearXNGSearchProvider:
         alternate_query: str | None = None,
         exclude_domains: tuple[str, ...] = (),
         exclude_urls: tuple[str, ...] = (),
+        single_provider_only: bool = False,
     ) -> list[SearchResult]:
+        """Run one SearXNG search under the current provider routing rules.
+
+        ``single_provider_only`` (Phase 12.2): when True, the SearXNG adapter
+        stops owning provider selection. The internal circuit-open early
+        return and the direct-Bing transport fallback are both skipped so the
+        upstream :class:`ProviderRouter` is the sole authority on when to
+        switch provider. Non-stop behavior (query strategy, hedged requests,
+        engine-specific cooldowns that stay inside a single SearXNG attempt)
+        is intentionally preserved so this phase does not change search
+        strategy.
+        """
         self._last_request_count = 0
         self._last_timeout_count = 0
         self._last_fallback_count = 0
@@ -355,7 +367,7 @@ class SearXNGSearchProvider:
         if not normalized:
             raise ToolExecutionError("SEARCH_QUERY_INVALID", retryable=False)
         now = time.monotonic()
-        if now < self._circuit_open_until:
+        if now < self._circuit_open_until and not single_provider_only:
             self._last_circuit_open_count += 1
             raise ToolExecutionError(
                 "SEARCH_PROVIDER_DEGRADED",
@@ -542,6 +554,31 @@ class SearXNGSearchProvider:
                 break
 
         if not results_by_url:
+            # Phase 12.2: when the router is authoritative the caller passes
+            # ``single_provider_only=True`` so this adapter must not silently
+            # switch to Bing. Emit a bounded failure and let the outer
+            # ``ProviderExecutor`` / router decide whether a different
+            # provider should be tried next turn.
+            if single_provider_only:
+                raise ToolExecutionError(
+                    "SEARCH_PROVIDER_DEGRADED",
+                    retryable=True,
+                    details=self._failure_details(
+                        {
+                            "provider": _PROVIDER_NAME,
+                            "failure_type": "empty_response",
+                            "context": {
+                                "strategy": "searxng_only",
+                                "query": normalized[:500],
+                                "fallback_attempted": False,
+                                "fallback_provider": None,
+                                "fallback_success": False,
+                                "single_provider_only": True,
+                            },
+                            "failures": failures,
+                        }
+                    ),
+                )
             # SearXNG can report every configured engine as suspended (CAPTCHA,
             # rate limit, or temporary circuit-open) even though the container
             # still has working outbound HTTPS.  Use Bing's public HTML endpoint
@@ -607,6 +644,7 @@ class SearXNGSearchProvider:
         limit: int,
         excluded_urls: Set[str],
         excluded_owners: Set[str],
+        bypass_circuit: bool = False,
     ) -> list[SearchResult]:
         """Read a small set of Bing HTML results when SearXNG is unavailable.
 
@@ -624,7 +662,8 @@ class SearXNGSearchProvider:
         bing_state = self._provider_states[_FALLBACK_PROVIDER_NAME]
         now = time.monotonic()
         if (
-            bing_state["state"] == _PROVIDER_COOLDOWN
+            not bypass_circuit
+            and bing_state["state"] == _PROVIDER_COOLDOWN
             and _state_float(bing_state["cooldown_until"]) > now
         ):
             self._last_circuit_open_count += 1
@@ -765,6 +804,68 @@ class SearXNGSearchProvider:
                 fallback_provider=_FALLBACK_PROVIDER_NAME,
                 fallback_success=False,
             )
+        return results
+
+    async def bing_only_search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        exclude_domains: tuple[str, ...] = (),
+        exclude_urls: tuple[str, ...] = (),
+    ) -> list[SearchResult]:
+        """Invoke Bing as the sole provider (Phase 12.2 router-authoritative mode).
+
+        The :class:`ProviderRouter` may pick Bing directly when SearXNG is
+        ``UNAVAILABLE``. In that path the outer ``ProviderExecutor`` calls this
+        method instead of :meth:`search`, so we bypass the internal Bing
+        cooldown check (which is a duplicate source of truth now owned by
+        :class:`ProviderHealthTracker`). Downstream URL safety, page-fetch,
+        extraction, and evidence checks remain unchanged.
+        """
+
+        normalized = " ".join(query.split())
+        if not normalized:
+            raise ToolExecutionError("SEARCH_QUERY_INVALID", retryable=False)
+        normalized_excluded_owners = frozenset(
+            domain.casefold().strip().lstrip(".")
+            for domain in exclude_domains
+            if domain and domain != "unknown"
+        )
+        normalized_excluded_urls = frozenset(
+            normalize_source_url(url) for url in exclude_urls if url
+        )
+        self._last_request_count += 1
+        self._last_fallback_attempt_count += 1
+        results = await self._direct_bing_fallback(
+            normalized,
+            limit=limit,
+            excluded_urls=normalized_excluded_urls,
+            excluded_owners=normalized_excluded_owners,
+            bypass_circuit=True,
+        )
+        if not results:
+            raise ToolExecutionError(
+                "SEARCH_PROVIDER_DEGRADED",
+                retryable=True,
+                details=self._failure_details(
+                    {
+                        "provider": _FALLBACK_PROVIDER_NAME,
+                        "failure_type": "empty_response",
+                        "context": {
+                            "strategy": "bing_only",
+                            "query": normalized[:500],
+                            "fallback_attempted": False,
+                            "fallback_provider": None,
+                            "fallback_success": False,
+                            "single_provider_only": True,
+                        },
+                        "failures": [],
+                    }
+                ),
+            )
+        self._last_healthy_response_count += 1
+        self._last_productive_response_count += 1
         return results
 
     async def _request_hedged(

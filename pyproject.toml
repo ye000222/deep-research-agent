@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deep-research-agent"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Evidence-driven deep research agent"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -43,7 +43,7 @@ include = ["app*"]
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"
-pythonpath = ["apps/api"]
+pythonpath = ["apps/api", "."]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -52,6 +52,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+# Phase 15.2 comparability is a frozen, one-off historical analyzer. It is
+# retained for provenance but is not maintained RC tooling; its lint exclusion
+# is documented in artifacts/v1_known_issues.md.
+[tool.ruff.lint.per-file-ignores]
+"scripts/correct_phase15_2_comparability.py" = ["E501", "I001"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -1,0 +1,76 @@
+{
+  "schema_version": "v1",
+  "artifact": "golden_baseline_manifest",
+  "registered_at": "2026-09-21",
+  "status": "registered",
+  "purpose": "Phase 15.0 正式 V1 Golden Baseline：注册当前模型比较类任务，固定 benchmark 身份、计划形态、指标版本与实验关键配置，供 n=3 真实 run 建立可比较、可重放的回归基线。本文件只定义评测身份，不改变任何运行时研究行为。",
+  "benchmark_id": "v1-dev-model-comparison",
+  "benchmark_version": "1.0.0",
+  "type": "development",
+  "planner_mode": "frozen_reference_plan",
+  "normalized_goal": "Compare CNN, Transformer and Vision-Language Models for industrial surface defect detection, including strengths and limitations.",
+  "tier": "standard",
+  "budget_profile": "standard",
+  "plan_template_run_id": "01a08bcc-1034-76ba-92d4-12fa1a8badcb",
+  "plan_shape_policy": "frozen_reference_plan:questions=5,priority_one=4,priority_two=1",
+  "metric_definition_version": "coverage-v1",
+  "feature_flags": {
+    "evidence_aware_context_enabled": false
+  },
+  "question_set": [
+    {
+      "question_id": "q1",
+      "priority": 1,
+      "question": "CNN、Transformer与VLM在工业表面缺陷检测中的核心架构差异与检测范式分别是什么？",
+      "evidence_requirements": ["原文给出三类模型的架构描述与检测流程定义"]
+    },
+    {
+      "question_id": "q2",
+      "priority": 1,
+      "question": "在公开工业缺陷数据集上，CNN、Transformer与VLM的检测精度指标对比结果如何？",
+      "evidence_requirements": ["原文报告MVTec AD或同类数据集上的精度或AUROC数据"]
+    },
+    {
+      "question_id": "q3",
+      "priority": 1,
+      "question": "三类方法在训练数据规模、标注需求与预训练依赖上有何差异？",
+      "evidence_requirements": ["原文说明各方法所需训练样本量或标注类型"]
+    },
+    {
+      "question_id": "q4",
+      "priority": 1,
+      "question": "三类方法在推理速度、模型规模与边缘部署可行性上的限制分别是什么？",
+      "evidence_requirements": ["原文给出推理延迟、参数量或部署平台数据"]
+    },
+    {
+      "question_id": "q5",
+      "priority": 2,
+      "question": "VLM在工业缺陷检测中的零样本或少样本能力及主要失效模式有哪些？",
+      "evidence_requirements": ["原文报告VLM零样本或少样本检测结果与失败案例"]
+    }
+  ],
+  "runtime_environment": {
+    "note": "信息性记录，不属于 benchmark identity；重跑时允许正常漂移，但 must-confirm 字段除外。",
+    "source_revision_at_registration": "v28-search-fallback-proxy-and-bing-parser",
+    "worker_concurrency_at_registration": 3,
+    "must_confirm_at_run_time": ["evidence_aware_context_enabled=false"]
+  },
+  "non_identity_fields_explicitly_excluded": [
+    "run_id",
+    "timestamp",
+    "random request ids",
+    "transient provider health",
+    "temporary network state"
+  ],
+  "linkage": {
+    "comparability_contract": "apps/api/app/domain/benchmark_comparability.py",
+    "governance_domain": "apps/api/app/domain/golden_baseline.py",
+    "decision_record": "docs/adr/0003-evidence-aware-main-path-enrichment.md",
+    "prior_temporary_baseline_runs_not_promotable": [
+      "01a0bf8b-fdc4-7008-a419-3edac7d3a9f6",
+      "01a0bf8b-fdde-7813-a99d-8fb0ec22ab92",
+      "01a0bfa7-3c70-712b-8109-064a8ba4b7f6"
+    ],
+    "prior_baseline_note": "Phase 14.3 三个 run 未注册 benchmark_id，按 Phase 15.0 规则不得通过回填 metadata 升级为正式 Golden Baseline，仅可作为历史/辅助比较数据。"
+  }
+}

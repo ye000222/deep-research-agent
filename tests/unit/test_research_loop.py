@@ -470,6 +470,8 @@ class FakeRepository:
         self.page_failures = 0
         self.fetch_budget_settlements = 0
         self.duplicate_page = False
+        self.selection_events: list[tuple[str, str | None]] = []
+        self.extraction_slot_allowed = True
         self.token_reservations: dict[UUID, int] = {}
         self.token_reservation_granted = True
         self.settled_reservations: list[tuple[UUID, int]] = []
@@ -506,7 +508,7 @@ class FakeRepository:
         return None
 
     async def reserve_extraction_slot(self, *args: object, **kwargs: object) -> bool:
-        return True
+        return self.extraction_slot_allowed
 
     async def release_extraction_slot(self, *args: object, **kwargs: object) -> None:
         return None
@@ -549,6 +551,11 @@ class FakeRepository:
 
     async def record_extraction_started(self, *args: object, **kwargs: object) -> None:
         return None
+
+    async def record_evidence_selection_event(self, *args: object, **kwargs: object) -> None:
+        self.selection_events.append(
+            (str(kwargs["stage"]), kwargs.get("reason"))
+        )
 
     async def page_already_processed(self, *args: object, **kwargs: object) -> bool:
         return self.duplicate_page
@@ -821,6 +828,8 @@ async def test_minimum_call_estimate_is_forwarded_under_normal_budget() -> None:
     assert repository.minimum_call_seen == 4_000
     assert extractor.calls >= 1
     assert result.accepted_evidence >= 0
+    assert ("selection_started", None) in repository.selection_events
+    assert ("selection_selected", None) in repository.selection_events
 
 
 @pytest.mark.asyncio
@@ -1211,6 +1220,12 @@ async def test_duplicate_final_page_consumes_fetch_but_not_extraction_budget() -
     assert extractor.calls == 0
     assert result.pages_read == 0
     assert repository.released_page_slots == 0
+    assert repository.selection_events
+    assert all(
+        event == ("selection_skipped", "already_processed")
+        for event in repository.selection_events
+        if event[0] == "selection_skipped"
+    )
 
 
 def test_query_family_exhaustion_uses_actual_fresh_searches_only() -> None:

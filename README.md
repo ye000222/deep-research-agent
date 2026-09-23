@@ -78,6 +78,18 @@ python scripts/release_gate.py --v1-closeout --v1-source-revision "<提交版本
 
 ## 快速启动
 
+### 环境要求与冻结配置
+
+- Docker Engine（支持 Docker Compose v2）以及可用的容器镜像构建环境；
+- 首次启动需要网络访问以获取镜像/依赖；
+- Windows 一键启动需要 PowerShell；手动启动可使用支持 Docker Compose 的操作系统。
+
+V1 RC 使用 `v1.0.0-rc.1` 与冻结配置 `v1-pre-rc-reference-1`：
+`EVIDENCE_AWARE_CONTEXT_ENABLED=false`、
+`INDEPENDENT_SOURCE_TARGETING_ENABLED=true`、
+`EVIDENCE_INPUT_QUALITY_ENABLED=false`。这些开关由 Compose 显式传给 API 和 Worker；
+不要在发布验证中通过个人 shell 环境变量覆盖它们。
+
 ### 一键启动（Windows）
 
 双击项目根目录的 `start.bat`，或在 PowerShell 中运行：
@@ -142,6 +154,21 @@ docker compose run --rm api python -m app.cli.setup_checkpoints
 - API 文档：http://localhost:8000/docs
 - SearXNG：http://localhost:8081
 
+### 创建 Run、查看状态与获取报告
+
+先在 Web 页面创建 Provider Profile 并保存凭据。API 使用浏览器建立的 HttpOnly
+客户端会话；不要把 API Key 放进 URL、命令历史或日志。创建 Run 的接口为
+`POST /api/v1/research-runs`，请求包含 `query`、`saved_profile_version_id` 和
+`budget_tier`（`quick`、`standard` 或 `deep`），并提供唯一的 `Idempotency-Key`。
+响应中的 `run_id`、`status_url` 和 `event_url` 可用于后续查询/订阅。
+
+- 存活检查：`GET /healthz`；依赖就绪检查：`GET /readyz`。
+- Run 状态：`GET /api/v1/research-runs/{run_id}`；事件：`GET .../{run_id}/events`。
+- 报告：`GET /api/v1/research-runs/{run_id}/report`；验证状态：
+  `GET /api/v1/research-runs/{run_id}/verification`。
+
+没有 Accepted Evidence 时，系统会以 `REPORT_NO_ACCEPTED_EVIDENCE` 终止，不会生成无依据报告。
+
 ## 本地开发
 
 后端：
@@ -172,6 +199,11 @@ mypy apps/api tests
 pnpm --filter @deep-research/web build
 docker compose config --quiet
 ```
+
+Benchmark 定义位于 `evals/benchmarks/`。静态/回归质量门可通过
+`python scripts/release_gate.py` 运行；该命令不会代替真实 qualification，
+也不会自动启动 Benchmark Run。当前已知任务族限制见
+[`artifacts/v1_known_issues.md`](./artifacts/v1_known_issues.md)。
 
 真实 PostgreSQL 集成测试：
 

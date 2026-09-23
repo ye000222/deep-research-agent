@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from uuid import UUID
@@ -119,6 +120,7 @@ class ResearchRunServiceProtocol(Protocol):
         saved_profile_version_id: UUID,
         budget_tier: str,
         plan_template_run_id: UUID | None = None,
+        benchmark: Mapping[str, object] | None = None,
     ) -> tuple[ResearchRunView, bool]: ...
 
     async def list_runs(self, owner_hash: str, *, limit: int) -> list[ResearchRunView]: ...
@@ -210,6 +212,7 @@ class ResearchRunService:
         saved_profile_version_id: UUID,
         budget_tier: str,
         plan_template_run_id: UUID | None = None,
+        benchmark: Mapping[str, object] | None = None,
     ) -> tuple[ResearchRunView, bool]:
         normalized = " ".join(query.split())
         if not normalized:
@@ -278,6 +281,13 @@ class ResearchRunService:
                 "wall_clock": "deadline_at",
             },
         }
+        if benchmark is not None:
+            # Phase 15.0 golden baseline: stamp the registered benchmark identity
+            # onto the run's own budget_snapshot so the run carries its
+            # comparability key from creation.  This is pure benchmark/experiment
+            # metadata; it changes no research behaviour and defaults to absent
+            # for every ordinary run.
+            budget["benchmark"] = dict(benchmark)
         return await self._repository.create(
             owner_hash,
             idempotency_key=key,

@@ -13,6 +13,8 @@ from pydantic import ValidationError
 
 from app.context.manager import ContextBudgetManager, ContextManifestPersistenceError
 from app.core.config import Settings
+from app.domain.provider_adapter import SearchProviderAdapter
+from app.domain.provider_registry import SearchProviderRegistry
 from app.domain.research_runs import EXECUTION_LEASE_SECONDS
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.checkpoints.lifecycle import CheckpointRuntime
@@ -44,8 +46,11 @@ from app.services.report_writer import ReportWriterService
 from app.services.research_graph import ResearchGraphService
 from app.services.research_loop import ResearchLoopService
 from app.tools.analyze_data import AnalyzeDataTool
+from app.tools.brave_search import BraveSearchAdapter
+from app.tools.duckduckgo_search import DuckDuckGoAdapter
 from app.tools.errors import ToolExecutionError
 from app.tools.gateway import ControlledToolGateway
+from app.tools.provider_adapters import BingAdapter, SearXNGAdapter
 from app.tools.search_evidence import SearchEvidenceTool
 from app.tools.web_reader import PublicWebReader
 from app.tools.web_search import SearXNGSearchProvider
@@ -135,9 +140,34 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         proxy=settings.public_web_http_proxy or None,
         trust_env=False,
     )
+    # Phase 12.4: build the search provider pool once. The registry is the
+    # single source of candidate providers and is injected into the repository
+    # (routing) and the loop (adapter dispatch) so both agree on the pool.
+    brave_secret = getattr(settings, "brave_api_key", None)
+    brave_key = brave_secret.get_secret_value() if brave_secret else ""
+    provider_registry = SearchProviderRegistry.default(
+        brave_api_key_present=bool(brave_key),
+        duckduckgo_enabled=getattr(settings, "duckduckgo_enabled", True),
+    )
+    searxng_provider = SearXNGSearchProvider(
+        search_client,
+        settings.searxng_base_url,
+        fallback_client=public_web_client,
+    )
+    search_adapters: dict[str, SearchProviderAdapter] = {
+        "SearXNG": SearXNGAdapter(searxng_provider),
+        "Bing": BingAdapter(searxng_provider),
+    }
+    if brave_key:
+        search_adapters["Brave"] = BraveSearchAdapter(public_web_client, api_key=brave_key)
+    if getattr(settings, "duckduckgo_enabled", True):
+        search_adapters["DuckDuckGo"] = DuckDuckGoAdapter(public_web_client)
     repository = ResearchRunRepository(database.session_factory)
     llm_calls = LLMCallRepository(database.session_factory)
-    research_repository = ResearchToolRepository(database.session_factory)
+    research_repository = ResearchToolRepository(
+        database.session_factory,
+        provider_registry=provider_registry,
+    )
     report_repository = ReportRepository(database.session_factory)
     state_repository = ResearchStateRuntimeRepository(database.session_factory)
     bindings = RunProviderBindingRepository(database.session_factory)
@@ -170,16 +200,14 @@ async def _execute(run_id: UUID, task_id: str) -> str:
     )
     research_loop = ResearchLoopService(
         research_repository,
-        SearXNGSearchProvider(
-            search_client,
-            settings.searxng_base_url,
-            fallback_client=public_web_client,
-        ),
+        searxng_provider,
         PublicWebReader(public_web_client),
         EvidenceExtractorService(bindings, cipher, gateway, contexts, extraction_cache),
         LocalArtifactStore(settings.artifact_root),
         controlled_tools,
         parallel_reads_enabled=True,
+        search_adapters=search_adapters,
+        evidence_aware_context_enabled=settings.evidence_aware_context_enabled,
     )
     report_writer = ReportWriterService(
         report_repository,
