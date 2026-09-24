@@ -88,7 +88,15 @@ jobs:
         run: |
           start=$(date +%s)
           pg_isready -h localhost -p 5432 -U deep_research -d deep_research
-          test "$(redis-cli -h localhost -p 6379 ping)" = "PONG"
+          python - <<'PY'
+          import socket
+
+          with socket.create_connection(("127.0.0.1", 6379), timeout=5) as connection:
+              connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+              response = connection.recv(64)
+          if response != b"+PONG\r\n":
+              raise SystemExit(f"Unexpected Redis PING response: {response!r}")
+          PY
           echo "Runner-side database/broker readiness check: $(( $(date +%s) - start ))s (service provisioning is managed before runner steps)" >> "$GITHUB_STEP_SUMMARY"
       - name: Run PostgreSQL and deterministic L2 integration tests
         run: |
