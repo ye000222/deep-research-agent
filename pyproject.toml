@@ -45,6 +45,14 @@ addopts = "-q"
 asyncio_mode = "auto"
 pythonpath = ["apps/api", "."]
 testpaths = ["tests"]
+markers = [
+  "unit: fast unit tests that do not require external services",
+  "integration: application or persistence integration tests",
+  "postgres: tests requiring a migrated PostgreSQL database",
+  "deterministic_smoke: deterministic API-to-worker research smoke; no live external calls",
+  "live_research: expensive real-provider research qualification",
+  "slow: tests intentionally taking longer than fast L1 feedback",
+]
 
 [tool.ruff]
 line-length = 100

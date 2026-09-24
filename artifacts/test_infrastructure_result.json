@@ -1,0 +1,72 @@
+{
+  "local_validation": {
+    "compose_config": "PASS (exit 0; Docker config access warnings)",
+    "deterministic_l2": {
+      "combined_seconds": 307.956,
+      "empty_evidence_failure_path": "PASS",
+      "success_path_seconds": 259.291,
+      "success_repeatability": "3/3 PASS"
+    },
+    "full_default_pytest": "PASS",
+    "l1_unit_api_seconds": 19.85,
+    "mypy_apps_api_app": "PASS (173 source files)",
+    "postgres_integration": "PASS (7 passed, 2 L2 cases separately gated)",
+    "release_gate_static": "PASS",
+    "ruff_apps_api_tests": "PASS",
+    "web_build": "PASS (installed local Vite binary; pnpm wrapper declined module purge)",
+    "web_typescript": "PASS"
+  },
+  "deterministic_failure_path": {
+    "accepted_evidence": 0,
+    "duration_seconds": 48.665,
+    "http_requests": 32,
+    "kind": "deterministic_failure_path",
+    "live_llm_calls": 0,
+    "report_fetch_status": 409,
+    "result": "PASS",
+    "run_id": "01a0cf25-8c4f-7038-936a-a08304a5e51f",
+    "search_fixture_calls": 20,
+    "terminal_status": "failed",
+    "termination_reason": "REPORT_NO_ACCEPTED_EVIDENCE"
+  },
+  "deterministic_success": {
+    "duration_seconds": 259.291,
+    "http_requests": 111,
+    "kind": "deterministic_success",
+    "live_llm_calls": 0,
+    "repeatability": "3/3 PASS",
+    "runs": [
+      {
+        "accepted_evidence": 10,
+        "candidate_evidence": 10,
+        "duration_seconds": 51.983,
+        "ordinal": 1,
+        "report_fetch": 200,
+        "report_verified": true,
+        "run_id": "01a0cf21-9893-744a-b80a-143a1a888f6d",
+        "status": "completed_with_limitations"
+      },
+      {
+        "accepted_evidence": 10,
+        "candidate_evidence": 10,
+        "duration_seconds": 84.416,
+        "ordinal": 2,
+        "report_fetch": 200,
+        "report_verified": true,
+        "run_id": "01a0cf22-641a-7767-b4df-1caa1fb3037f",
+        "status": "completed_with_limitations"
+      },
+      {
+        "accepted_evidence": 10,
+        "candidate_evidence": 10,
+        "duration_seconds": 117.602,
+        "ordinal": 3,
+        "report_fetch": 200,
+        "report_verified": true,
+        "run_id": "01a0cf23-ae67-733a-baab-646ad3c84736",
+        "status": "completed_with_limitations"
+      }
+    ],
+    "search_fixture_calls": 66
+  }
+}
