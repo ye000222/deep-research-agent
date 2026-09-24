@@ -1,0 +1,94 @@
+{
+  "artifact_version": 1,
+  "branch": "chore/test-infrastructure-v1.1",
+  "head": "87464a5113407e5860cbb7b55c8e605abd376676",
+  "release_tag": {
+    "name": "v1.1.0",
+    "peeled_commit": "38e3ce1a64450cd4a3175bffab6f8ad140cf7fbf"
+  },
+  "research_behavior_change": "NONE",
+  "baseline_observed_at": "2026-09-24",
+  "tests": [
+    {
+      "name": "CI / api",
+      "purpose": ["ruff", "mypy", "pytest"],
+      "trigger": ["pull_request", "push:main"],
+      "blocking": true,
+      "postgres": false,
+      "redis": false,
+      "worker": false,
+      "live_search": false,
+      "live_llm": false,
+      "deterministic": true,
+      "observed_local_pytest_seconds": 34.36,
+      "notes": "PostgreSQL integration tests are environment-skipped in the default invocation."
+    },
+    {
+      "name": "CI / PostgreSQL integration",
+      "purpose": ["migration", "repository", "persistence", "checkpoint", "recovery"],
+      "trigger": ["pull_request", "push:main"],
+      "blocking": true,
+      "postgres": true,
+      "redis": true,
+      "worker": "partial existing lifecycle tests; no full deterministic API-to-worker smoke",
+      "live_search": false,
+      "live_llm": false,
+      "deterministic": true,
+      "runtime_seconds": null,
+      "skip_classification": "RUN_POSTGRES_INTEGRATION=1 required"
+    },
+    {
+      "name": "CI / web",
+      "purpose": ["pnpm install", "web build"],
+      "trigger": ["pull_request", "push:main"],
+      "blocking": true,
+      "runtime_seconds": null,
+      "notes": "Exact previous duration not retained."
+    },
+    {
+      "name": "CI / compose",
+      "purpose": ["docker compose config"],
+      "trigger": ["pull_request", "push:main"],
+      "blocking": true,
+      "image_build": false,
+      "service_start": false,
+      "runtime_seconds": null
+    },
+    {
+      "name": "CI / Static V1 release checks",
+      "purpose": ["release_gate", "repeat static tests", "conditional PostgreSQL integration", "repeat web build", "golden evaluation", "secret checks"],
+      "trigger": ["pull_request", "push:main", "after required jobs"],
+      "blocking": true,
+      "duplicate_work": ["ruff", "mypy", "pytest", "postgres integration", "web build"],
+      "runtime_seconds": null,
+      "skip_classification": "EXPECTED_CONDITIONAL_SKIP if a required upstream job failed"
+    },
+    {
+      "name": "Live Research qualification",
+      "purpose": ["real research quality and qualification"],
+      "trigger": ["manual/operator qualification"],
+      "blocking": false,
+      "postgres": true,
+      "redis": true,
+      "worker": true,
+      "live_search": true,
+      "live_llm": true,
+      "deterministic": false,
+      "observed_runtime": "60+ minutes for standard/live runs",
+      "normal_pull_request_gate": false
+    }
+  ],
+  "test_tree": {
+    "unit": "tests/unit",
+    "api": "tests/api",
+    "integration": "tests/integration",
+    "existing_integration_modules": 5,
+    "pytest_markers_before_refactor": []
+  },
+  "observations": [
+    "Release aggregate re-runs static, pytest, integration, and web work after those jobs have already passed.",
+    "No full deterministic API -> outbox -> queue -> worker -> Evidence -> Report -> verify smoke existed.",
+    "CI Compose validation parsed configuration but did not build an application image.",
+    "L1 local pytest baseline measured 34.36 seconds; CI setup/install/job timings were not retained."
+  ]
+}

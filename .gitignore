@@ -53,6 +53,10 @@ artifacts/.secrets/
 !artifacts/phase17_release_quality_scorecard.md
 !artifacts/phase17_stability_analysis.json
 !artifacts/phase17_stability_analysis.md
+!artifacts/test_infrastructure_baseline.json
+!artifacts/test_infrastructure_baseline.md
+!artifacts/test_infrastructure_result.json
+!artifacts/test_infrastructure_result.md
 logs/
 tmp/
 *.db
