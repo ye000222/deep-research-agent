@@ -1,0 +1,94 @@
+{
+  "schema_version": "v2.0-claim-architecture.v1",
+  "research_behavior_diff": "NONE",
+  "implementation_boundary": "passive domain contracts, deterministic candidate primitives, offline baseline analyzer and diagnostics; not wired into ResearchLoop, Acceptance, Closure, Planner, or Report",
+  "canonical_claim": {
+    "fields": ["claim_id", "run_id", "question_id", "dimension_key", "normalized_text", "original_text", "claim_type", "subject", "predicate", "object_or_value", "qualifiers", "polarity", "provenance", "created_at"],
+    "claim_types": ["factual", "quantitative", "comparative", "causal", "descriptive", "unknown"],
+    "qualifier_keys": ["time", "date_range", "location", "unit", "version", "population_scope", "methodology", "condition"],
+    "normalization": "V2.0 collapses whitespace for display/key primitives and preserves original text and qualifier fields. It does not claim semantic canonicalization.",
+    "identity": "claim_id is a database entity identifier; exact_proposition_key is a provisional lexical key, not semantic identity."
+  },
+  "claim_evidence_link": {
+    "fields": ["claim_id", "evidence_id", "relation", "confidence", "source_id", "source_owner_key", "quote_reference", "created_by/method"],
+    "evidence_relations": ["supports", "contradicts", "mentions", "insufficient"],
+    "integrity": "run/question/dimension and source/source_owner_key are validated; owner identity is copied from canonical Source row, never inferred from role."
+  },
+  "claim_relation": {
+    "claim_to_claim": ["same", "related", "contradicts", "unknown"],
+    "v2_0_behavior": "Only exact or explicitly structured deterministic candidate matching; ambiguous text is UNKNOWN. Full semantic equivalence deferred to V2.1."
+  },
+  "verification_state": {
+    "values": ["unsupported", "supported", "verified", "conflicted", "unknown"],
+    "semantics": {
+      "unsupported": "no accepted Evidence supporting this Claim",
+      "supported": "one or more accepted supporting Evidence links but verification contract is not met",
+      "verified": "a versioned explicit Claim-level verification contract is satisfied",
+      "conflicted": "accepted Evidence has an unresolved direct semantic contradiction",
+      "unknown": "inputs/state do not permit a reliable verdict"
+    },
+    "v2_0": "contract only; no verdicts are produced or persisted"
+  },
+  "source_identity": {
+    "role_is_identity": false,
+    "identity_field": "source_owner_key",
+    "owner_rule": "multiple URLs/webpages may map to one owner; source type/role does not establish independence"
+  },
+  "dimension_closure_is_claim_verification": false,
+  "metrics": {
+    "coverage_v1": "unchanged",
+    "claim_metric_definition_version": "claim-v2-baseline-v1",
+    "metrics": ["supported_claim_rate", "multi_evidence_claim_rate", "independently_corroborated_claim_rate", "verified_claim_rate", "conflicted_claim_rate", "unknown_verification_rate", "evidence_per_supported_claim", "independent_owners_per_supported_claim"],
+    "no_composite_score": true
+  },
+  "persistence": {
+    "v2_0_migration": "none",
+    "reuse": ["research_claims", "research_evidence.claim_id", "research_sources.source_owner_key", "research_claim_edges", "research_conflicts", "source snapshot/chunk quote provenance"],
+    "known_v1_limits": ["claim_id nullable on Evidence", "one Evidence row points to at most one Claim", "no structured qualifiers", "no persisted per-Claim verification history"],
+    "compatibility": "No historical backfill; old Evidence without claim_id remains valid and maps to UNKNOWN/NOT_RECONSTRUCTABLE."
+  },
+  "phase_map": [
+    {"phase": "V2.0", "scope": "Claim Architecture + Baseline + diagnostics"},
+    {"phase": "V2.1", "scope": "Semantic Claim Equivalence", "input": "two CanonicalClaim records including original text, structured proposition and qualifiers", "output": "SAME | RELATED | CONTRADICTS | UNKNOWN plus rationale/confidence", "boundary": "no planner/search/acceptance/closure side effects"},
+    {"phase": "V2.2", "scope": "Independent Corroboration, per-Claim verification, contradiction detection"},
+    {"phase": "V2.3", "scope": "Evidence Formation Reliability"},
+    {"phase": "V2.4", "scope": "Claim-driven Gap Closure"},
+    {"phase": "V2.5", "scope": "Planner/Retrieval Variance Reduction only if data justifies"},
+    {"phase": "V2 RC", "scope": "Report upgrade, cross-family qualification, release hardening"}
+  ],
+  "v2_0_tests": "tests/unit/test_claim_architecture_v2_0.py plus existing Evidence Graph and claim-verification suites",
+  "database_migration": false,
+  "validation": {
+    "research_behavior_diff": "NONE",
+    "database_baseline_access": "read-only PostgreSQL at 127.0.0.1:5432; configured Docker hostname postgres was not resolvable from this shell",
+    "l1_unit_api_static": "PASS",
+    "v2_focused_unit_tests": "20 passed",
+    "postgres_checkpoint_redelivery_l2": "PASS (1 test)",
+    "deterministic_research_l2_success_path": {
+      "status": "PASS",
+      "repeatability": "3/3",
+      "run_ids": ["01a0d277-1f11-7527-ae06-1f1aa83fcc89", "01a0d27a-56f1-764c-a8dd-9737d9f30735", "01a0d27b-63bb-76aa-aa71-141ef67b6558"],
+      "candidate_and_accepted_evidence_each": 10,
+      "verified_report_each": true,
+      "creation_to_terminal_seconds": [72.879, 68.409, 113.577]
+    },
+    "deterministic_research_l2_failure_path": {
+      "status": "PASS",
+      "run_id": "01a0d278-f393-7d7c-aed8-92eb05bc642a",
+      "accepted_evidence": 0,
+      "termination_reason": "REPORT_NO_ACCEPTED_EVIDENCE",
+      "report_fabricated": false
+    },
+    "l2_root_cause": "TEST_ISOLATION_FAILURE: the test helper claimed a global pending outbox batch and published stale historical runs onto the current test queue before publishing its target; target-only dispatch fixed the contamination",
+    "test_only_fixes": ["target-scoped outbox claim and publish", "configurable staged success repetition count; default remains 3", "write smoke artifact beneath ARTIFACT_ROOT", "per-run terminal wait ceiling 180 seconds"],
+    "worker_shutdown": "PASS; all passing tests exited cleanly; exact teardown duration is not separately instrumented",
+    "l2_total_pytest_seconds": 339.77,
+    "l2_suite_budget_seconds": 900,
+    "public_network": "NO",
+    "live_search_provider": "NO",
+    "live_llm": "NO",
+    "live_research_runs": 0,
+    "production_research_behavior_diff": "NONE",
+    "stop_gate": "V2.0 READY; V2.1 is not started and awaits user confirmation"
+  }
+}

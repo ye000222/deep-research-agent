@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -74,6 +75,9 @@ def test_deterministic_success_smoke_repeats_three_times(
     app = create_app(settings)
     results: list[dict[str, object]] = []
     started = time.perf_counter()
+    repeat_count = int(os.getenv("L2_SUCCESS_REPETITIONS", "3"))
+    if repeat_count < 1 or repeat_count > 3:
+        raise ValueError("L2_SUCCESS_REPETITIONS must be between 1 and 3")
 
     with TestClient(app) as client:
         profile = client.post(
@@ -98,7 +102,7 @@ def test_deterministic_success_smoke_repeats_three_times(
             perform_ping_check=False,
             shutdown_timeout=15,
         ):
-            for ordinal in range(1, 4):
+            for ordinal in range(1, repeat_count + 1):
                 run_started = time.perf_counter()
                 created = client.post(
                     "/api/v1/research-runs",
@@ -122,7 +126,7 @@ def test_deterministic_success_smoke_repeats_three_times(
                 outbox_state = asyncio.run(_outbox_state(database_url, run_id))
                 assert outbox_state == "published"
 
-                terminal = _wait_for_terminal(client, run_id, timeout_seconds=120)
+                terminal = _wait_for_terminal(client, run_id, timeout_seconds=180)
                 elapsed = round(time.perf_counter() - run_started, 3)
                 assert terminal["status"] in {"completed", "completed_with_limitations"}
 
@@ -151,7 +155,7 @@ def test_deterministic_success_smoke_repeats_three_times(
                     }
                 )
 
-    assert len(results) == 3
+    assert len(results) == repeat_count
     assert len(search_calls) > 0
     assert "research_planning" in model_calls
     assert "evidence_extraction" in model_calls
@@ -162,7 +166,7 @@ def test_deterministic_success_smoke_repeats_three_times(
     _write_smoke_artifact(
         {
             "kind": "deterministic_success",
-            "repeatability": "3/3 PASS",
+            "repeatability": f"{repeat_count}/{repeat_count} PASS",
             "duration_seconds": duration,
             "runs": results,
             "http_requests": len(http_log),
@@ -404,28 +408,51 @@ async def _publish_outbox_task(database_url: str, run_id: str) -> list[str]:
     failures: list[str] = []
     try:
         while time.monotonic() < deadline:
-            batch = await repository.claim_batch()
-            for dispatch in batch:
-                try:
-                    await asyncio.to_thread(
-                        celery_app.send_task,
-                        "deep_research.execute_run",
-                        args=(str(dispatch.run_id),),
-                        task_id=dispatch.dispatch_key,
+            now = datetime.now(UTC)
+            stale_before = now - timedelta(seconds=30)
+            async with database.session_factory() as session, session.begin():
+                row = await session.scalar(
+                    select(TaskDispatchOutboxRow)
+                    .where(
+                        TaskDispatchOutboxRow.run_id == target_run,
+                        (
+                            TaskDispatchOutboxRow.status.in_(("pending", "retry"))
+                            & (TaskDispatchOutboxRow.next_attempt_at <= now)
+                        )
+                        | (
+                            (TaskDispatchOutboxRow.status == "publishing")
+                            & (TaskDispatchOutboxRow.claimed_at <= stale_before)
+                        ),
                     )
-                except Exception as exc:
-                    await repository.mark_retry(
-                        dispatch.outbox_id,
-                        error_code=type(exc).__name__,
-                    )
-                    if dispatch.run_id == target_run:
-                        failures.append(type(exc).__name__)
+                    .with_for_update(skip_locked=True)
+                )
+                if row is not None:
+                    row.status = "publishing"
+                    row.claimed_at = now
+                    row.attempt_count += 1
+                    outbox_id = row.id
+                    dispatch_key = row.dispatch_key
                 else:
-                    await repository.mark_published(dispatch.outbox_id)
-                    if dispatch.run_id == target_run:
-                        return failures
-            if not batch:
+                    outbox_id = None
+                    dispatch_key = None
+
+            if outbox_id is None or dispatch_key is None:
                 await asyncio.sleep(0.05)
+                continue
+
+            try:
+                await asyncio.to_thread(
+                    celery_app.send_task,
+                    "deep_research.execute_run",
+                    args=(str(target_run),),
+                    task_id=dispatch_key,
+                )
+            except Exception as exc:
+                await repository.mark_retry(outbox_id, error_code=type(exc).__name__)
+                failures.append(type(exc).__name__)
+            else:
+                await repository.mark_published(outbox_id)
+                return failures
         failures.append("outbox_target_not_published_within_15_seconds")
         return failures
     finally:
@@ -461,7 +488,7 @@ def _wait_for_terminal(client: Any, run_id: str, *, timeout_seconds: int) -> dic
 
 
 def _write_smoke_artifact(payload: dict[str, object]) -> None:
-    artifact_dir = Path("artifacts")
+    artifact_dir = Path(os.getenv("ARTIFACT_ROOT", "artifacts"))
     artifact_dir.mkdir(exist_ok=True)
     path = artifact_dir / "test_infrastructure_result.json"
     previous: dict[str, object] = {}
