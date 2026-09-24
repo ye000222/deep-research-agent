@@ -1,0 +1,64 @@
+{
+  "schema_version": "v2.0-existing-claim-audit.v1",
+  "base_sha": "815d76c87011eebbd1da685c4f1c054d0f073f81",
+  "branch": "feature/v2-claim-architecture",
+  "research_behavior_diff": "NONE",
+  "claim_semantics": {
+    "generation": {
+      "live": true,
+      "path": "EvidenceExtractor emits ScoredEvidence; ResearchTools.record_page persists each non-duplicate evidence item, deduplicates Claims by run_id + question_id + whitespace/casefold claim_fingerprint, and creates ResearchClaimRow.",
+      "semantic_scope": "Claim row is materialized at evidence persistence, including rejected evidence; accepted graph status is computed separately."
+    },
+    "claim_id": {
+      "live": true,
+      "stable": "UUID database identity within persisted run data; stable hash lookup deduplicates same normalized lexical text within run/question.",
+      "not_equivalent_to": "semantic identity across paraphrases, runs, time/version/scope qualifiers, or numeric unit conversions"
+    },
+    "canonical_text": {
+      "live": true,
+      "finding": "atomic_claim retains extracted text. claim_hash collapses whitespace and case but does not establish semantic canonicality. No explicit qualifier structure exists in ResearchClaimRow."
+    },
+    "claim_evidence_link": {
+      "live": true,
+      "finding": "research_evidence.claim_id is a nullable FK; evidence row also stores relation, accepted, claim text, exact_quote, source_id, optional snapshot_id/chunk_id. It is effectively a one-evidence-to-one-claim edge, not a first-class many-to-many link."
+    },
+    "claim_source_identity": {
+      "live": true,
+      "finding": "Evidence links to research_sources by source_id. research_sources stores source_owner_key, canonical_url, domain and source_type. Owner sets are derived by joining accepted evidence to source rows."
+    },
+    "claim_verification": {
+      "live_but_aggregate": true,
+      "finding": "ClaimVerificationAnalyzer consumes GapRequirement verification_status and aggregate evidence/alignment facts; claim_id is an optional label. It does not persist a per-claim verification result from exact claim-evidence-owner links."
+    },
+    "legacy_claim_status": {
+      "live": true,
+      "values_observed_in_code": ["candidate", "partial", "supported", "disputed", "rejected"],
+      "meaning": "Evidence graph status. supported requires accepted evidence with at least two distinct source_owner_key values; disputed is set for refuting evidence or deterministic contradiction graph cases. Neither status is equivalent to V2 VERIFIED."
+    },
+    "claim_relations": {
+      "live": true,
+      "finding": "research_claim_edges stores deterministic text relation values supports/supplements/contradicts; research_conflicts stores evidence-pair conflicts. Claim-to-Claim taxonomy is heuristic and does not preserve semantic qualifiers as structured scope."
+    },
+    "dimension_vs_claim_verification": {
+      "finding": "GapRequirement is keyed by question/dimension/requirement and owns verification_status; Claim graph is keyed by run/question/claim_hash. Closure/evidence-quality analysis aggregates dimension facts. Dimension closure does not establish a particular Claim VERIFIED."
+    },
+    "historical_verified_claims_zero": {
+      "finding": "The current schema has no claim_verification_results table/column or canonical VERIFIED claim status. Historical verified_claims snapshots therefore cannot be reconstructed as per-claim verdicts; zero is not a defensible count. The V1 qualification scorecard explicitly says this field is informational."
+    },
+    "live_vs_legacy": {
+      "live": ["research_claims", "research_evidence.claim_id", "research_sources.source_owner_key", "research_claim_edges", "research_conflicts", "EvidenceGraphView", "GapRequirement verification projection"],
+      "aggregate_or_noncanonical": ["ClaimVerificationAnalyzer output derived from GapRequirement", "KnownClaimRef checkpoint projection", "research_budget claim risk identifiers", "quality_snapshot claim_count/citation_support aliases"],
+      "not_found_as_persisted_v2_fact": ["explicit qualifier object", "many-to-many ClaimEvidenceLink row", "per-claim verification state/history", "semantic identity registry"]
+    }
+  },
+  "migration": {
+    "v2_0_migration_required": false,
+    "reason": "Existing V1.1 tables already persist Claim identity, evidence-to-claim FK, exact quote/source/chunk provenance, source_owner_key, relations and conflicts. V2.0 is contract/baseline/diagnostics only; adding columns or writes would be unnecessary runtime schema change.",
+    "future_gap": "A future many-to-many claim_evidence_links plus versioned claim_verification_results may be warranted after V2.1/V2.2 contracts are exercised; do not backfill or migrate in V2.0."
+  },
+  "historical_data_access": {
+    "phase17_qualification_run_inventory": "available in checked-in artifacts/v1_release_quality_suite.json",
+    "persisted_run_database": "read-only reachable through the local port-forward using 127.0.0.1:5432; the configured Docker hostname `postgres` itself is not resolvable from this process",
+    "claim_level_rows": "reconstructed read-only for the ten Phase 17 qualification runs by scripts/analyze_v2_0_claim_baseline.py"
+  }
+}

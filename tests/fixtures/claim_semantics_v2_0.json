@@ -1,0 +1,51 @@
+[
+  {
+    "case": "exact_same_proposition",
+    "left": {"text": "The company was founded in 2018.", "subject": "the company", "predicate": "founded", "value": "2018", "qualifiers": {"time": "2018"}},
+    "right": {"text": "The company was founded in 2018.", "subject": "the company", "predicate": "founded", "value": "2018", "qualifiers": {"time": "2018"}},
+    "v2_0_result": "same",
+    "v2_1_expectation": "same"
+  },
+  {
+    "case": "semantic_paraphrase_requires_v2_1",
+    "left": {"text": "The organization was established in 2018.", "subject": "the company", "predicate": "founded", "value": "2018", "qualifiers": {"time": "2018"}},
+    "right": {"text": "The company was founded in 2018.", "subject": "the company", "predicate": "founded", "value": "2018", "qualifiers": {"time": "2018"}},
+    "v2_0_result": "same",
+    "v2_1_expectation": "candidate_same"
+  },
+  {
+    "case": "time_qualifier_differs",
+    "left": {"text": "Revenue was $20B in 2024.", "subject": "revenue", "predicate": "amount", "value": "20 billion", "qualifiers": {"time": "2024", "unit": "USD"}},
+    "right": {"text": "Revenue was $20B in 2025.", "subject": "revenue", "predicate": "amount", "value": "20 billion", "qualifiers": {"time": "2025", "unit": "USD"}},
+    "v2_0_result": "related",
+    "v2_1_expectation": "not_same_related"
+  },
+  {
+    "case": "same_scope_numeric_contradiction_candidate",
+    "left": {"text": "Population was 124M in 2025.", "subject": "population", "predicate": "count", "value": "124 million", "qualifiers": {"time": "2025", "unit": "people", "scope": "same population"}},
+    "right": {"text": "Population was 126M in 2025.", "subject": "population", "predicate": "count", "value": "126 million", "qualifiers": {"time": "2025", "unit": "people", "scope": "same population"}},
+    "v2_0_result": "contradicts",
+    "v2_1_expectation": "contradiction_candidate"
+  },
+  {
+    "case": "unit_normalization_candidate",
+    "left": {"text": "Revenue was $20 billion.", "subject": "revenue", "predicate": "amount", "value": "20 billion", "qualifiers": {"unit": "USD"}},
+    "right": {"text": "Revenue was $20,000 million.", "subject": "revenue", "predicate": "amount", "value": "20000 million", "qualifiers": {"unit": "USD"}},
+    "v2_0_result": "same",
+    "v2_1_expectation": "same_value_candidate"
+  },
+  {
+    "case": "polarity_contradiction_candidate",
+    "left": {"text": "Drug X reduces outcome Y.", "subject": "Drug X", "predicate": "reduces outcome Y", "value": "outcome Y", "qualifiers": {"scope": "same study population"}, "polarity": true},
+    "right": {"text": "Drug X does not reduce outcome Y.", "subject": "Drug X", "predicate": "reduces outcome Y", "value": "outcome Y", "qualifiers": {"scope": "same study population"}, "polarity": false},
+    "v2_0_result": "contradicts",
+    "v2_1_expectation": "contradiction_candidate"
+  },
+  {
+    "case": "version_difference_is_related",
+    "left": {"text": "Model X supports 128K context in v1.", "subject": "Model X", "predicate": "context window", "value": "128000", "qualifiers": {"version": "v1", "unit": "tokens"}},
+    "right": {"text": "Model X supports 1M context in v2.", "subject": "Model X", "predicate": "context window", "value": "1000000", "qualifiers": {"version": "v2", "unit": "tokens"}},
+    "v2_0_result": "related",
+    "v2_1_expectation": "related_versioned"
+  }
+]
