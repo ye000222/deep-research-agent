@@ -356,10 +356,15 @@ def _install_worker_boundaries(
     def fixture_dns(host: str, *args: object, **kwargs: object) -> list[tuple[Any, ...]]:
         if host in infrastructure_hosts:
             port = int(args[0]) if args else 0
-            address: tuple[object, ...] = (host, port, 0, 0) if ":" in host else (host, port)
+            resolved_host = "127.0.0.1" if host == "localhost" else host
+            address: tuple[object, ...] = (
+                (resolved_host, port, 0, 0)
+                if ":" in resolved_host
+                else (resolved_host, port)
+            )
             return [
                 (
-                    socket.AF_INET6 if ":" in host else socket.AF_INET,
+                    socket.AF_INET6 if ":" in resolved_host else socket.AF_INET,
                     socket.SOCK_STREAM,
                     socket.IPPROTO_TCP,
                     "",
