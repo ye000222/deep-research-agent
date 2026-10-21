@@ -19,6 +19,10 @@ from app.memory.manager import ResearchMemoryManager
 from app.services.planner import PlannerService
 from app.services.report_writer import ReportWriterService
 from app.services.research_loop import ResearchLoopService
+from app.services.research_orchestrator import (
+    ResearchOrchestrator,
+    research_executor_for_version,
+)
 
 _PLANNER_RETRY_DELAYS_SECONDS = (3.0, 10.0)
 
@@ -47,6 +51,7 @@ class ResearchGraphService:
         research_loop: ResearchLoopService,
         report_writer: ReportWriterService,
         memories: ResearchMemoryManager | None = None,
+        research_orchestrator: ResearchOrchestrator | None = None,
     ) -> None:
         self._runs = runs
         self._states = states
@@ -54,6 +59,7 @@ class ResearchGraphService:
         self._research_loop = research_loop
         self._report_writer = report_writer
         self._memories = memories
+        self._research_orchestrator = research_orchestrator
 
     async def execute(
         self,
@@ -126,10 +132,27 @@ class ResearchGraphService:
 
         async def research_node(graph_state: ResearchGraphState) -> ResearchGraphState:
             iteration = int(graph_state.get("iteration", 0)) + 1
-            result = await self._research_loop.run_one_iteration(
-                run_id,
-                worker_task_id=worker_task_id,
+            run_inputs_reader = getattr(self._runs, "get_run_state_inputs", None)
+            run_inputs = (
+                await run_inputs_reader(run_id)
+                if callable(run_inputs_reader)
+                else {"orchestrator_version": "V2_LEGACY"}
             )
+            executor = research_executor_for_version(
+                str(run_inputs.get("orchestrator_version", ""))
+            )
+            if executor == "V3":
+                if self._research_orchestrator is None:
+                    raise RuntimeError("V3_RESEARCH_ORCHESTRATOR_NOT_CONFIGURED")
+                result = await self._research_orchestrator.run_next_work(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                )
+            else:
+                result = await self._research_loop.run_one_iteration(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                )
             state = await self._states.synchronize(
                 run_id,
                 node_name="research_iteration",

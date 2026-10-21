@@ -42,3 +42,20 @@ def get_client_session(request: Request, response: Response) -> ClientSession:
         secure=settings.app_env.lower() not in {"development", "test"},
     )
     return session
+
+
+def get_existing_client_session(request: Request) -> ClientSession:
+    """Require a valid existing cookie without triggering normal session creation."""
+    manager: ClientSessionManager | None = request.app.state.client_sessions
+    if manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_code": "provider_profile_persistence_disabled"},
+        )
+    session = manager.resolve_existing(request.cookies.get(manager.cookie_name))
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error_code": "AUTHENTICATED_CLIENT_SESSION_REQUIRED"},
+        )
+    return session

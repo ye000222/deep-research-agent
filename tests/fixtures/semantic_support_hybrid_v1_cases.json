@@ -1,0 +1,27 @@
+{
+  "provider_calls": 0,
+  "cases": [
+    {"case_id": "A_exact_numeric_support", "route": "DETERMINISTICALLY_SUPPORTED", "verifier_calls": 0},
+    {"case_id": "B_exact_numeric_rejection", "route": "DETERMINISTICALLY_REJECTED", "verifier_calls": 0},
+    {"case_id": "C_attachment_supported", "verdict": "SUPPORTED"},
+    {"case_id": "D_attachment_not_supported", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "E_attachment_ambiguous", "verdict": "AMBIGUOUS"},
+    {"case_id": "F_method_relation_supported", "role": "METHOD_RELATION", "verdict": "SUPPORTED"},
+    {"case_id": "G_method_value_without_relation", "role": "METHOD_RELATION", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "H_epistemic_operator_supported", "role": "EPISTEMIC_OPERATOR", "verdict": "SUPPORTED"},
+    {"case_id": "I_wrong_epistemic_agent", "role": "EPISTEMIC_AGENT", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "J_wrong_sibling_scope", "role": "ATTACHMENT", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "K_wrong_metric_pairing", "role": "MEASUREMENT_VALUE", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "L_category_wrong_measurement", "role": "MEASUREMENT_DEFINITION", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "M_unrelated_condition", "role": "CONDITION", "verdict": "NOT_SUPPORTED"},
+    {"case_id": "N_insufficient_evidence", "verdict": "INSUFFICIENT_EVIDENCE"},
+    {"case_id": "O_schema_invalid", "failure": "SCHEMA_INVALID"},
+    {"case_id": "P_omitted_binding", "failure": "RESPONSE_OMITTED"},
+    {"case_id": "Q_unknown_binding_ref", "failure": "BATCH_INVALID"},
+    {"case_id": "R_duplicate_contradictory_verdict", "failure": "BATCH_INVALID"},
+    {"case_id": "S_textual_invalid_no_verifier", "textual": "INVALID", "verifier_calls": 0},
+    {"case_id": "T_structural_invalid_no_verifier", "structural": "INVALID", "verifier_calls": 0},
+    {"case_id": "U_multiple_inference_bindings_one_claim_call", "inference_bindings": 3, "verifier_calls": 1},
+    {"case_id": "V_no_inference_bindings_no_call", "inference_bindings": 0, "verifier_calls": 0}
+  ]
+}

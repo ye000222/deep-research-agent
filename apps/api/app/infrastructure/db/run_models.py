@@ -8,6 +8,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Identity,
@@ -29,6 +30,13 @@ from app.infrastructure.db.base import Base
 class ResearchRunRow(Base):
     __tablename__ = "research_runs"
     __table_args__ = (
+        CheckConstraint(
+            "(latest_run_state_ref IS NULL AND latest_run_state_hash IS NULL "
+            "AND latest_run_state_version IS NULL) OR "
+            "(latest_run_state_ref IS NOT NULL AND latest_run_state_hash IS NOT NULL "
+            "AND latest_run_state_version IS NOT NULL AND latest_run_state_version >= 1)",
+            name="ck_research_run_state_pointer_consistent",
+        ),
         UniqueConstraint(
             "owner_hash",
             "idempotency_key",
@@ -49,6 +57,15 @@ class ResearchRunRow(Base):
     normalized_goal: Mapped[str] = mapped_column(Text, nullable=False)
     constraints: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False)
+    run_kind: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="research", server_default="research"
+    )
+    orchestrator_version: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="V2_LEGACY", server_default="V2_LEGACY"
+    )
+    latest_run_state_ref: Mapped[str | None] = mapped_column(Text)
+    latest_run_state_hash: Mapped[str | None] = mapped_column(String(64))
+    latest_run_state_version: Mapped[int | None] = mapped_column(Integer)
     phase: Mapped[str] = mapped_column(String(30), nullable=False)
     state_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     plan_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -172,3 +189,72 @@ class ResearchPlanItemRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class ResearchWorkRow(Base):
+    """Durable logical research work owned by the V3 orchestrator."""
+
+    __tablename__ = "research_work"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "producer_kind", "producer_ref", "schema_version",
+            name="uq_research_work_producer_identity",
+        ),
+        Index("ix_research_work_run_status_priority", "run_id", "status", "priority"),
+    )
+
+    work_ref: Mapped[UUID] = mapped_column(SQLUuid(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        SQLUuid(as_uuid=True), ForeignKey("research_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    producer_kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    producer_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    work_kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    objective: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    objective_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    constraints: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    execution_bounds: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    budget_attribution: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    source_run_state_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    source_run_state_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_run_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class WorkAttemptRow(Base):
+    """Durable reservation/outcome; external dispatch is not exactly-once."""
+
+    __tablename__ = "research_work_attempt"
+    __table_args__ = (
+        UniqueConstraint("work_ref", "attempt_index", name="uq_work_attempt_index"),
+        UniqueConstraint("reservation_identity", name="uq_work_attempt_reservation_identity"),
+        Index("ix_work_attempt_work_state", "work_ref", "state"),
+    )
+
+    attempt_ref: Mapped[UUID] = mapped_column(SQLUuid(as_uuid=True), primary_key=True)
+    work_ref: Mapped[UUID] = mapped_column(
+        SQLUuid(as_uuid=True),
+        ForeignKey("research_work.work_ref", ondelete="CASCADE"),
+        nullable=False,
+    )
+    attempt_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(30), nullable=False)
+    reservation_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_run_state_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    source_run_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    query_refs: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    tool_call_refs: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    produced_evidence_refs: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    reused_evidence_refs: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    budget_refs: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    usage_summary: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    failure_classification: Mapped[str | None] = mapped_column(String(100))
+    resume_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    schema_version: Mapped[str] = mapped_column(String(50), nullable=False)

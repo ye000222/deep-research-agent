@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 
 
 class AdapterType(StrEnum):
@@ -41,7 +41,7 @@ class CapabilityMatrix(BaseModel):
 
 class ContentPart(BaseModel):
     kind: str = Field(pattern="^(text|json)$")
-    value: str | dict[str, Any]
+    value: JsonValue
 
 
 class CanonicalModelRequest(BaseModel):

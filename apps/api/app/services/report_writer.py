@@ -363,7 +363,7 @@ class ReportWriterService:
             content_parts=(
                 ContentPart(
                     kind="json",
-                    value=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    value=payload,
                 ),
             ),
             response_contract=ReportDraft.model_json_schema(),

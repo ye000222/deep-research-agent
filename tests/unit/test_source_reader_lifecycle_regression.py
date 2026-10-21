@@ -117,10 +117,14 @@ async def test_short_body_is_distinct_from_empty_content(
     )
     reader = PublicWebReader(httpx.AsyncClient())
 
-    await _read_capturing_error(reader, "https://example.com/short")
+    error = await _read_capturing_error(reader, "https://example.com/short")
 
+    assert isinstance(error, ToolExecutionError)
+    assert error.code == "WEBPAGE_EXTRACTION_EMPTY"
     assert _event_types(reader)[-1] == "source.content_quality_rejected"
     assert _events(reader)[-1].get("reason") == "body_too_short"
+    assert "source.content_quality_passed" not in _event_types(reader)
+    assert "source.readable" not in _event_types(reader)
 
 
 @pytest.mark.asyncio

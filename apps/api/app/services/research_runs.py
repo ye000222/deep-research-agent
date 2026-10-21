@@ -121,6 +121,7 @@ class ResearchRunServiceProtocol(Protocol):
         budget_tier: str,
         plan_template_run_id: UUID | None = None,
         benchmark: Mapping[str, object] | None = None,
+        orchestrator_version: str = "V2_LEGACY",
     ) -> tuple[ResearchRunView, bool]: ...
 
     async def list_runs(self, owner_hash: str, *, limit: int) -> list[ResearchRunView]: ...
@@ -213,6 +214,7 @@ class ResearchRunService:
         budget_tier: str,
         plan_template_run_id: UUID | None = None,
         benchmark: Mapping[str, object] | None = None,
+        orchestrator_version: str = "V2_LEGACY",
     ) -> tuple[ResearchRunView, bool]:
         normalized = " ".join(query.split())
         if not normalized:
@@ -295,6 +297,7 @@ class ResearchRunService:
             normalized_goal=normalized,
             credential_version_id=saved_profile_version_id,
             budget_snapshot={"tier": budget_tier, **budget},
+            orchestrator_version=orchestrator_version,
         )
 
     async def list_runs(self, owner_hash: str, *, limit: int) -> list[ResearchRunView]:

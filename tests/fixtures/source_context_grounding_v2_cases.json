@@ -1,0 +1,25 @@
+{
+  "provider_calls": 0,
+  "cases": [
+    {"case_id": "A_simple_grounded_assertion", "kind": "simple"},
+    {"case_id": "B_epistemic_reports_operator_agent", "kind": "epistemic"},
+    {"case_id": "C_prediction_modality", "kind": "prediction"},
+    {"case_id": "D_method_relation_and_value", "kind": "method"},
+    {"case_id": "E_method_value_without_relation", "kind": "method_missing"},
+    {"case_id": "F_condition_evidence", "kind": "condition"},
+    {"case_id": "G_scope_evidence", "kind": "scope"},
+    {"case_id": "H_measurement_definition", "kind": "measurement"},
+    {"case_id": "I_shared_temporal_through_scope", "kind": "shared_scope"},
+    {"case_id": "J_direct_attachment", "kind": "direct_attachment"},
+    {"case_id": "K_shared_scope_attachment", "kind": "shared_attachment"},
+    {"case_id": "L_span_reused_for_multiple_roles", "kind": "span_reuse"},
+    {"case_id": "M_textual_grounding_invalid", "kind": "fabricated_span"},
+    {"case_id": "N_semantic_support_ambiguous", "kind": "semantic_ambiguous"},
+    {"case_id": "O_structural_reference_invalid", "kind": "dangling_ref"},
+    {"case_id": "P_repeated_span_occurrence", "kind": "repeated"},
+    {"case_id": "Q_nested_evidence_spans", "kind": "nested"},
+    {"case_id": "R_fabricated_agent", "kind": "fabricated_agent"},
+    {"case_id": "S_correct_token_in_wrong_clause", "kind": "wrong_clause"},
+    {"case_id": "T_canonical_enum_not_lexical", "kind": "canonical_nonliteral"}
+  ]
+}

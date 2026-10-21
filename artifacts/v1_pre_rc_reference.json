@@ -1,0 +1,276 @@
+{
+  "schema_version": "v1-pre-rc-reference.v1",
+  "phase": "16.0",
+  "run_ids": [
+    "01a0c3ef-928b-7f0d-8006-40843c571b57",
+    "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0",
+    "01a0c412-5ae6-7b9c-9353-7be1ad74c293"
+  ],
+  "benchmark_identity": {
+    "benchmark_id": "v1-dev-model-comparison",
+    "benchmark_version": "1.0.0",
+    "tier": "standard",
+    "metric_definition_version": "coverage-v1",
+    "plan_policy": "frozen reference plan: questions=5, priority_one=4, priority_two=1",
+    "independent_source_targeting_enabled": true,
+    "evidence_input_quality_enabled": false
+  },
+  "quality_reference": {
+    "run_count": 3,
+    "quality": {
+      "coverage": {
+        "mean": 0.714267,
+        "sd": 0.101022,
+        "min": 0.5714,
+        "max": 0.7857,
+        "n": 3
+      },
+      "priority_one_coverage": {
+        "mean": 0.0,
+        "sd": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 3
+      },
+      "critical_gap_count": {
+        "mean": 1.333333,
+        "sd": 0.471405,
+        "min": 1.0,
+        "max": 2.0,
+        "n": 3
+      },
+      "candidate_evidence": {
+        "mean": 54.666667,
+        "sd": 6.128259,
+        "min": 47.0,
+        "max": 62.0,
+        "n": 3
+      },
+      "accepted_evidence": {
+        "mean": 31.0,
+        "sd": 5.887841,
+        "min": 23.0,
+        "max": 37.0,
+        "n": 3
+      },
+      "acceptance_rate": {
+        "mean": 0.572361,
+        "sd": 0.117199,
+        "min": 0.418182,
+        "max": 0.702128,
+        "n": 3
+      },
+      "supported_claims": {
+        "mean": 31.0,
+        "sd": 5.887841,
+        "min": 23.0,
+        "max": 37.0,
+        "n": 3
+      },
+      "verified_claims": {
+        "mean": 0.0,
+        "sd": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 3
+      },
+      "unverified_claims": {
+        "mean": 31.0,
+        "sd": 5.887841,
+        "min": 23.0,
+        "max": 37.0,
+        "n": 3
+      },
+      "gap_requirement_total": {
+        "mean": 38.333333,
+        "sd": 6.236096,
+        "min": 30.0,
+        "max": 45.0,
+        "n": 3
+      },
+      "gap_open": {
+        "mean": 12.0,
+        "sd": 1.632993,
+        "min": 10.0,
+        "max": 14.0,
+        "n": 3
+      },
+      "gap_partial": {
+        "mean": 11.666667,
+        "sd": 1.699673,
+        "min": 10.0,
+        "max": 14.0,
+        "n": 3
+      },
+      "gap_closed": {
+        "mean": 14.666667,
+        "sd": 5.312459,
+        "min": 8.0,
+        "max": 21.0,
+        "n": 3
+      },
+      "gap_closure_rate": {
+        "mean": 0.369445,
+        "sd": 0.081744,
+        "min": 0.266667,
+        "max": 0.466667,
+        "n": 3
+      }
+    },
+    "research_work": {
+      "logical_queries": {
+        "mean": 26.333333,
+        "sd": 3.681787,
+        "min": 22.0,
+        "max": 31.0,
+        "n": 3
+      },
+      "search_started": {
+        "mean": 35.0,
+        "sd": 4.546061,
+        "min": 29.0,
+        "max": 40.0,
+        "n": 3
+      },
+      "search_completed": {
+        "mean": 26.333333,
+        "sd": 3.681787,
+        "min": 22.0,
+        "max": 31.0,
+        "n": 3
+      },
+      "provider_requests": {
+        "mean": 67.666667,
+        "sd": 43.399949,
+        "min": 35.0,
+        "max": 129.0,
+        "n": 3
+      },
+      "candidate_urls": {
+        "mean": 337.0,
+        "sd": 25.508169,
+        "min": 317.0,
+        "max": 373.0,
+        "n": 3
+      },
+      "unique_urls": {
+        "mean": 157.333333,
+        "sd": 18.785337,
+        "min": 134.0,
+        "max": 180.0,
+        "n": 3
+      },
+      "readable_sources": {
+        "mean": 22.666667,
+        "sd": 0.942809,
+        "min": 22.0,
+        "max": 24.0,
+        "n": 3
+      },
+      "reader_completed": {
+        "mean": 22.666667,
+        "sd": 0.942809,
+        "min": 22.0,
+        "max": 24.0,
+        "n": 3
+      },
+      "evidence_extractions": {
+        "mean": 23.0,
+        "sd": 0.816497,
+        "min": 22.0,
+        "max": 24.0,
+        "n": 3
+      }
+    },
+    "cost": {
+      "runtime_seconds": {
+        "mean": 2935.566667,
+        "sd": 535.897405,
+        "min": 2189.0,
+        "max": 3421.8,
+        "n": 3
+      },
+      "tokens": {
+        "mean": 140212.0,
+        "sd": 14251.310489,
+        "min": 120136.0,
+        "max": 151788.0,
+        "n": 3
+      }
+    }
+  },
+  "canonical_gap_summary": {
+    "total": 17,
+    "closed": 11,
+    "partial": 6,
+    "open": 0,
+    "by_run": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": {
+        "partial": 2,
+        "closed": 3
+      },
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": {
+        "closed": 4,
+        "partial": 2
+      },
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": {
+        "closed": 4,
+        "partial": 2
+      }
+    }
+  },
+  "reliability_summary": {
+    "run_completed": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 1,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 1,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 1
+    },
+    "report_verified": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 1,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 1,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 1
+    },
+    "technical_degraded": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 2,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 7,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 2
+    },
+    "retry_scheduled": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 19,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 23,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 25
+    },
+    "tool_failed": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 6,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 12,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 6
+    },
+    "search_source_exhausted": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 18,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 6,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 12
+    },
+    "recovery_started": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 0,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 2,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 0
+    },
+    "recovery_completed": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 0,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 2,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 0
+    },
+    "closure_transitions": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 2,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 4,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 4
+    },
+    "closure_feedback": {
+      "01a0c3ef-928b-7f0d-8006-40843c571b57": 11,
+      "01a0c412-10b0-7c3f-8cf4-d56aeecbbea0": 8,
+      "01a0c412-5ae6-7b9c-9353-7be1ad74c293": 8
+    },
+    "assessment": "All three runs reached terminal completed_with_limitations and report.verified; no persisted crash, unbounded-loop, deadline-enforcement, recovery-deadlock, or event-persistence failure was observed in the audited event counts."
+  },
+  "purpose": "V1 Pre-RC reference only; not a new benchmark and not a causal experiment."
+}

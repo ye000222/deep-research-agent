@@ -1,0 +1,106 @@
+{
+  "fixture_version": "atomic-proposition-contract-synthetic-v1",
+  "synthetic_only": true,
+  "cases": {
+    "same_structured_paraphrase": {
+      "left": {
+        "subject": "Device X",
+        "predicate": "has maximum load",
+        "value": {"kind": "quantity", "numeric": {"operator": "exact", "value": "12", "unit": "kg"}},
+        "polarity": "asserted",
+        "qualifiers": [{"category": "condition", "key": "test_mode", "value": "indoor", "materiality": "material"}]
+      },
+      "right": {
+        "subject": "Device X",
+        "predicate": "has maximum load",
+        "value": {"kind": "quantity", "numeric": {"operator": "exact", "value": "12", "unit": "kg"}},
+        "polarity": "asserted",
+        "qualifiers": [{"category": "condition", "key": "test_mode", "value": "indoor", "materiality": "material"}]
+      },
+      "expected_guard": "same"
+    },
+    "time_scope_mismatch": {
+      "left_qualifier": {"category": "period", "key": "period", "value": "2024", "materiality": "material"},
+      "right_qualifier": {"category": "period", "key": "period", "value": "2025", "materiality": "material"},
+      "expected_guard": "not_same",
+      "expected_contradiction_comparability": "incomparable"
+    },
+    "version_mismatch": {
+      "left_qualifier": {"category": "version", "key": "version", "value": "v1", "materiality": "material"},
+      "right_qualifier": {"category": "version", "key": "version", "value": "v2", "materiality": "material"},
+      "expected_guard": "not_same",
+      "expected_contradiction_comparability": "incomparable"
+    },
+    "scope_mismatch": {
+      "left_qualifier": {"category": "scope", "key": "geography", "value": "region-a", "materiality": "material"},
+      "right_qualifier": {"category": "scope", "key": "geography", "value": "global", "materiality": "material"},
+      "expected_contradiction_comparability": "incomparable"
+    },
+    "polarity_mismatch": {
+      "left_polarity": "asserted",
+      "right_polarity": "negated",
+      "expected_guard": "not_same",
+      "expected_contradiction_comparability": "comparable"
+    },
+    "unit_mismatch": {
+      "left_numeric": {"operator": "exact", "value": "10", "unit": "km"},
+      "right_numeric": {"operator": "exact", "value": "10", "unit": "mi"},
+      "expected_contradiction_comparability": "incomparable",
+      "automatic_conversion": false
+    },
+    "general_specific": {
+      "general": {"subject": "System X", "predicate": "supports mode Y", "qualifiers": []},
+      "specific": {
+        "subject": "System X",
+        "predicate": "supports mode Y",
+        "qualifiers": [{"category": "condition", "key": "operating_state", "value": "state-a", "materiality": "material"}]
+      },
+      "expected_relation": "related",
+      "same": false,
+      "subsumption_inferred": false
+    },
+    "shared_core_composite": {
+      "claim_a_propositions": ["P", "Q"],
+      "claim_b_propositions": ["P", "R"],
+      "shared_proposition_identity": "P",
+      "whole_claim_relation": "related"
+    },
+    "numeric_conflict_same_scope": {
+      "left_numeric": {"operator": "exact", "value": "10", "unit": "unit-u"},
+      "right_numeric": {"operator": "exact", "value": "12", "unit": "unit-u"},
+      "same_subject_predicate_qualifiers": true,
+      "expected_comparability": "comparable",
+      "contradiction_requires_review": true
+    },
+    "causal_relation": {
+      "subject": "Process A",
+      "predicate": "causes",
+      "object": "Outcome B",
+      "causality_is_preserved": true
+    },
+    "comparison_relation": {
+      "subject": "System A",
+      "predicate": "outperforms",
+      "comparison_target": "System B",
+      "comparison_metric": "latency",
+      "numeric": {"operator": "exact", "value": "10", "unit": "percent"},
+      "condition_is_material": true
+    },
+    "enumeration_membership": {
+      "claim_text": "Applications include A, B and C.",
+      "default_propositions": [
+        {"subject": "A", "predicate": "is_member_of", "object": "application set"},
+        {"subject": "B", "predicate": "is_member_of", "object": "application set"},
+        {"subject": "C", "predicate": "is_member_of", "object": "application set"}
+      ],
+      "exhaustive_set_equality_inferred": false
+    },
+    "ambiguous_decomposition": {
+      "status": "unresolved_decomposition",
+      "subject": null,
+      "predicate": null,
+      "reason": "The source wording does not determine whether the phrase is a fact or attribution.",
+      "expected_identity_guard": "unknown"
+    }
+  }
+}

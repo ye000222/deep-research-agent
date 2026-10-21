@@ -1,0 +1,32 @@
+{
+  "fixture_version": "source-context-extraction-v3.synthetic.v1",
+  "cases": [
+    {"id":"assertion_with_attribution_lead_in","expected":"substantive_anchor_supported"},
+    {"id":"attribution_only_unresolved","expected":"UNRESOLVED"},
+    {"id":"epistemic_operator_context_owner","expected":"RESOLVED"},
+    {"id":"epistemic_agent_context_owner","expected":"RESOLVED"},
+    {"id":"epistemic_binding_to_assertion","expected":"INVALID"},
+    {"id":"method_identity","expected":"RESOLVED"},
+    {"id":"method_purpose_relation","expected":"RESOLVED"},
+    {"id":"assertion_causes_assertion","expected":"RESOLVED"},
+    {"id":"assertion_results_in_assertion","expected":"RESOLVED"},
+    {"id":"reversed_causal_direction","expected":"RESOLVED"},
+    {"id":"unresolved_causal_direction","expected":"UNKNOWN"},
+    {"id":"generic_compatibility","expected":"RESOLVED"},
+    {"id":"measurement_value_unit_basis","expected":"RESOLVED"},
+    {"id":"measurement_basis_without_result","expected":"RESOLVED"},
+    {"id":"measurement_result_without_basis","expected":"RESOLVED"},
+    {"id":"metric_result_without_formal_definition","expected":"definition_not_inferred"},
+    {"id":"resolved_attachment_with_binding","expected":"RESOLVED"},
+    {"id":"resolved_attachment_missing_binding","expected":"PARTIAL"},
+    {"id":"multi_target_attachment_with_binding","expected":"RESOLVED"},
+    {"id":"multi_target_attachment_missing_binding","expected":"PARTIAL"},
+    {"id":"semantic_relation_with_binding","expected":"RESOLVED"},
+    {"id":"semantic_relation_missing_binding","expected":"PARTIAL"},
+    {"id":"relation_invalid_source_ref","expected":"INVALID"},
+    {"id":"relation_invalid_target_ref","expected":"INVALID"},
+    {"id":"valid_scope_graph","expected":"RESOLVED"},
+    {"id":"invalid_scope_graph","expected":"INVALID"},
+    {"id":"structural_evidence_not_semantic_promotion","expected":"NOT_EVALUATED"}
+  ]
+}

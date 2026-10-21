@@ -1,0 +1,181 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "assertion-composition-contract-v2.1r-v1",
+  "proposed_model_output_contract": {
+    "version": "atomic-proposition-schema-v3",
+    "optional_field": "assertion_composition",
+    "sparse_default": "single propositions and plain independently asserted conjunctions need no group",
+    "group_shape": {
+      "schema_version": "assertion-composition-v1",
+      "root_group_id": "g-root",
+      "groups": [
+        {
+          "group_id": "g-root",
+          "operator": "OR",
+          "source_span": "Unit A is ready or Unit B is active",
+          "members": [
+            {"member_type": "proposition", "proposition_index": 0, "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit A is ready"},
+            {"member_type": "proposition", "proposition_index": 1, "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit B is active"}
+          ]
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "case_id": "single_proposition_sparse",
+      "claim_text": "Unit A is ready.",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000001"],
+      "composition": null,
+      "expected_eligibility": {}
+    },
+    {
+      "case_id": "conjunction",
+      "claim_text": "Unit A is ready and Unit B is active.",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000011", "00000000-0000-0000-0000-000000000012"],
+      "composition": {
+        "claim_id": "10000000-0000-0000-0000-000000000001",
+        "root_group_id": "20000000-0000-0000-0000-000000000001",
+        "groups": [
+          {
+            "group_id": "20000000-0000-0000-0000-000000000001",
+            "operator": "AND",
+            "source_span": "Unit A is ready and Unit B is active.",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000011", "verification_eligibility": "INDEPENDENTLY_ASSERTED", "source_span": "Unit A is ready"},
+              {"member_type": "proposition", "position": 1, "proposition_id": "00000000-0000-0000-0000-000000000012", "verification_eligibility": "INDEPENDENTLY_ASSERTED", "source_span": "Unit B is active"}
+            ]
+          }
+        ]
+      },
+      "expected_eligibility": {"00000000-0000-0000-0000-000000000011": "INDEPENDENTLY_ASSERTED", "00000000-0000-0000-0000-000000000012": "INDEPENDENTLY_ASSERTED"}
+    },
+    {
+      "case_id": "disjunction",
+      "claim_text": "Unit A is ready or Unit B is active.",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000021", "00000000-0000-0000-0000-000000000022"],
+      "composition": {
+        "claim_id": "10000000-0000-0000-0000-000000000002",
+        "root_group_id": "20000000-0000-0000-0000-000000000002",
+        "groups": [
+          {
+            "group_id": "20000000-0000-0000-0000-000000000002",
+            "operator": "OR",
+            "source_span": "Unit A is ready or Unit B is active.",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000021", "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit A is ready"},
+              {"member_type": "proposition", "position": 1, "proposition_id": "00000000-0000-0000-0000-000000000022", "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit B is active"}
+            ]
+          }
+        ]
+      },
+      "expected_eligibility": {"00000000-0000-0000-0000-000000000021": "NOT_INDEPENDENTLY_ASSERTED", "00000000-0000-0000-0000-000000000022": "NOT_INDEPENDENTLY_ASSERTED"}
+    },
+    {
+      "case_id": "exclusive_alternative",
+      "claim_text": "Unit A is ready or Unit B is active, but not both.",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000031", "00000000-0000-0000-0000-000000000032"],
+      "composition": {
+        "claim_id": "10000000-0000-0000-0000-000000000003",
+        "root_group_id": "20000000-0000-0000-0000-000000000003",
+        "groups": [
+          {
+            "group_id": "20000000-0000-0000-0000-000000000003",
+            "operator": "XOR",
+            "source_span": "Unit A is ready or Unit B is active, but not both.",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000031", "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit A is ready"},
+              {"member_type": "proposition", "position": 1, "proposition_id": "00000000-0000-0000-0000-000000000032", "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit B is active"}
+            ]
+          }
+        ]
+      },
+      "expected_eligibility": {"00000000-0000-0000-0000-000000000031": "NOT_INDEPENDENTLY_ASSERTED", "00000000-0000-0000-0000-000000000032": "NOT_INDEPENDENTLY_ASSERTED"}
+    },
+    {
+      "case_id": "nested_conjunction_of_disjunction",
+      "claim_text": "Unit A is ready and (Unit B is active or Unit C is online).",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000041", "00000000-0000-0000-0000-000000000042", "00000000-0000-0000-0000-000000000043"],
+      "composition": {
+        "claim_id": "10000000-0000-0000-0000-000000000004",
+        "root_group_id": "20000000-0000-0000-0000-000000000004",
+        "groups": [
+          {
+            "group_id": "20000000-0000-0000-0000-000000000004",
+            "operator": "AND",
+            "source_span": "Unit A is ready and (Unit B is active or Unit C is online).",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000041", "verification_eligibility": "INDEPENDENTLY_ASSERTED", "source_span": "Unit A is ready"},
+              {"member_type": "group", "position": 1, "group_id": "20000000-0000-0000-0000-000000000005", "source_span": "Unit B is active or Unit C is online"}
+            ]
+          },
+          {
+            "group_id": "20000000-0000-0000-0000-000000000005",
+            "operator": "OR",
+            "source_span": "Unit B is active or Unit C is online",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000042", "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit B is active"},
+              {"member_type": "proposition", "position": 1, "proposition_id": "00000000-0000-0000-0000-000000000043", "verification_eligibility": "NOT_INDEPENDENTLY_ASSERTED", "source_span": "Unit C is online"}
+            ]
+          }
+        ]
+      },
+      "expected_eligibility": {"00000000-0000-0000-0000-000000000041": "INDEPENDENTLY_ASSERTED", "00000000-0000-0000-0000-000000000042": "NOT_INDEPENDENTLY_ASSERTED", "00000000-0000-0000-0000-000000000043": "NOT_INDEPENDENTLY_ASSERTED"}
+    },
+    {
+      "case_id": "conditional_is_one_conditioned_proposition",
+      "claim_text": "If Unit A is ready, Unit B is active.",
+      "composition": null,
+      "handling": "single proposition Q under material condition P"
+    },
+    {
+      "case_id": "causal_relation_is_not_boolean_group",
+      "claim_text": "Unit A is active because Unit B is ready.",
+      "composition": null,
+      "handling": "one relational proposition preserving cause"
+    },
+    {
+      "case_id": "contrastive_connective_fails_closed_unknown",
+      "claim_text": "Unit A is active while Unit B is ready.",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000071", "00000000-0000-0000-0000-000000000072"],
+      "composition": {
+        "claim_id": "10000000-0000-0000-0000-000000000007",
+        "root_group_id": "20000000-0000-0000-0000-000000000007",
+        "groups": [
+          {
+            "group_id": "20000000-0000-0000-0000-000000000007",
+            "operator": "UNKNOWN",
+            "source_span": "Unit A is active while Unit B is ready.",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000071", "verification_eligibility": "UNKNOWN", "source_span": "Unit A is active"},
+              {"member_type": "proposition", "position": 1, "proposition_id": "00000000-0000-0000-0000-000000000072", "verification_eligibility": "UNKNOWN", "source_span": "Unit B is ready"}
+            ]
+          }
+        ]
+      },
+      "expected_eligibility": {"00000000-0000-0000-0000-000000000071": "UNKNOWN", "00000000-0000-0000-0000-000000000072": "UNKNOWN"}
+    },
+    {
+      "case_id": "negative_alternatives_as_asserted_negated_conjuncts",
+      "claim_text": "Neither Unit A is ready nor Unit B is active.",
+      "proposition_ids": ["00000000-0000-0000-0000-000000000081", "00000000-0000-0000-0000-000000000082"],
+      "proposition_polarities": {"00000000-0000-0000-0000-000000000081": "NEGATED", "00000000-0000-0000-0000-000000000082": "NEGATED"},
+      "composition": {
+        "claim_id": "10000000-0000-0000-0000-000000000008",
+        "root_group_id": "20000000-0000-0000-0000-000000000008",
+        "groups": [
+          {
+            "group_id": "20000000-0000-0000-0000-000000000008",
+            "operator": "AND",
+            "source_span": "Neither Unit A is ready nor Unit B is active.",
+            "members": [
+              {"member_type": "proposition", "position": 0, "proposition_id": "00000000-0000-0000-0000-000000000081", "verification_eligibility": "INDEPENDENTLY_ASSERTED", "source_span": "Unit A is ready"},
+              {"member_type": "proposition", "position": 1, "proposition_id": "00000000-0000-0000-0000-000000000082", "verification_eligibility": "INDEPENDENTLY_ASSERTED", "source_span": "Unit B is active"}
+            ]
+          }
+        ]
+      },
+      "expected_eligibility": {"00000000-0000-0000-0000-000000000081": "INDEPENDENTLY_ASSERTED", "00000000-0000-0000-0000-000000000082": "INDEPENDENTLY_ASSERTED"}
+    }
+  ]
+}

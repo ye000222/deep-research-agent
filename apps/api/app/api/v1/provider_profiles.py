@@ -56,7 +56,12 @@ class ProviderProfileResponse(BaseModel):
     status: str
     version: int
     is_default: bool
-    credential_version_id: UUID
+    credential_version_id: UUID = Field(
+        description=(
+            "Primary key of the active llm_credential_versions row. Use this value "
+            "as saved_profile_version_id when creating a Research Run; do not use profile_id."
+        )
+    )
     credential_version: int
     credential_last_four: str
     credential_fingerprint: str

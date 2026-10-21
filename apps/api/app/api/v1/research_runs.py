@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import asdict
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -14,7 +14,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import get_client_session, get_research_run_service
+from app.api.dependencies import (
+    get_client_session,
+    get_existing_client_session,
+    get_research_run_service,
+)
 from app.domain.context import ContextManifestView
 from app.domain.controlled_tools import (
     AnalysisOperation,
@@ -56,8 +60,14 @@ router = APIRouter(prefix="/api/v1/research-runs", tags=["research-runs"])
 
 class ResearchRunCreate(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
-    saved_profile_version_id: UUID
+    saved_profile_version_id: UUID = Field(
+        description=(
+            "CredentialVersionRow.id returned by the selected owner's profile as "
+            "credential_version_id. This is not ProviderProfileRow.id / profile_id."
+        )
+    )
     budget_tier: str = Field(default="quick", pattern="^(quick|standard|deep)$")
+    orchestrator_version: Literal["V2_LEGACY", "V3"] = "V2_LEGACY"
 
 
 class EvidenceSearchPayload(BaseModel):
@@ -142,7 +152,7 @@ class RunLLMConfigResponse(BaseModel):
 async def create_run(
     payload: ResearchRunCreate,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
-    client: Annotated[ClientSession, Depends(get_client_session)],
+    client: Annotated[ClientSession, Depends(get_existing_client_session)],
     service: Annotated[ResearchRunServiceProtocol, Depends(get_research_run_service)],
 ) -> ResearchRunResponse:
     try:
@@ -152,11 +162,17 @@ async def create_run(
             query=payload.query,
             saved_profile_version_id=payload.saved_profile_version_id,
             budget_tier=payload.budget_tier,
+            orchestrator_version=payload.orchestrator_version,
         )
     except CredentialVersionNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"error_code": "credential_version_not_found"},
+            detail={
+                "error_code": "credential_version_not_found",
+                "message": (
+                    "Credential version is unavailable for this session or is no longer active."
+                ),
+            },
         ) from exc
     except ValueError as exc:
         raise HTTPException(

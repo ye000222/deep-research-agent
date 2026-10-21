@@ -27,12 +27,28 @@ class ClientSessionManager:
         client_id = self._verify(token) if token else None
         is_new = client_id is None
         client_id = client_id or uuid4()
-        owner_hash = hmac.new(
+        owner_hash = self._owner_hash(client_id)
+        return ClientSession(client_id=client_id, owner_hash=owner_hash, is_new=is_new)
+
+    def resolve_existing(self, token: str | None) -> ClientSession | None:
+        """Resolve only a valid pre-existing cookie without minting a session."""
+        if not token:
+            return None
+        client_id = self._verify(token)
+        if client_id is None:
+            return None
+        return ClientSession(
+            client_id=client_id,
+            owner_hash=self._owner_hash(client_id),
+            is_new=False,
+        )
+
+    def _owner_hash(self, client_id: UUID) -> str:
+        return hmac.new(
             self._key,
             b"provider-profile-owner-v1:" + client_id.bytes,
             hashlib.sha256,
         ).hexdigest()
-        return ClientSession(client_id=client_id, owner_hash=owner_hash, is_new=is_new)
 
     def issue_cookie(self, response: Response, session: ClientSession, *, secure: bool) -> None:
         if not session.is_new:

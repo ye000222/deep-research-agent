@@ -20,6 +20,11 @@ class RunStatus(StrEnum):
     CREDENTIALS_REQUIRED = "credentials_required"
 
 
+class RunKind(StrEnum):
+    RESEARCH = "research"
+    PROSPECTIVE_ACQUISITION_TASK = "prospective_acquisition_task"
+
+
 class RunPhase(StrEnum):
     INITIALIZING = "initializing"
     PLANNING = "planning"

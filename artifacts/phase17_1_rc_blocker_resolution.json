@@ -1,0 +1,91 @@
+{
+  "phase": "17.1",
+  "title": "RC Blocker Resolution",
+  "scope": "lease and no-accepted-evidence blocker audit only",
+  "production_code_modified": false,
+  "research_intelligence_modified": false,
+  "lease_audit": {
+    "classification": "EXPECTED_LEASE_HANDOFF",
+    "run_id": "01a0c9a8-9cd5-7844-921d-069730a4c766",
+    "timeline": {
+      "lease_acquired": "2026-09-22T15:07:46.505018Z",
+      "lease_ttl_seconds": 900,
+      "heartbeat_interval_seconds": 30,
+      "terminalized": "2026-09-22T15:12:41.411085Z",
+      "terminal_reason": "user_cancelled",
+      "worker_lease_loss_logged": "2026-09-22T15:12:47.915Z",
+      "worker_task_duration_seconds": 328.08
+    },
+    "root_cause": "The user cancellation terminalized the run and cleared lease_owner, lease_until and worker_task_id. The still-running worker then attempted a lease-guarded write and correctly raised ResearchLeaseLostError.",
+    "heartbeat_present": true,
+    "execution_exceeded_ttl": false,
+    "duplicate_execution_evidence": false,
+    "recovered_event_count": 0,
+    "lease_loss_caused_final_failure": false,
+    "p0": false
+  },
+  "no_accepted_evidence_audit": {
+    "classification": "EXPECTED_FAILURE",
+    "run_id": "01a0c9ad-2018-7730-a8ef-1066181f4cc7",
+    "case": "B",
+    "status": "failed",
+    "termination_reason": "REPORT_NO_ACCEPTED_EVIDENCE",
+    "candidate_evidence": 0,
+    "accepted_evidence": 0,
+    "research_evidence_rows": 0,
+    "readable_sources": 2,
+    "searches": 2,
+    "provider_failures": 0,
+    "source_fetch_failures": 2,
+    "evidence_selection_skipped_question_budget": 2,
+    "report_rows": 0,
+    "root_cause": "Quick tier exhausted its small execution envelope without producing Accepted Evidence. The run terminalized with the no-fabricated-report invariant; absence of a Report is therefore expected, not a Report pipeline failure.",
+    "p0": false
+  },
+  "success_path_smoke": {
+    "run_id": "01a0c9c9-f951-76f0-a801-a10b65806236",
+    "benchmark_id": "phase17-1-success-path-smoke",
+    "tier": "standard",
+    "reference_config_id": "v1-pre-rc-reference-1",
+    "feature_flags": {
+      "evidence_aware_context_enabled": false,
+      "independent_source_targeting_enabled": true,
+      "evidence_input_quality_enabled": false
+    },
+    "status": "completed_with_limitations",
+    "termination_reason": "completed_with_limitations",
+    "search_query_started": 33,
+    "search_completed": 20,
+    "readable_sources": 42,
+    "evidence_extracted_events": 23,
+    "research_evidence_rows": 5,
+    "accepted_evidence": 3,
+    "report_persisted": true,
+    "report_verified": true,
+    "report_fetch_via_application_service": true,
+    "report_id": "01a0c9f7-998c-794d-9f71-a3239018376c",
+    "report_writing_reason": "sources_exhausted",
+    "terminal_event": "run.completed",
+    "pass": true
+  },
+  "failure_path_invariant": {
+    "run_id": "01a0c9ad-2018-7730-a8ef-1066181f4cc7",
+    "accepted_evidence": 0,
+    "report_persisted": false,
+    "termination_reason": "REPORT_NO_ACCEPTED_EVIDENCE",
+    "no_fabricated_report": true,
+    "pass": true
+  },
+  "final_gates": {
+    "research_lease_lost_error": "NON-BLOCKING",
+    "report_no_accepted_evidence": "EXPECTED_FAILURE",
+    "success_path_deployment_smoke": "PASS",
+    "failure_path_no_evidence_invariant": "PASS",
+    "production_fix_required": false,
+    "decision": "V1 RC READY WITH KNOWN ISSUES"
+  },
+  "known_issues_scope": [
+    "Existing non-P0 provenance, working-tree hygiene and research-quality limitations remain unchanged and are outside this blocker-resolution scope."
+  ],
+  "stop": true
+}

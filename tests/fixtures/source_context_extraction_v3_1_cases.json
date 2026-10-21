@@ -1,0 +1,30 @@
+{
+  "fixture_version": "source-context-extraction-v3.1-generic-fixtures-v1",
+  "claim_specific_content": false,
+  "cases": [
+    {"id": "scope_single_member", "category": "scope", "expected": "RESOLVED"},
+    {"id": "scope_multi_member_no_duplicate_binding", "category": "scope", "expected": "RESOLVED"},
+    {"id": "scope_invalid_member", "category": "scope", "expected": "INVALID"},
+    {"id": "scope_invalid_evidence", "category": "scope", "expected": "INVALID"},
+    {"id": "scope_empty_evidence", "category": "scope", "expected": "SCHEMA_INVALID"},
+    {"id": "scope_partial_or_unsupported", "category": "scope", "expected": "PARTIAL"},
+    {"id": "scope_duplicate_members", "category": "scope", "expected": "INVALID"},
+    {"id": "scope_structure_not_semantic_support", "category": "scope", "expected": "NOT_EVALUATED"},
+    {"id": "measurement_identity_integer_value", "category": "measurement", "expected": "RESOLVED"},
+    {"id": "measurement_identity_value_unit", "category": "measurement", "expected": "RESOLVED"},
+    {"id": "measurement_value_without_unit", "category": "measurement", "expected": "UNIT_ABSENT"},
+    {"id": "measurement_identity_only", "category": "measurement", "expected": "OBSERVED_VALUE_ABSENT"},
+    {"id": "measurement_formal_definition_explicit", "category": "measurement", "expected": "RESOLVED"},
+    {"id": "measurement_result_without_definition", "category": "measurement", "expected": "DEFINITION_ABSENT"},
+    {"id": "measurement_value_wrongly_definition_role", "category": "role", "expected": "INVALID"},
+    {"id": "measurement_identity_wrongly_definition_role", "category": "role", "expected": "INVALID"},
+    {"id": "measurement_value_unit_comparator", "category": "measurement", "expected": "RESOLVED"},
+    {"id": "measurement_value_threshold", "category": "measurement", "expected": "RESOLVED"},
+    {"id": "measurement_value_basis", "category": "measurement", "expected": "RESOLVED"},
+    {"id": "measurement_basis_absent", "category": "measurement", "expected": "BASIS_ABSENT"},
+    {"id": "shared_condition_multiple_measurements", "category": "graph", "expected": "RESOLVED"},
+    {"id": "measurement_attached_to_wrong_assertion", "category": "graph", "expected": "INVALID"},
+    {"id": "measurement_evidence_wrong_target", "category": "role", "expected": "INVALID"},
+    {"id": "measurement_scope_category_association", "category": "measurement", "expected": "RESOLVED"}
+  ]
+}

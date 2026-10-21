@@ -1,0 +1,21 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "logical-connectives-contract-audit-v2.1r-v1",
+  "neutral_entities": true,
+  "cases": [
+    {"case_id": "conjunction", "source": "Unit A is active and Unit B is ready.", "relation": "AND"},
+    {"case_id": "disjunction", "source": "Unit A is active or Unit B is ready.", "relation": "OR"},
+    {"case_id": "exclusive_alternative", "source": "Unit A is active or Unit B is ready, but not both.", "relation": "XOR"},
+    {"case_id": "causal", "source": "Unit A is active because Unit B is ready.", "relation": "BECAUSE"},
+    {"case_id": "conditional", "source": "If Unit A is active, Unit B is ready.", "relation": "IF_THEN"},
+    {"case_id": "concessive_or_temporal_while", "source": "Unit A is active while Unit B is ready.", "relation": "WHILE"},
+    {"case_id": "negated_alternatives", "source": "Neither Unit A is active nor Unit B is ready.", "relation": "NEGATED_ALTERNATIVES"}
+  ],
+  "contract_audit": {
+    "atomic_proposition_has_connective_or_group_field": false,
+    "decomposition_metadata_has_connective_or_group_field": false,
+    "claim_proposition_link_relation_values": ["expresses"],
+    "multiple_links_encode_boolean_relation": false,
+    "separate_asserted_propositions_safely_encode_or": false
+  }
+}

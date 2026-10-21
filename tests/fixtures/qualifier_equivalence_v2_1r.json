@@ -1,0 +1,83 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "qualifier-equivalence-v2.1r-v1",
+  "cases": [
+    {
+      "case_id": "predicate_negation",
+      "claim_text": "The service cannot process the request.",
+      "propositions": [
+        {
+          "proposition_text": "The service cannot process the request.",
+          "subject": "service",
+          "predicate": "cannot process",
+          "typed_value": {"kind": "boolean", "boolean": true},
+          "polarity": "asserted"
+        }
+      ],
+      "expected": {"negation": "PRESERVED"}
+    },
+    {
+      "case_id": "date_is_not_a_unit",
+      "claim_text": "On 2042 年 3 月 11 日, the device completed a test.",
+      "propositions": [
+        {
+          "proposition_text": "On 2042-03-11, the device completed a test.",
+          "subject": "device",
+          "predicate": "completed a test on",
+          "typed_value": {"kind": "entity", "text": "2042-03-11"},
+          "polarity": "asserted",
+          "material_qualifiers": [
+            {"category": "date", "key": "date", "value": "2042-03-11", "source_span": "2042 年 3 月 11 日"}
+          ]
+        }
+      ],
+      "expected": {"date_time": "PRESERVED", "unit": "NOT_APPLICABLE"}
+    },
+    {
+      "case_id": "typed_currency_and_measurement",
+      "claim_text": "The measured rate was $40.",
+      "propositions": [
+        {
+          "proposition_text": "The measured rate was $40.",
+          "subject": "rate",
+          "predicate": "measured rate was",
+          "typed_value": {
+            "kind": "quantity",
+            "numeric": {"operator": "exact", "value": 40, "currency": "USD"}
+          },
+          "polarity": "asserted"
+        }
+      ],
+      "expected": {"currency": "PRESERVED", "measurement": "PRESERVED"}
+    },
+    {
+      "case_id": "generic_sample_count",
+      "claim_text": "The estimate used four samples.",
+      "propositions": [
+        {
+          "proposition_text": "The estimate used four samples.",
+          "subject": "estimate",
+          "predicate": "used",
+          "typed_value": {"kind": "text", "text": "four samples"},
+          "polarity": "asserted",
+          "material_qualifiers": [
+            {"category": "configuration", "key": "sample_count", "value": "four samples", "source_span": "four samples"}
+          ]
+        }
+      ],
+      "expected": {"sample_count": "PRESERVED"}
+    }
+  ],
+  "hard_negatives": [
+    {
+      "case_id": "document_classifier_is_not_sample_count",
+      "claim_text": "The roadmap is a living document.",
+      "expected": {"sample_count": "NOT_APPLICABLE", "negation": "NOT_APPLICABLE"}
+    },
+    {
+      "case_id": "technical_compound_is_not_truth_negation",
+      "claim_text": "The method is an unsupervised method.",
+      "expected": {"negation": "NOT_APPLICABLE"}
+    }
+  ]
+}

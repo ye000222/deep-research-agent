@@ -13,6 +13,7 @@ if sys.platform == "win32":
     # psycopg async requires SelectorEventLoop; Windows defaults to ProactorEventLoop
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+from app.api.v1.prospective_acquisition import router as prospective_acquisition_router
 from app.api.v1.router import router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
@@ -74,6 +75,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     application.include_router(router)
+    if resolved.app_env.lower() in {"development", "test"}:
+        application.include_router(prospective_acquisition_router)
     return application
 
 

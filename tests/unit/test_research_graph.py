@@ -42,6 +42,10 @@ class FakeRuns:
         self.saved = 0
         self.replanned = 0
         self.gap_tasks: list[tuple[str, tuple[str, ...]]] = []
+        self.orchestrator_version = "V2_LEGACY"
+
+    async def get_run_state_inputs(self, _run_id: UUID) -> dict[str, object]:
+        return {"orchestrator_version": self.orchestrator_version}
 
     async def get_plan_for_execution(self, run_id: UUID) -> ResearchPlan | None:
         return self.plan
@@ -164,6 +168,27 @@ class FakeReportWriter:
         return "report_completed:completed:citations=5"
 
 
+class FakeResearchOrchestrator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run_next_work(
+        self, _run_id: UUID, *, worker_task_id: str
+    ) -> ResearchIterationResult:
+        assert worker_task_id == "worker-1"
+        self.calls += 1
+        return ResearchIterationResult(
+            outcome="research_stopped:ready_to_write",
+            continue_research=False,
+            decision="ready_to_write",
+            pages_read=1,
+            accepted_evidence=1,
+            coverage=1.0,
+            information_gain=0.5,
+            low_information_gain_streak=0,
+        )
+
+
 class FakeReplanResearchLoop(FakeResearchLoop):
     async def run_one_iteration(
         self,
@@ -256,3 +281,32 @@ async def test_graph_routes_evaluator_replan_through_persisted_plan_revision() -
         "research_iteration",
         "report_writer",
     ]
+
+
+@pytest.mark.asyncio
+async def test_v3_graph_dispatches_to_orchestrator_and_keeps_v2_loop_idle() -> None:
+    run_id = uuid4()
+    runs = FakeRuns()
+    runs.orchestrator_version = "V3"
+    states = FakeStates(run_id)
+    research_loop = FakeResearchLoop()
+    orchestrator = FakeResearchOrchestrator()
+    service = ResearchGraphService(  # type: ignore[arg-type]
+        runs,
+        states,
+        FakePlanner(),
+        research_loop,
+        FakeReportWriter(),
+        research_orchestrator=orchestrator,  # type: ignore[arg-type]
+    )
+
+    outcome = await service.execute(
+        run_id,
+        worker_task_id="worker-1",
+        checkpointer=InMemorySaver(),
+    )
+
+    assert outcome == "report_completed:completed:citations=5"
+    assert orchestrator.calls == 1
+    assert research_loop.calls == 0
+    assert states.nodes == ["planner", "research_iteration", "report_writer"]

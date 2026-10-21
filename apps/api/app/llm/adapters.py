@@ -509,6 +509,17 @@ class LLMGateway:
                 retryable=True,
                 detail_code=_request_error_detail(exc),
             ) from exc
+        except httpx.DecodingError as exc:
+            raise ModelGatewayError(
+                "MODEL_RESPONSE_INVALID", retryable=False, detail_code="DECODING_ERROR"
+            ) from exc
+        except (httpx.StreamConsumed, httpx.StreamClosed) as exc:
+            raise ModelGatewayError(
+                "MODEL_RESPONSE_INVALID",
+                retryable=False,
+                detail_code="STREAM_CONSUMED"
+                if isinstance(exc, httpx.StreamConsumed) else "STREAM_CLOSED",
+            ) from exc
         except httpx.RequestError as exc:
             raise ModelGatewayError(
                 "MODEL_NETWORK_ERROR",
@@ -525,7 +536,12 @@ class LLMGateway:
             raise ModelGatewayError("MODEL_PROVIDER_UNAVAILABLE", retryable=True)
         if response.status_code >= 400:
             raise ModelGatewayError("MODEL_REQUEST_INVALID", retryable=False)
-        payload: object = response.json()
+        try:
+            payload: object = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ModelGatewayError(
+                "MODEL_RESPONSE_INVALID", retryable=False, detail_code="JSON_DECODE_ERROR"
+            ) from exc
         if not isinstance(payload, dict):
             raise ModelGatewayError("MODEL_RESPONSE_INVALID", retryable=False)
         return cast(dict[str, Any], payload)
@@ -562,8 +578,33 @@ def _compatible_v1_fallback(base_url: str, attempted_url: str) -> str | None:
 
 
 def _content_text(request: CanonicalModelRequest) -> str:
-    parts = [part.value for part in request.content_parts if part.kind == "text"]
-    return "\n\n".join(str(value) for value in parts)
+    parts: list[str] = []
+    for part in request.content_parts:
+        if part.kind == "text":
+            # Preserve the existing text-part rendering exactly.
+            parts.append(str(part.value))
+        elif part.kind == "json":
+            try:
+                parts.append(
+                    json.dumps(
+                        part.value,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ModelGatewayError("MODEL_REQUEST_INVALID", retryable=False) from exc
+        else:
+            # ContentPart's model also rejects unknown kinds at construction;
+            # keep this boundary fail-closed if an invalid instance is injected.
+            raise ModelGatewayError("MODEL_REQUEST_INVALID", retryable=False)
+
+    content = "\n\n".join(parts)
+    if request.content_parts and not content.strip():
+        raise ModelGatewayError("MODEL_REQUEST_INVALID", retryable=False)
+    return content
 
 
 def _openai_response_text(payload: Mapping[str, Any]) -> str:

@@ -1,0 +1,59 @@
+{
+  "artifact_version": "source-context-extraction-v3.3-measurement-cases.v1",
+  "cases": [
+    {
+      "case_id": "SYN-MEAS-01",
+      "claim_text": "AUC is 99.6%",
+      "identity": {"name": "AUC", "identity_type": "SCORE_OR_INDEX", "source_span": {"evidence_ref": "e1", "occurrence_index": 0}},
+      "observed_value": {"kind": "DECIMAL", "raw_value": "99.6", "value": "99.6"},
+      "identity_span": "AUC",
+      "value_span": "99.6%",
+      "expected": "ADMISSIBLE"
+    },
+    {
+      "case_id": "SYN-MEAS-02",
+      "claim_text": "The model has excellent performance",
+      "identity": {"name": "performance", "identity_type": "QUALITATIVE_PROPERTY", "source_span": {"evidence_ref": "e1", "occurrence_index": 0}},
+      "observed_value": null,
+      "identity_span": "excellent performance",
+      "value_span": null,
+      "expected": "NOT_MEASUREMENT"
+    },
+    {
+      "case_id": "SYN-MEAS-03",
+      "claim_text": "The model is lightweight",
+      "identity": {"name": "lightweight", "identity_type": "UNKNOWN", "source_span": {"evidence_ref": "e1", "occurrence_index": 0}},
+      "observed_value": null,
+      "identity_span": "lightweight",
+      "value_span": null,
+      "expected": "UNKNOWN"
+    },
+    {
+      "case_id": "SYN-MEAS-04",
+      "claim_text": "Model size is 20MB",
+      "identity": {"name": "model size", "identity_type": "SIZE_OR_CAPACITY", "source_span": {"evidence_ref": "e1", "occurrence_index": 0}},
+      "observed_value": {"kind": "DECIMAL", "raw_value": "20", "value": "20"},
+      "identity_span": "Model size",
+      "value_span": "20MB",
+      "expected": "ADMISSIBLE"
+    },
+    {
+      "case_id": "SYN-MEAS-05",
+      "claim_text": "The system is highly efficient",
+      "identity": {"name": "efficiency", "identity_type": "QUALITATIVE_PROPERTY", "source_span": {"evidence_ref": "e1", "occurrence_index": 0}},
+      "observed_value": null,
+      "identity_span": "highly efficient",
+      "value_span": null,
+      "expected": "NOT_MEASUREMENT"
+    },
+    {
+      "case_id": "SYN-MEAS-06",
+      "claim_text": "Latency is reduced",
+      "identity": {"name": "latency", "identity_type": "TEMPORAL_MEASURE", "source_span": {"evidence_ref": "e1", "occurrence_index": 0}},
+      "observed_value": null,
+      "identity_span": "Latency",
+      "value_span": null,
+      "expected": "UNKNOWN"
+    }
+  ]
+}

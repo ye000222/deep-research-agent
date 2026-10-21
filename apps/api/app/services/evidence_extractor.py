@@ -25,6 +25,18 @@ from app.domain.adaptive_scheduler import (
     source_role_fits_claim,
 )
 from app.domain.context import ContextCandidate, ContextItemType
+from app.domain.document_evidence_context import (
+    LocalizationStatus,
+    MappedTextWindow,
+    ProcessingChunk,
+    ReadableDocument,
+    build_processing_chunks,
+    build_readable_document,
+    locate_canonical_evidence_span,
+    mapped_window,
+    planned_processing_chunk_count,
+    processing_chunk_for_range,
+)
 from app.domain.evidence_input_quality import assess_candidate, select_supporting_quote
 from app.domain.providers import (
     CanonicalModelRequest,
@@ -45,6 +57,7 @@ from app.security.secrets import SecretCipher
 
 _SOURCE_CONTEXT_CHUNK_CHARS = 3_000
 _MAX_SOURCE_CONTEXT_CHUNKS = 64
+_SOURCE_CONTEXT_CHUNK_OVERLAP_CHARS = 200
 _EXTRACTOR_OUTPUT_TOKENS = 3_500
 _EXTRACTOR_INPUT_TOKENS = 6_000
 _COMPACT_OUTPUT_TOKENS = 1_800
@@ -116,7 +129,7 @@ class EvidenceExtractorService:
         page: ReadPage,
         source_id: UUID | None = None,
         max_total_tokens: int | None = None,
-    ) -> tuple[list[ScoredEvidence], TokenUsage, dict[str, int | bool]]:
+    ) -> tuple[list[ScoredEvidence], TokenUsage, dict[str, int | bool | str]]:
         binding = await self._bindings.get(run_id)
         api_key = self._cipher.decrypt(
             binding.encrypted_secret,
@@ -126,6 +139,22 @@ class EvidenceExtractorService:
         )
         dimensions = "\n".join(f"- {key}: {criterion}" for key, criterion in acceptance_dimensions)
         dimension_criteria = dict(acceptance_dimensions)
+        completeness_known = (
+            page.available_char_count is not None
+            or page.document_type != "UNKNOWN"
+            or page.truncation_reason is not None
+        )
+        document = build_readable_document(
+            source_ref=(str(source_id) if source_id is not None else page.final_url),
+            snapshot_content_hash=page.content_hash,
+            canonical_text=page.clean_text,
+            available_text_length=page.available_char_count,
+            document_type=page.document_type,
+            was_truncated=page.truncated,
+            truncation_reason=page.truncation_reason,
+            source_segments=page.source_segments,
+            completeness_known=completeness_known,
+        )
         if self._extraction_cache is not None and binding.extraction_cache_enabled:
             cache_key = self._cache_key(
                 question=question,
@@ -145,6 +174,18 @@ class EvidenceExtractorService:
                     ),
                     input_quality_enabled=get_settings().evidence_input_quality_enabled,
                 )
+                scored, localized_counts = _attach_canonical_spans(
+                    scored,
+                    document=document,
+                    windows=(
+                        MappedTextWindow(
+                            text=page.clean_text,
+                            canonical_start=0,
+                            canonical_end=len(page.clean_text),
+                            chunk_ref=document.document_ref,
+                        ),
+                    ),
+                )
                 return (
                     scored,
                     TokenUsage(
@@ -161,6 +202,25 @@ class EvidenceExtractorService:
                         "empty_result_rescue": False,
                         "transient_retry": False,
                         "cache_hit": True,
+                        "document_chars": len(page.clean_text),
+                        "available_document_chars": document.available_text_length,
+                        "document_was_truncated": page.truncated,
+                        "processing_chunk_count": planned_processing_chunk_count(
+                            len(page.clean_text),
+                            chunk_chars=_SOURCE_CONTEXT_CHUNK_CHARS,
+                        ),
+                        "selected_chunk_count": 0,
+                        "unprocessed_chunk_count": planned_processing_chunk_count(
+                            len(page.clean_text),
+                            chunk_chars=_SOURCE_CONTEXT_CHUNK_CHARS,
+                        ),
+                        "processing_coverage_complete": False,
+                        "processing_window_manifest": "[]",
+                        "document_completeness_known": completeness_known,
+                        "document_representation_complete": (
+                            completeness_known and not page.truncated
+                        ),
+                        **localized_counts,
                     },
                 )
         task_brief = f"研究问题: {question}\n来源 URL: {page.final_url}" + (
@@ -190,6 +250,27 @@ class EvidenceExtractorService:
         manifest_id = uuid4()
         selected_text = page.clean_text[:14_000]
         truncated = len(selected_text) < len(page.clean_text)
+        processing_chunks = build_processing_chunks(
+            document,
+            chunk_chars=_SOURCE_CONTEXT_CHUNK_CHARS,
+            overlap_chars=_SOURCE_CONTEXT_CHUNK_OVERLAP_CHARS,
+            max_chunks=_MAX_SOURCE_CONTEXT_CHUNKS,
+        )
+        planned_chunk_count = planned_processing_chunk_count(
+            len(page.clean_text),
+            chunk_chars=_SOURCE_CONTEXT_CHUNK_CHARS,
+            overlap_chars=_SOURCE_CONTEXT_CHUNK_OVERLAP_CHARS,
+        )
+        chunks_by_ref = {chunk.chunk_ref: chunk for chunk in processing_chunks}
+        selected_windows: tuple[MappedTextWindow, ...] = (
+            MappedTextWindow(
+                text=selected_text,
+                canonical_start=0,
+                canonical_end=len(selected_text),
+                chunk_ref=document.document_ref,
+                selection_reason="initial_prefix_budget",
+            ),
+        )
         relevant_windows = (
             select_relevant_blocks(
                 page.clean_text,
@@ -202,22 +283,41 @@ class EvidenceExtractorService:
         )
         if relevant_windows and self._contexts is None:
             chosen = relevant_windows[:4]
-            selected_text = "\n".join(w.content for w in sorted(chosen, key=lambda w: w.start))
-            truncated = sum(len(w.content) for w in chosen) < len(page.clean_text)
-        if self._contexts is not None:
-            chunks = [
-                page.clean_text[index : index + _SOURCE_CONTEXT_CHUNK_CHARS]
-                for index in range(
-                    0,
-                    min(
-                        len(page.clean_text),
-                        _SOURCE_CONTEXT_CHUNK_CHARS * _MAX_SOURCE_CONTEXT_CHUNKS,
-                    ),
-                    _SOURCE_CONTEXT_CHUNK_CHARS,
+            selected_chunks = tuple(
+                processing_chunk_for_range(
+                    document,
+                    start=window.start,
+                    end=window.end,
+                    ordinal=index,
+                    chunking_version="relevant-paragraphs.v1",
                 )
-            ]
+                for index, window in enumerate(sorted(chosen, key=lambda w: w.start))
+            )
+            selected_text = "\n".join(chunk.text for chunk in selected_chunks)
+            selected_windows = tuple(
+                mapped_window(chunk, selection_reason="relevant_query_block")
+                for chunk in selected_chunks
+            )
+            truncated = len(selected_chunks) < len(relevant_windows) or sum(
+                len(chunk.text) for chunk in selected_chunks
+            ) < len(page.clean_text)
+        if self._contexts is not None:
+            chunks = [chunk.text for chunk in processing_chunks]
+            input_chunks = processing_chunks
             if relevant_windows:
                 chunks = [window.content for window in relevant_windows]
+                input_chunks = tuple(
+                    processing_chunk_for_range(
+                        document,
+                        start=window.start,
+                        end=window.end,
+                        ordinal=index,
+                        chunking_version="relevant-paragraphs.v1",
+                    )
+                    for index, window in enumerate(relevant_windows)
+                )
+                chunks = [chunk.text for chunk in input_chunks]
+            chunks_by_ref = {chunk.chunk_ref: chunk for chunk in input_chunks}
             candidates = [
                 ContextCandidate(
                     item_type=ContextItemType.INSTRUCTION,
@@ -246,8 +346,11 @@ class EvidenceExtractorService:
                         selected_reason_code=(
                             "query_mmr_rank" if relevant_windows else "source_order_rank"
                         ),
+                        provenance_refs=(processing_chunk.chunk_ref,),
                     )
-                    for index, chunk in enumerate(chunks)
+                    for index, (chunk, processing_chunk) in enumerate(
+                        zip(chunks, input_chunks, strict=True)
+                    )
                 ],
                 ContextCandidate(
                     item_type=ContextItemType.OUTPUT_SCHEMA,
@@ -274,7 +377,27 @@ class EvidenceExtractorService:
                 candidate.content
                 for candidate in envelope.selected_by_type(ContextItemType.SOURCE_CHUNK)
             )
-            truncated = bool(envelope.rejected) or len(chunks) == _MAX_SOURCE_CONTEXT_CHUNKS
+            selected_source_items = envelope.selected_by_type(ContextItemType.SOURCE_CHUNK)
+            selected_windows = tuple(
+                _mapped_context_item(
+                    item.content,
+                    item.provenance_refs,
+                    chunks_by_ref,
+                    selection_reason=item.selected_reason_code,
+                )
+                for item in selected_source_items
+            )
+            selected_chunk_refs = {
+                ref
+                for item in selected_source_items
+                for ref in item.provenance_refs
+                if ref in chunks_by_ref
+            }
+            truncated = (
+                bool(envelope.rejected)
+                or len(selected_chunk_refs) < len(input_chunks)
+                or page.truncated
+            )
         request = CanonicalModelRequest(
             task_kind="evidence_extraction",
             role="extractor",
@@ -335,6 +458,13 @@ class EvidenceExtractorService:
                     reason="transient_transport_retry",
                     max_input_tokens=_compact_input_budget(retry_budget),
                 )
+                selected_windows = _compact_mapped_windows(
+                    document,
+                    question=question,
+                    acceptance_dimensions=acceptance_dimensions,
+                    selected_text=selected_text,
+                    source_id=source_id,
+                )
                 compact_fallback = True
                 transient_retry = True
                 truncated = len(selected_text) < len(page.clean_text)
@@ -367,6 +497,13 @@ class EvidenceExtractorService:
                     output_tokens=_compact_output_budget(output_tokens, retry_budget),
                     reason="invalid_json_rescue",
                     max_input_tokens=_compact_input_budget(retry_budget),
+                )
+                selected_windows = _compact_mapped_windows(
+                    document,
+                    question=question,
+                    acceptance_dimensions=acceptance_dimensions,
+                    selected_text=selected_text,
+                    source_id=source_id,
                 )
                 compact_fallback = True
                 truncated = len(selected_text) < len(page.clean_text)
@@ -408,6 +545,13 @@ class EvidenceExtractorService:
                 output_tokens=_compact_output_budget(output_tokens, repair_budget),
                 reason="schema_repair",
                 max_input_tokens=_compact_input_budget(repair_budget),
+            )
+            selected_windows = _compact_mapped_windows(
+                document,
+                question=question,
+                acceptance_dimensions=acceptance_dimensions,
+                selected_text=repair_text,
+                source_id=source_id,
             )
             repair_request = _schema_repair_request(repair_base, exc)
             try:
@@ -471,6 +615,13 @@ class EvidenceExtractorService:
                     _remaining_token_budget(max_total_tokens, usage)
                 ),
             )
+            compact_windows = _compact_mapped_windows(
+                document,
+                question=question,
+                acceptance_dimensions=acceptance_dimensions,
+                selected_text=compact_text,
+                source_id=source_id,
+            )
             # Empty-result rescue is best effort. A page that already produced
             # a valid empty EvidenceBatch must not be converted into a model
             # failure merely because the focused retry is malformed.
@@ -492,6 +643,7 @@ class EvidenceExtractorService:
             else:
                 empty_result_rescue = True
                 selected_text = compact_text
+                selected_windows = compact_windows
                 truncated = len(selected_text) < len(page.clean_text)
                 if rescue_batch.items:
                     batch = rescue_batch
@@ -500,10 +652,13 @@ class EvidenceExtractorService:
             batch,
             page=page,
             dimension_criteria=dimension_criteria,
-            reliability=source_reliability(
-                page.final_url, text=page.clean_text, title=page.title
-            ),
+            reliability=source_reliability(page.final_url, text=page.clean_text, title=page.title),
             input_quality_enabled=get_settings().evidence_input_quality_enabled,
+        )
+        scored, localized_counts = _attach_canonical_spans(
+            scored,
+            document=document,
+            windows=selected_windows,
         )
         if (
             self._extraction_cache is not None
@@ -526,13 +681,26 @@ class EvidenceExtractorService:
                     ),
                     evidence=cache_items,
                 )
-        manifest = {
+        manifest: dict[str, int | bool | str] = {
             "source_chars": len(page.clean_text),
             "selected_chars": len(selected_text),
             "truncated": truncated,
             "compact_fallback": compact_fallback,
             "empty_result_rescue": empty_result_rescue,
             "transient_retry": transient_retry,
+            "document_chars": len(page.clean_text),
+            "available_document_chars": document.available_text_length,
+            "document_was_truncated": page.truncated,
+            "document_completeness_known": completeness_known,
+            "document_representation_complete": completeness_known and not page.truncated,
+            "processing_chunk_count": planned_chunk_count,
+            "selected_chunk_count": len(selected_windows),
+            "unprocessed_chunk_count": max(0, planned_chunk_count - len(selected_windows)),
+            "processing_coverage_complete": _windows_cover_document(
+                selected_windows, len(page.clean_text)
+            ),
+            "processing_window_manifest": _processing_window_manifest(selected_windows),
+            **localized_counts,
         }
         return scored, usage, manifest
 
@@ -624,26 +792,24 @@ class EvidenceExtractorService:
                     input_quality=(
                         {
                             **assess_candidate(
-                            claim=candidate.claim,
-                            quote=candidate.exact_quote,
-                            source_text=page.clean_text,
-                            claim_type=infer_claim_type(
-                                dimension_criteria.get(
-                                    str(candidate.dimension_key), candidate.claim
-                                )
-                            ),
-                            observed_role=classify_source_role(
-                                page.final_url,
-                                text=f"{page.title}\n{page.clean_text[:2_000]}",
-                            ),
-                            accepted=rejection_reason is None,
+                                claim=candidate.claim,
+                                quote=candidate.exact_quote,
+                                source_text=page.clean_text,
+                                claim_type=infer_claim_type(
+                                    dimension_criteria.get(
+                                        str(candidate.dimension_key), candidate.claim
+                                    )
+                                ),
+                                observed_role=classify_source_role(
+                                    page.final_url,
+                                    text=f"{page.title}\n{page.clean_text[:2_000]}",
+                                ),
+                                accepted=rejection_reason is None,
                             ).as_dict(),
                             "evaluation_executed": "true",
                             "input_quality_decision": quote_decision,
                             "original_quote_state": (
-                                "changed"
-                                if candidate.exact_quote != original_quote
-                                else "retained"
+                                "changed" if candidate.exact_quote != original_quote else "retained"
                             ),
                             "final_quote_state": (
                                 "quote_improved"
@@ -689,16 +855,11 @@ class EvidenceExtractorService:
         of being forced into an inevitable truncation.
         """
 
-        dimensions = "\n".join(
-            f"- {key}: {criterion}" for key, criterion in acceptance_dimensions
-        )
-        task_brief = (
-            f"研究问题: {question}\n来源 URL: https://source.example.invalid"
-            + (
-                f"\n当前原子验收维度(每条证据的 dimension_key 必须选择其中之一):\n{dimensions}"
-                if dimensions
-                else ""
-            )
+        dimensions = "\n".join(f"- {key}: {criterion}" for key, criterion in acceptance_dimensions)
+        task_brief = f"研究问题: {question}\n来源 URL: https://source.example.invalid" + (
+            f"\n当前原子验收维度(每条证据的 dimension_key 必须选择其中之一):\n{dimensions}"
+            if dimensions
+            else ""
         )
         instructions = f"{EXTRACTOR_INSTRUCTIONS}\n本次最多返回 1 条证据。"
         schema = json.dumps(
@@ -916,8 +1077,7 @@ def source_reliability(url: str, *, text: str = "", title: str = "") -> float:
     elif any(host == value or host.endswith(f".{value}") for value in trusted_association_hosts):
         prior = 0.86
     elif any(
-        host == value or host.endswith(f".{value}")
-        for value in trusted_industry_research_hosts
+        host == value or host.endswith(f".{value}") for value in trusted_industry_research_hosts
     ):
         prior = 0.80
     elif host.endswith(".gov") or ".gov." in host:
@@ -994,6 +1154,150 @@ def _select_compact_source_text(
     )
     selected_indexes = sorted(index for index, _chunk in ranked[:_COMPACT_SOURCE_CHUNKS])
     return "\n".join(chunks[index] for index in selected_indexes)
+
+
+def _compact_mapped_windows(
+    document: ReadableDocument,
+    *,
+    question: str,
+    acceptance_dimensions: tuple[tuple[str, str], ...],
+    selected_text: str,
+    source_id: UUID | None,
+) -> tuple[MappedTextWindow, ...]:
+    del source_id  # document identity already binds the source and snapshot.
+    chunk_count = (document.canonical_text_length + _SOURCE_CONTEXT_CHUNK_CHARS - 1) // (
+        _SOURCE_CONTEXT_CHUNK_CHARS
+    )
+    chunks = build_processing_chunks(
+        document,
+        chunk_chars=_SOURCE_CONTEXT_CHUNK_CHARS,
+        max_chunks=max(1, chunk_count),
+    )
+    objective = " ".join([question, *(criterion for _, criterion in acceptance_dimensions)])
+    objective_tokens = _relevance_tokens(objective)
+    ranked = sorted(
+        enumerate(chunks),
+        key=lambda entry: (
+            -len(objective_tokens & _relevance_tokens(entry[1].text)),
+            entry[0],
+        ),
+    )
+    selected = tuple(
+        chunks[index]
+        for index in sorted(index for index, _chunk in ranked[:_COMPACT_SOURCE_CHUNKS])
+    )
+    if "\n".join(chunk.text for chunk in selected) != selected_text:
+        return (
+            MappedTextWindow(
+                text=selected_text,
+                canonical_start=-1,
+                canonical_end=-1,
+                chunk_ref=document.document_ref,
+            ),
+        )
+    return tuple(mapped_window(chunk, selection_reason="compact_rank") for chunk in selected)
+
+
+def _mapped_context_item(
+    content: str,
+    provenance_refs: tuple[str, ...],
+    chunks_by_ref: dict[str, ProcessingChunk],
+    *,
+    selection_reason: str,
+) -> MappedTextWindow:
+    if len(provenance_refs) == 1:
+        chunk = chunks_by_ref.get(provenance_refs[0])
+        if chunk is not None:
+            # Context compression keeps provenance refs but changes text. The
+            # canonical mapper rejects the mismatch rather than guessing offsets.
+            return MappedTextWindow(
+                text=content,
+                canonical_start=chunk.canonical_start,
+                canonical_end=chunk.canonical_end,
+                chunk_ref=chunk.chunk_ref,
+                selection_reason=selection_reason,
+            )
+    return MappedTextWindow(
+        text=content,
+        canonical_start=-1,
+        canonical_end=-1,
+        chunk_ref=provenance_refs[0] if provenance_refs else "unmapped",
+        selection_reason=selection_reason,
+    )
+
+
+def _processing_window_manifest(windows: tuple[MappedTextWindow, ...]) -> str:
+    return json.dumps(
+        [
+            {
+                "chunk_ref": window.chunk_ref,
+                "canonical_start": window.canonical_start,
+                "canonical_end": window.canonical_end,
+                "selection_reason": window.selection_reason,
+                "mapping_status": "MAPPED" if window.canonical_start >= 0 else "UNMAPPED",
+            }
+            for window in windows
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _attach_canonical_spans(
+    scored: list[ScoredEvidence],
+    *,
+    document: ReadableDocument,
+    windows: tuple[MappedTextWindow, ...],
+) -> tuple[list[ScoredEvidence], dict[str, int]]:
+    localized = ambiguous = unmapped = not_found = 0
+    attached: list[ScoredEvidence] = []
+    for item in scored:
+        result = locate_canonical_evidence_span(
+            document,
+            item.candidate.exact_quote,
+            windows,
+        )
+        localized += result.status is LocalizationStatus.LOCATED
+        ambiguous += result.status is LocalizationStatus.AMBIGUOUS
+        unmapped += result.status is LocalizationStatus.UNMAPPED_INPUT
+        not_found += result.status is LocalizationStatus.NOT_FOUND
+        attached.append(
+            item.model_copy(
+                update={"canonical_span": result.span, "localization_status": result.status}
+            )
+        )
+    return attached, {
+        "canonical_span_localized_count": localized,
+        "canonical_span_ambiguous_count": ambiguous,
+        "canonical_span_unmapped_count": unmapped,
+        "canonical_span_not_found_count": not_found,
+    }
+
+
+def _windows_cover_document(windows: tuple[MappedTextWindow, ...], document_length: int) -> bool:
+    if document_length == 0:
+        return True
+    valid: list[tuple[int, int]] = []
+    for window in windows:
+        if (
+            window.canonical_start < 0
+            or window.canonical_end > document_length
+            or window.canonical_end - window.canonical_start != len(window.text)
+        ):
+            return False
+        valid.append((window.canonical_start, window.canonical_end))
+    if not valid:
+        return False
+    valid.sort()
+    covered_until = 0
+    for start, end in valid:
+        if start > covered_until:
+            return False
+        covered_until = max(covered_until, end)
+        if covered_until >= document_length:
+            return True
+    return False
 
 
 def _should_rescue_empty_result(

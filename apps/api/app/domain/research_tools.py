@@ -8,6 +8,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.document_evidence_context import (
+    CanonicalEvidenceSpan,
+    DocumentSourceSegment,
+    LocalizationStatus,
+)
+
 
 class SearchResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -43,6 +49,10 @@ class ReadPage(BaseModel):
     fetched_at: datetime
     published_at: datetime | None = None
     truncated: bool = False
+    available_char_count: int | None = Field(default=None, ge=0)
+    truncation_reason: str | None = Field(default=None, max_length=100)
+    document_type: str = Field(default="UNKNOWN", max_length=30)
+    source_segments: tuple[DocumentSourceSegment, ...] = ()
 
 
 class EvidenceRelation(StrEnum):
@@ -77,6 +87,8 @@ class ScoredEvidence(BaseModel):
     accepted: bool
     rejection_reason: str | None = None
     input_quality: dict[str, str] | None = None
+    canonical_span: CanonicalEvidenceSpan | None = None
+    localization_status: LocalizationStatus | None = None
 
 
 class EvidenceView(BaseModel):

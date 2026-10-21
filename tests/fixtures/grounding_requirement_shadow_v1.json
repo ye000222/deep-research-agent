@@ -1,0 +1,33 @@
+{
+  "contract_version": "grounding-requirements.generic.v1",
+  "synthetic_only": true,
+  "cases": [
+    {"id": "assertion_fully_grounded", "node_kind": "ASSERTION", "expected": "GROUNDED_USABLE"},
+    {"id": "assertion_without_irrelevant_scope", "node_kind": "ASSERTION", "expected": "GROUNDED_USABLE"},
+    {"id": "method_all_relations_grounded", "node_kind": "CONTEXT", "expected": "GROUNDED_USABLE"},
+    {"id": "method_relation_missing", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "epistemic_agent_missing", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "epistemic_wrong_target", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "attachment_structural_and_semantic", "node_kind": "ATTACHMENT", "expected": "GROUNDED_USABLE"},
+    {"id": "attachment_semantic_missing", "node_kind": "ATTACHMENT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "shared_context_two_targets", "node_kind": "CONTEXT", "expected": "GROUNDED_USABLE"},
+    {"id": "shared_context_one_target_unsupported", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "numeric_exact_value", "node_kind": "CONTEXT", "expected": "GROUNDED_USABLE"},
+    {"id": "numeric_association_missing", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "enumeration_count_only", "node_kind": "GROUP", "expected": "GROUNDED_USABLE"},
+    {"id": "enumeration_count_and_members", "node_kind": "GROUP", "expected": "GROUNDED_USABLE"},
+    {"id": "enumeration_member_missing", "node_kind": "GROUP", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "optional_invalid_is_diagnostic", "node_kind": "ASSERTION", "expected": "GROUNDED_USABLE"},
+    {"id": "required_not_supported", "node_kind": "ASSERTION", "expected": "UNGROUNDED_UNUSABLE"},
+    {"id": "required_ambiguous", "node_kind": "ASSERTION", "expected": "SEMANTIC_SUPPORT_AMBIGUOUS"},
+    {"id": "required_insufficient", "node_kind": "ASSERTION", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "textual_invalid", "node_kind": "ASSERTION", "expected": "UNGROUNDED_UNUSABLE"},
+    {"id": "structural_invalid", "node_kind": "ASSERTION", "expected": "UNGROUNDED_UNUSABLE"},
+    {"id": "zero_structural_only", "node_kind": "GROUP", "expected": "STRUCTURALLY_GROUNDED"},
+    {"id": "derivation_unresolved", "node_kind": "CONTEXT", "expected": "NOT_EVALUATED"},
+    {"id": "multiple_distinct_candidates", "node_kind": "ASSERTION", "expected": "SEMANTIC_SUPPORT_AMBIGUOUS"},
+    {"id": "duplicate_evidence_candidates", "node_kind": "ASSERTION", "expected": "GROUNDED_USABLE"},
+    {"id": "per_target_partial", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"},
+    {"id": "per_value_partial", "node_kind": "CONTEXT", "expected": "PARTIALLY_GROUNDED_UNRESOLVED"}
+  ]
+}

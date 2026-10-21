@@ -1,0 +1,26 @@
+{
+  "fixture_kind": "synthetic_structured_source_context_responses",
+  "provider_calls": 0,
+  "cases": [
+    {"case_id":"A_simple_assertion","claim":"Atlas reached 8 units.","shape":"single"},
+    {"case_id":"B_two_coordinated_assertions","claim":"Atlas reached 8 units and Nova reached 9 units.","shape":"two"},
+    {"case_id":"C_shared_temporal","claim":"In 2025 Atlas reached 8 units and Nova reached 9 units.","shape":"shared_temporal"},
+    {"case_id":"D_sibling_temporal","claim":"In 2024 Atlas reached 8 units; in 2025 Nova reached 9 units.","shape":"sibling_temporal"},
+    {"case_id":"E_local_condition","claim":"If demand rises, Atlas expands.","shape":"local_condition"},
+    {"case_id":"F_shared_condition","claim":"If demand rises, Atlas expands and Nova hires.","shape":"shared_condition"},
+    {"case_id":"G_shared_attribution","claim":"Acme reports that Atlas grew and Nova expanded.","shape":"shared_attribution"},
+    {"case_id":"H_local_attribution","claim":"Acme reports Atlas grew; Nova expanded.","shape":"local_attribution"},
+    {"case_id":"I_prediction_modality","claim":"Acme predicts Atlas will grow.","shape":"prediction"},
+    {"case_id":"J_population_location_scope","claim":"Among rural households, Atlas adoption reached 8 units.","shape":"scope"},
+    {"case_id":"K_method_relation","claim":"Atlas improved using method M.","shape":"method"},
+    {"case_id":"L_method_noun_only_negative","claim":"The method improved Atlas.","shape":"method_noun"},
+    {"case_id":"M_measurement_context","claim":"Atlas was measured by index Q.","shape":"measurement"},
+    {"case_id":"N_typed_numeric_value","claim":"Atlas reached 8.00 units.","shape":"numeric"},
+    {"case_id":"O_unknown_attachment","claim":"Atlas may grow.","shape":"unknown_attachment"},
+    {"case_id":"P_ambiguous_segmentation","claim":"Atlas and Nova may each grow or not.","shape":"unresolved"},
+    {"case_id":"Q_repeated_span_occurrence","claim":"Atlas grew; Atlas grew.","shape":"repeated"},
+    {"case_id":"R_nested_evidence_spans","claim":"According to Acme, Atlas grew in 2025.","shape":"nested"},
+    {"case_id":"S_fabricated_span_negative","claim":"Atlas grew.","shape":"fabricated"},
+    {"case_id":"T_invalid_attachment_reference","claim":"Atlas grew.","shape":"dangling_attachment"}
+  ]
+}

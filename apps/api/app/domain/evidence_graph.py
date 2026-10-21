@@ -10,6 +10,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.document_evidence_context import CanonicalEvidenceSpan
+
 _WHITESPACE = re.compile(r"\s+")
 _NUMBER = re.compile(r"(-?\d+(?:\.\d+)?)\s*(亿美元|亿元|万元|美元|%|\uff05|亿|万|元)?")
 _GRAPH_PUNCTUATION = re.compile(r"[^0-9a-zA-Z%\uff05\u4e00-\u9fff<>]+")
@@ -291,20 +293,38 @@ def claim_fingerprint(claim: str) -> str:
 def locate_quote(source_text: str, exact_quote: str) -> tuple[int, int] | None:
     """Locate a quote while tolerating equivalent whitespace in extracted HTML text."""
 
-    direct_start = source_text.find(exact_quote)
-    if direct_start >= 0:
-        return direct_start, direct_start + len(exact_quote)
+    direct_locations: list[tuple[int, int]] = []
+    direct_start = 0
+    while exact_quote:
+        direct_start = source_text.find(exact_quote, direct_start)
+        if direct_start < 0:
+            break
+        direct_locations.append((direct_start, direct_start + len(exact_quote)))
+        direct_start += 1
+    if len(direct_locations) == 1:
+        return direct_locations[0]
+    if len(direct_locations) > 1:
+        return None
 
     normalized_source, source_positions = _normalize_with_positions(source_text)
     normalized_quote = normalize_graph_text(exact_quote)
-    normalized_start = normalized_source.find(normalized_quote)
-    if normalized_start < 0 or not normalized_quote:
+    if not normalized_quote:
         return None
-
-    normalized_end = normalized_start + len(normalized_quote) - 1
-    if normalized_end >= len(source_positions):
+    normalized_locations: list[tuple[int, int]] = []
+    normalized_start = 0
+    while True:
+        normalized_start = normalized_source.find(normalized_quote, normalized_start)
+        if normalized_start < 0:
+            break
+        normalized_end = normalized_start + len(normalized_quote) - 1
+        if normalized_end < len(source_positions):
+            normalized_locations.append(
+                (source_positions[normalized_start], source_positions[normalized_end] + 1)
+            )
+        normalized_start += 1
+    if len(normalized_locations) != 1:
         return None
-    return source_positions[normalized_start], source_positions[normalized_end] + 1
+    return normalized_locations[0]
 
 
 def build_evidence_chunk(
@@ -312,10 +332,23 @@ def build_evidence_chunk(
     exact_quote: str,
     *,
     context_chars: int = 1_800,
+    canonical_span: CanonicalEvidenceSpan | None = None,
 ) -> EvidenceChunkWindow | None:
     """Build a bounded, reproducible source chunk around an exact quote."""
 
-    location = locate_quote(source_text, exact_quote)
+    location: tuple[int, int] | None
+    if canonical_span is not None:
+        location = (canonical_span.char_start, canonical_span.char_end)
+        if (
+            location[0] < 0
+            or location[1] > len(source_text)
+            or source_text[location[0] : location[1]] != canonical_span.exact_text
+            or _WHITESPACE.sub(" ", canonical_span.exact_text).strip()
+            != _WHITESPACE.sub(" ", exact_quote).strip()
+        ):
+            return None
+    else:
+        location = locate_quote(source_text, exact_quote)
     if location is None:
         return None
     quote_start, quote_end = location

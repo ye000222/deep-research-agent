@@ -1,0 +1,13 @@
+{
+  "benchmark_count_with_data": 4,
+  "coverage_mean": 0.606567,
+  "coverage_median": 0.683733,
+  "coverage_min": 0.25,
+  "coverage_max": 0.8088,
+  "between_benchmark_sd": 0.213197,
+  "low_coverage_families": [
+    "v1-gen-low-altitude-economy"
+  ],
+  "qualification_status": "QUALIFIED_DATASET",
+  "reason": "Terminal results use the frozen reference configuration; infrastructure-invalid attempts are excluded and retained in provenance."
+}

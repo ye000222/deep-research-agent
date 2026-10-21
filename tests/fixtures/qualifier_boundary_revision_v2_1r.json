@@ -1,0 +1,139 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "qualifier-boundary-revision-v2.1r-v1",
+  "negation_positive": [
+    {
+      "case_id": "clause_initial_predicate_negation",
+      "claim_text": "不运行。",
+      "propositions": [
+        {
+          "proposition_text": "不运行。",
+          "subject": "设备",
+          "predicate": "不运行",
+          "polarity": "asserted"
+        }
+      ]
+    },
+    {
+      "case_id": "negated_polarity_after_cjk_subject",
+      "claim_text": "设备不运行。",
+      "propositions": [
+        {
+          "proposition_text": "设备不运行。",
+          "subject": "设备",
+          "predicate": "运行",
+          "polarity": "negated"
+        }
+      ]
+    },
+    {
+      "case_id": "unstarted_polarity_after_cjk_subject",
+      "claim_text": "系统未启动。",
+      "propositions": [
+        {
+          "proposition_text": "系统未启动。",
+          "subject": "系统",
+          "predicate": "启动",
+          "polarity": "negated"
+        }
+      ]
+    },
+    {
+      "case_id": "multi_character_negation_remains_detectable",
+      "claim_text": "设备无法启动。",
+      "propositions": [
+        {
+          "proposition_text": "设备无法启动。",
+          "subject": "设备",
+          "predicate": "无法启动",
+          "polarity": "asserted"
+        }
+      ]
+    }
+  ],
+  "negation_hard_negatives": [
+    {
+      "case_id": "lexical_different",
+      "claim_text": "两个方案存在不同性能。",
+      "propositions": [
+        {
+          "proposition_text": "两个方案的性能存在差异。",
+          "subject": "两个方案",
+          "predicate": "性能存在差异",
+          "polarity": "asserted"
+        }
+      ]
+    },
+    {
+      "case_id": "lexical_irregular",
+      "claim_text": "样品具有不规则纹理。",
+      "propositions": [
+        {
+          "proposition_text": "样品具有不规则纹理。",
+          "subject": "样品",
+          "predicate": "具有纹理",
+          "polarity": "asserted"
+        }
+      ]
+    },
+    {
+      "case_id": "lexical_stainless",
+      "claim_text": "外壳由不锈钢制成。",
+      "propositions": [
+        {
+          "proposition_text": "外壳由不锈钢制成。",
+          "subject": "外壳",
+          "predicate": "由不锈钢制成",
+          "polarity": "asserted"
+        }
+      ]
+    }
+  ],
+  "method_equivalence": [
+    {
+      "case_id": "method_relation_in_predicate_with_object",
+      "claim_text": "该框架采用提示条件化的异常定位。",
+      "propositions": [
+        {
+          "proposition_text": "该框架采用提示条件化的异常定位。",
+          "subject": "该框架",
+          "predicate": "采用",
+          "typed_value": {"kind": "text", "text": "提示条件化的异常定位"},
+          "polarity": "asserted"
+        }
+      ],
+      "expected": "PRESERVED"
+    },
+    {
+      "case_id": "method_marker_in_prose_is_not_enough",
+      "claim_text": "该框架采用提示条件化的异常定位。",
+      "propositions": [
+        {
+          "proposition_text": "该框架采用提示条件化的异常定位。",
+          "subject": "该框架",
+          "predicate": "具有定位能力",
+          "typed_value": {"kind": "text", "text": "异常定位"},
+          "polarity": "asserted"
+        }
+      ],
+      "expected": "POTENTIAL_LOSS"
+    },
+    {
+      "case_id": "method_semantics_in_qualifier_without_verb_copy",
+      "claim_text": "该框架采用提示条件化的异常定位。",
+      "propositions": [
+        {
+          "proposition_text": "该框架执行提示条件化异常定位。",
+          "subject": "该框架",
+          "predicate": "执行",
+          "typed_value": {"kind": "text", "text": "提示条件化异常定位"},
+          "polarity": "asserted",
+          "material_qualifiers": [
+            {"category": "method", "key": "method", "value": "提示条件化"}
+          ]
+        }
+      ],
+      "expected": "PRESERVED"
+    }
+  ]
+}

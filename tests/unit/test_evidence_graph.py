@@ -1,3 +1,8 @@
+from app.domain.document_evidence_context import (
+    MappedTextWindow,
+    build_readable_document,
+    locate_canonical_evidence_span,
+)
 from app.domain.evidence_graph import (
     build_evidence_chunk,
     claim_fingerprint,
@@ -115,6 +120,48 @@ def test_build_evidence_chunk_is_bounded_and_reproducible() -> None:
 
 def test_build_evidence_chunk_rejects_unverifiable_quote() -> None:
     assert build_evidence_chunk("source text", "invented quote") is None
+
+
+def test_quote_localization_fails_closed_for_multiple_global_occurrences() -> None:
+    source = "Repeated exact quote. intervening. Repeated exact quote."
+
+    assert locate_quote(source, "Repeated exact quote.") is None
+    assert build_evidence_chunk(source, "Repeated exact quote.") is None
+
+
+def test_evidence_chunk_uses_explicit_canonical_second_occurrence() -> None:
+    source = "Repeated exact quote. intervening. Repeated exact quote."
+    document = build_readable_document(
+        source_ref="source-id",
+        snapshot_content_hash="c" * 64,
+        canonical_text=source,
+        available_text_length=len(source),
+        document_type="HTML",
+        was_truncated=False,
+    )
+    second_start = source.rindex("Repeated exact quote.")
+    local = locate_canonical_evidence_span(
+        document,
+        "Repeated exact quote.",
+        (
+            MappedTextWindow(
+                text=source[second_start:],
+                canonical_start=second_start,
+                canonical_end=len(source),
+                chunk_ref="second-occurrence",
+            ),
+        ),
+    )
+
+    assert local.span is not None
+    window = build_evidence_chunk(
+        source,
+        "Repeated exact quote.",
+        context_chars=3,
+        canonical_span=local.span,
+    )
+    assert window is not None
+    assert window.char_start == second_start - 3
 
 
 def test_infer_claim_relation_does_not_conflict_different_market_scopes() -> None:

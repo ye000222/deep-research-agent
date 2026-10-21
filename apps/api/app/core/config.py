@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -64,6 +65,13 @@ class Settings(BaseSettings):
     # Phase 15.2 experiment factor.  False preserves Phase 15.1 extraction
     # behavior; true enables claim-aware input preparation and diagnostics.
     evidence_input_quality_enabled: bool = False
+    # V2.3-D Step 3: OFF is the production baseline. SHADOW requires a complete,
+    # caller-supplied SemanticRuntimeBudget JSON object; there are no implicit caps.
+    semantic_runtime_mode: Literal["OFF", "SHADOW"] = "OFF"
+    semantic_runtime_budget_json: str | None = None
+    # V3.3 Gap Work is opt-in until its orchestrator integration is formally
+    # accepted.  The legacy scheduler remains the default production behavior.
+    proposition_gap_work_scheduling_enabled: bool = False
     # Consecutive failed cooldown re-probes before a provider is disabled for
     # the whole run (bounds the probe -> fail -> probe loop).
     provider_max_probe_failures: int = Field(default=3, ge=1)

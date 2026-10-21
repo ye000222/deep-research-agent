@@ -16,6 +16,7 @@ from app.core.config import Settings
 from app.domain.provider_adapter import SearchProviderAdapter
 from app.domain.provider_registry import SearchProviderRegistry
 from app.domain.research_runs import EXECUTION_LEASE_SECONDS
+from app.domain.semantic_runtime_budget import SemanticRuntimeBudget
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.checkpoints.lifecycle import CheckpointRuntime
 from app.infrastructure.db.extraction_cache import ExtractionCacheRepository
@@ -28,6 +29,7 @@ from app.infrastructure.db.reports import (
 )
 from app.infrastructure.db.research_runs import ResearchRunRepository
 from app.infrastructure.db.research_tools import ResearchLeaseLostError, ResearchToolRepository
+from app.infrastructure.db.research_work import ResearchWorkRepository
 from app.infrastructure.db.run_providers import (
     RunCredentialUnavailableError,
     RunProviderBindingRepository,
@@ -38,13 +40,24 @@ from app.infrastructure.db.state_runtime import (
     StateSnapshotNotFoundError,
 )
 from app.llm.adapters import LLMGateway, ModelGatewayError
+from app.llm.model_http_policy import model_generation_timeout
 from app.memory.manager import ResearchMemoryManager
 from app.security.secrets import SecretCipher, SecretDecryptionError, load_or_create_master_key
+from app.services.durable_semantic_input import DurableSemanticInputLoader
 from app.services.evidence_extractor import EvidenceExtractorService
 from app.services.planner import PlannerService
 from app.services.report_writer import ReportWriterService
 from app.services.research_graph import ResearchGraphService
 from app.services.research_loop import ResearchLoopService
+from app.services.research_orchestrator import ResearchOrchestrator
+from app.services.run_state_publisher import RunStatePublisher
+from app.services.run_state_reducer import RunStateReducer
+from app.services.semantic_engine import V23DeterministicSemanticEngine
+from app.services.semantic_feedback_recovery import SemanticFeedbackRecoveryCoordinator
+from app.services.semantic_research_shadow import (
+    SemanticResearchShadowPipeline,
+    SemanticShadowMode,
+)
 from app.tools.analyze_data import AnalyzeDataTool
 from app.tools.brave_search import BraveSearchAdapter
 from app.tools.duckduckgo_search import DuckDuckGoAdapter
@@ -114,7 +127,7 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         max_size=settings.checkpoint_pool_max_size,
     )
     model_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(90.0, connect=10.0),
+        timeout=model_generation_timeout(),
         # Retry connection establishment locally before consuming one of the
         # wider, durable Outbox retry windows. HTTP responses and read failures
         # are not replayed by the transport.
@@ -191,6 +204,49 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         await public_web_client.aclose()
         raise
     gateway = LLMGateway(model_client, call_recorder=llm_calls.record)
+    semantic_shadow_mode = SemanticShadowMode(settings.semantic_runtime_mode)
+    semantic_budget: SemanticRuntimeBudget | None = None
+    if semantic_shadow_mode is SemanticShadowMode.SHADOW and settings.semantic_runtime_budget_json:
+        try:
+            semantic_budget = SemanticRuntimeBudget.model_validate_json(
+                settings.semantic_runtime_budget_json
+            )
+        except ValidationError:
+            # Invalid/missing budget is handled as SHADOW_NOT_CONFIGURED by the side path.
+            semantic_budget = None
+    artifacts = LocalArtifactStore(settings.artifact_root)
+    run_state_reducer = RunStateReducer()
+    run_state_publisher = RunStatePublisher(artifacts=artifacts, runs=repository)
+    semantic_shadow = (
+        SemanticResearchShadowPipeline(
+            repository=research_repository,
+            bindings=bindings,
+            cipher=cipher,
+            gateway=gateway,
+            artifacts=artifacts,
+            budget=semantic_budget,
+            run_state_runs=repository,
+            run_state_reducer=run_state_reducer,
+            run_state_publisher=run_state_publisher,
+            semantic_engine=V23DeterministicSemanticEngine(),
+        )
+        if semantic_shadow_mode is SemanticShadowMode.SHADOW
+        else None
+    )
+    research_work_repository = ResearchWorkRepository(database.session_factory)
+    semantic_recovery = (
+        SemanticFeedbackRecoveryCoordinator(
+            sessions=database.session_factory,
+            runs=repository,
+            publisher=run_state_publisher,
+            loader=DurableSemanticInputLoader(database.session_factory, artifacts),
+            semantic_pipeline=semantic_shadow,
+            work_repository=research_work_repository,
+            budget_repository=research_repository,
+        )
+        if semantic_shadow is not None
+        else None
+    )
     planner = PlannerService(
         bindings,
         cipher,
@@ -203,11 +259,22 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         searxng_provider,
         PublicWebReader(public_web_client),
         EvidenceExtractorService(bindings, cipher, gateway, contexts, extraction_cache),
-        LocalArtifactStore(settings.artifact_root),
+        artifacts,
         controlled_tools,
         parallel_reads_enabled=True,
         search_adapters=search_adapters,
         evidence_aware_context_enabled=settings.evidence_aware_context_enabled,
+        semantic_shadow_mode=semantic_shadow_mode,
+        semantic_shadow=semantic_shadow,
+    )
+    research_orchestrator = ResearchOrchestrator(
+        runs=repository,
+        work=research_work_repository,
+        run_states=run_state_publisher,
+        loop=research_loop,
+        tools=research_repository,
+        semantic_recovery=semantic_recovery,
+        gap_work_scheduling_enabled=settings.proposition_gap_work_scheduling_enabled,
     )
     report_writer = ReportWriterService(
         report_repository,
@@ -225,6 +292,7 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         research_loop,
         report_writer,
         memories,
+        research_orchestrator,
     )
     try:
         acquired = await repository.acquire_for_execution(
@@ -234,6 +302,12 @@ async def _execute(run_id: UUID, task_id: str) -> str:
         )
         if not acquired:
             return "skipped"
+        initial_run_state = await run_state_publisher.initialize_genesis(
+            run_ref=run_id,
+            reducer=run_state_reducer,
+        )
+        if initial_run_state is not None and semantic_shadow is None:
+            raise RuntimeError("V3_SEMANTIC_RUNTIME_NOT_CONFIGURED")
         lease_stop = asyncio.Event()
         lease_heartbeat = asyncio.create_task(
             _renew_worker_lease(
@@ -245,6 +319,18 @@ async def _execute(run_id: UUID, task_id: str) -> str:
             ),
             name=f"research-lease-heartbeat-{run_id}",
         )
+        if (
+            initial_run_state is not None
+            and initial_run_state.orchestrator_version == "V3"
+            and semantic_recovery is not None
+        ):
+            try:
+                await semantic_recovery.recover_semantic_feedback_for_run(run_id)
+            except Exception as exc:
+                logger.warning(
+                    "Semantic feedback recovery did not converge before research resume",
+                    extra={"run_id": str(run_id), "reason_code": type(exc).__name__},
+                )
         saver = await checkpoints.open()
         return await graph.execute(
             run_id,

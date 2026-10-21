@@ -1,0 +1,75 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "qualifier-lexical-boundary-v2.1r-v1",
+  "positive_attribution": [
+    {
+      "case_id": "zh_clause_initial",
+      "claim_text": "据报告，设备已上线。",
+      "propositions": [
+        {
+          "proposition_text": "据报告，设备已上线。",
+          "subject": "设备",
+          "predicate": "已上线",
+          "attribution": "报告",
+          "polarity": "asserted"
+        }
+      ]
+    },
+    {
+      "case_id": "zh_script_transition_suffix",
+      "claim_text": "报告R称，设备已上线。",
+      "propositions": [
+        {
+          "proposition_text": "报告R称，设备已上线。",
+          "subject": "设备",
+          "predicate": "已上线",
+          "attribution": "报告R",
+          "polarity": "asserted"
+        }
+      ]
+    },
+    {
+      "case_id": "ja_structural_marker",
+      "claim_text": "報告Rによると、装置は稼働中である。",
+      "propositions": [
+        {
+          "proposition_text": "報告Rによると、装置は稼働中である。",
+          "subject": "装置",
+          "predicate": "稼働中である",
+          "attribution": "報告R",
+          "polarity": "asserted"
+        }
+      ]
+    },
+    {
+      "case_id": "es_structural_marker",
+      "claim_text": "Según el informe R, el sistema está activo.",
+      "propositions": [
+        {
+          "proposition_text": "Según el informe R, el sistema está activo.",
+          "subject": "el sistema",
+          "predicate": "está activo",
+          "attribution": "el informe R",
+          "polarity": "asserted"
+        }
+      ]
+    }
+  ],
+  "hard_negatives": [
+    {
+      "case_id": "zh_database",
+      "text": "数据库记录显示设备已上线。",
+      "not_detected": ["attribution"]
+    },
+    {
+      "case_id": "zh_dataset",
+      "text": "数据集覆盖多个实验场景。",
+      "not_detected": ["attribution"]
+    },
+    {
+      "case_id": "zh_name_field",
+      "text": "名称字段已被更新。",
+      "not_detected": ["attribution"]
+    }
+  ]
+}

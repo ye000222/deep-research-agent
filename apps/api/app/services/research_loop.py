@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -28,10 +29,18 @@ from app.domain.research_context_enricher import ResearchContextEnricher
 from app.domain.research_tools import ReadPage, SearchResult
 from app.domain.source_policy import is_stable_read_url, normalize_source_url, source_owner_key
 from app.infrastructure.artifacts import LocalArtifactStore
-from app.infrastructure.db.research_tools import ResearchTarget, ResearchToolRepository
+from app.infrastructure.db.research_tools import (
+    IterationEvaluation,
+    ResearchTarget,
+    ResearchToolRepository,
+)
 from app.llm.adapters import ModelGatewayError
 from app.services.evidence_extractor import EvidenceExtractorService, source_reliability
 from app.services.parallel_reads import read_page_attempts_concurrently
+from app.services.semantic_research_shadow import (
+    SemanticResearchShadowPipeline,
+    SemanticShadowMode,
+)
 from app.tools.errors import ToolExecutionError
 from app.tools.gateway import ControlledToolGateway
 from app.tools.provider_adapters import BingAdapter, SearXNGAdapter
@@ -231,6 +240,8 @@ class ResearchAttemptResult:
     recovery_accepted_evidence_before: int = 0
     recovery_tokens_reserved: int = 0
     recovery_attempts: tuple[RecoveryAttemptContext, ...] = ()
+    evidence_refs: tuple[UUID, ...] = ()
+    reused_evidence_refs: tuple[UUID, ...] = ()
 
 
 class ResearchLoopService:
@@ -246,6 +257,8 @@ class ResearchLoopService:
         parallel_reads_enabled: bool = False,
         search_adapters: Mapping[str, SearchProviderAdapter] | None = None,
         evidence_aware_context_enabled: bool = False,
+        semantic_shadow_mode: SemanticShadowMode = SemanticShadowMode.OFF,
+        semantic_shadow: SemanticResearchShadowPipeline | None = None,
     ) -> None:
         self._repository = repository
         self._search = search
@@ -263,6 +276,8 @@ class ResearchLoopService:
         # enrichment layer in its entirety, keeping the Planner ->
         # SearchTarget -> Provider path identical to the Phase 12.4 baseline.
         self._evidence_aware_context_enabled = evidence_aware_context_enabled
+        self._semantic_shadow_mode = semantic_shadow_mode
+        self._semantic_shadow = semantic_shadow
         # Phase 12.4 B: a single provider-name -> adapter dispatch map. The
         # Router-selected provider is looked up here and executed directly, so
         # there is no provider-string branching and no provider-side fallback.
@@ -278,6 +293,56 @@ class ResearchLoopService:
             }
         else:
             self._search_adapters = {}
+
+    async def _record_page_with_shadow(
+        self,
+        run_id: UUID,
+        **persist_kwargs: Any,
+    ) -> tuple[int, int, tuple[UUID, ...]]:
+        """Commit legacy evidence, then invoke the optional observational side path."""
+
+        receipt_writer = getattr(self._repository, "record_page_with_receipts", None)
+        if not callable(receipt_writer):
+            inserted, accepted = await self._repository.record_page(run_id, **persist_kwargs)
+            return inserted, accepted, ()
+
+        persisted_page = await receipt_writer(run_id, **persist_kwargs)
+        if (
+            self._semantic_shadow_mode is SemanticShadowMode.SHADOW
+            and self._semantic_shadow is not None
+        ):
+            try:
+                await self._semantic_shadow.process_persisted_page(run_id, persisted_page)
+            except Exception:
+                # This derived path is observational; it cannot change committed research results.
+                logger.error(
+                    "semantic shadow failed outside its isolation boundary",
+                    extra={"run_id": str(run_id), "reason_code": "SHADOW_FAILURE_ISOLATED"},
+                )
+        evidence_refs = tuple(
+            evidence.evidence_id
+            for receipt in persisted_page.claim_receipts
+            for evidence in receipt.evidence_receipts
+            if evidence.accepted_and_persisted
+        )
+        return persisted_page.inserted_count, persisted_page.accepted_count, evidence_refs
+
+    async def project_work_iteration(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        attempt_outcome: str,
+    ) -> IterationEvaluation:
+        """Project shared plan/evaluation results without invoking the legacy scheduler."""
+
+        return await self._repository.project_work_iteration(
+            run_id,
+            worker_task_id=worker_task_id,
+            target=target,
+            attempt_outcome=attempt_outcome,
+        )
 
     async def run_one_iteration(
         self,
@@ -320,12 +385,7 @@ class ResearchLoopService:
                 low_information_gain_streak=0,
             )
 
-        target = await self._enrich_target_with_research_context(
-            run_id,
-            worker_task_id=worker_task_id,
-            target=target,
-        )
-        attempt = await self._research_target(
+        attempt = await self.execute_target(
             run_id,
             worker_task_id=worker_task_id,
             target=target,
@@ -384,6 +444,26 @@ class ResearchLoopService:
             coverage=evaluation.coverage,
             information_gain=evaluation.information_gain,
             low_information_gain_streak=evaluation.low_information_gain_streak,
+        )
+
+    async def execute_target(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+    ) -> ResearchAttemptResult:
+        """Run the scheduler-neutral Search/Reader/Extractor executor seam."""
+
+        enriched_target = await self._enrich_target_with_research_context(
+            run_id,
+            worker_task_id=worker_task_id,
+            target=target,
+        )
+        return await self._research_target(
+            run_id,
+            worker_task_id=worker_task_id,
+            target=enriched_target,
         )
 
     async def run_iteration(self, run_id: UUID, *, worker_task_id: str) -> str:
@@ -803,6 +883,7 @@ class ResearchLoopService:
             return ResearchAttemptResult(0, 0, "zero_results")
         pages_read = 0
         accepted = 0
+        persisted_evidence_refs: list[UUID] = []
         recovery_attempt_id: UUID | None = None
         recovery_coverage_before = 0.0
         recovery_gap_before: tuple[str, ...] = ()
@@ -822,6 +903,7 @@ class ResearchLoopService:
                 recovery_accepted_evidence_before=recovery_accepted_evidence_before,
                 recovery_tokens_reserved=recovery_tokens_reserved,
                 recovery_attempts=tuple(recovery_attempts),
+                evidence_refs=tuple(persisted_evidence_refs),
             )
 
         async def record_recovery_failure(reason: str) -> None:
@@ -1325,6 +1407,8 @@ class ResearchLoopService:
                     worker_task_id=worker_task_id,
                     target=target,
                     source_id=source_id,
+                    artifact_uri=artifact_uri,
+                    page=page,
                 )
             except Exception:
                 await cleanup_attempt(attempt_id, uncertain=False)
@@ -1424,7 +1508,11 @@ class ResearchLoopService:
                 raise
 
             try:
-                page_candidate_count, page_accepted = await self._repository.record_page(
+                (
+                    page_candidate_count,
+                    page_accepted,
+                    page_evidence_refs,
+                ) = await self._record_page_with_shadow(
                     run_id,
                     worker_task_id=worker_task_id,
                     target=target,
@@ -1441,6 +1529,7 @@ class ResearchLoopService:
                 await record_recovery_failure("evidence_persistence_failed")
                 raise
             accepted += page_accepted
+            persisted_evidence_refs.extend(page_evidence_refs)
             structured_extraction_failures = 0
             if page_candidate_count == 0:
                 # A readable page that yields no candidate is a failed query
@@ -1503,6 +1592,7 @@ class ResearchLoopService:
             recovery_accepted_evidence_before=recovery_accepted_evidence_before,
             recovery_tokens_reserved=recovery_tokens_reserved,
             recovery_attempts=tuple(recovery_attempts),
+            evidence_refs=tuple(persisted_evidence_refs),
         )
 
     @staticmethod

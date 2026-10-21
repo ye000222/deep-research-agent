@@ -1,0 +1,174 @@
+{
+  "fixture_version": "semantic-proposition-formation-synthetic-v1",
+  "synthetic_only": true,
+  "cases": [
+    {
+      "case_id": "qualitative_comparison",
+      "claim_text": "Unit A outperforms Unit B.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2",
+        "decomposition_status": "single_proposition",
+        "propositions": [{
+          "proposition_text": "Unit A outperforms Unit B, with the comparison metric unspecified.",
+          "subject": "Unit A", "predicate": "outperforms",
+          "typed_value": {"kind": "comparison", "comparison_target": "Unit B", "comparison_metric": null, "comparison_metric_status": "unspecified"},
+          "polarity": "asserted"
+        }]
+      }
+    },
+    {
+      "case_id": "quantitative_comparison",
+      "claim_text": "Unit A exceeds Unit B by 4 points on metric M.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2",
+        "decomposition_status": "single_proposition",
+        "propositions": [{
+          "proposition_text": "Unit A exceeds Unit B by 4 points on metric M.",
+          "subject": "Unit A", "predicate": "exceeds",
+          "typed_value": {"kind": "comparison", "comparison_target": "Unit B", "comparison_metric": "metric M", "comparison_metric_status": "explicit", "numeric": {"operator": "exact", "value": 4, "unit": "points"}},
+          "polarity": "asserted"
+        }]
+      }
+    },
+    {
+      "case_id": "context_resolved_comparison_metric",
+      "claim_text": "For the stated throughput measure, Unit A is higher than Unit B.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2",
+        "decomposition_status": "single_proposition",
+        "propositions": [{
+          "proposition_text": "For the stated throughput measure, Unit A is higher than Unit B.",
+          "subject": "Unit A", "predicate": "is higher than",
+          "typed_value": {"kind": "comparison", "comparison_target": "Unit B", "comparison_metric": "throughput", "comparison_metric_status": "context_resolved"},
+          "polarity": "asserted",
+          "material_qualifiers": [{"category": "measurement", "key": "measure", "value": "throughput", "materiality": "material", "source_span": "stated throughput measure"}]
+        }]
+      }
+    },
+    {
+      "case_id": "explicit_condition",
+      "claim_text": "Under condition C, Module M supports mode Z.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2",
+        "decomposition_status": "single_proposition",
+        "propositions": [{
+          "proposition_text": "Under condition C, Module M supports mode Z.",
+          "subject": "Module M", "predicate": "supports",
+          "typed_value": {"kind": "entity", "text": "mode Z"}, "polarity": "asserted",
+          "material_qualifiers": [{"category": "condition", "key": "operating_condition", "value": "C", "materiality": "material", "source_span": "Under condition C"}]
+        }]
+      }
+    },
+    {
+      "case_id": "claim_local_implicit_subject",
+      "claim_text": "The unit stores record R and exports file F.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2",
+        "decomposition_status": "decomposed",
+        "propositions": [
+          {"proposition_text": "The unit stores record R.", "subject": "unit", "predicate": "stores", "typed_value": {"kind": "entity", "text": "record R"}, "polarity": "asserted"},
+          {"proposition_text": "The unit exports file F.", "subject": "unit", "predicate": "exports", "typed_value": {"kind": "entity", "text": "file F"}, "polarity": "asserted"}
+        ]
+      }
+    },
+    {
+      "case_id": "missing_subject",
+      "claim_text": "Remains stable after restart.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "unresolved_decomposition", "propositions": [], "ambiguity_reason": "The Claim does not identify the entity that remains stable."}
+    },
+    {
+      "case_id": "time_qualified",
+      "claim_text": "During period P, Facility F processed 8 batches.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2",
+        "decomposition_status": "single_proposition",
+        "propositions": [{
+          "proposition_text": "During period P, Facility F processed 8 batches.",
+          "subject": "Facility F", "predicate": "processed",
+          "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 8, "unit": "batches"}}, "polarity": "asserted",
+          "material_qualifiers": [{"category": "period", "key": "processing_period", "value": "P", "materiality": "material", "source_span": "During period P"}]
+        }]
+      }
+    },
+    {
+      "case_id": "forecast_modality",
+      "claim_text": "The analyst forecasts that Service S will expand.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition",
+        "propositions": [{"proposition_text": "The analyst forecasts that Service S will expand.", "subject": "Service S", "predicate": "will expand", "typed_value": {"kind": "boolean", "boolean": true}, "polarity": "asserted", "modality": "forecast", "attribution": "the analyst"}]
+      }
+    },
+    {
+      "case_id": "attributed_assertion",
+      "claim_text": "According to Review R, Process P reduces delay.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition",
+        "propositions": [{"proposition_text": "According to Review R, Process P reduces delay.", "subject": "Process P", "predicate": "reduces", "typed_value": {"kind": "entity", "text": "delay"}, "polarity": "asserted", "attribution": "Review R"}]
+      }
+    },
+    {
+      "case_id": "sample_configuration_condition",
+      "claim_text": "With three calibration inputs, Unit A can attain an output of 18 units.",
+      "response": {
+        "schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition",
+        "propositions": [{"proposition_text": "With three calibration inputs, Unit A can attain an output of 18 units.", "subject": "Unit A", "predicate": "can attain output", "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 18, "unit": "units", "measurement_basis": "attainable"}}, "polarity": "asserted", "modality": "can attain", "material_qualifiers": [{"category": "configuration", "key": "calibration_input_count", "value": "three", "materiality": "material", "source_span": "With three calibration inputs"}]}]
+      }
+    },
+    {
+      "case_id": "exact_numeric",
+      "claim_text": "The counter records exactly 12 events.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The counter records exactly 12 events.", "subject": "counter", "predicate": "records", "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 12, "unit": "events"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "approximate_numeric",
+      "claim_text": "The duration is approximately 6 hours.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The duration is approximately 6 hours.", "subject": "duration", "predicate": "is", "typed_value": {"kind": "quantity", "numeric": {"operator": "approx", "value": 6, "unit": "hours"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "lower_bound",
+      "claim_text": "The collection contains at least 5 entries.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The collection contains at least 5 entries.", "subject": "collection", "predicate": "contains", "typed_value": {"kind": "quantity", "numeric": {"operator": "gte", "value": 5, "unit": "entries"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "upper_bound",
+      "claim_text": "The measured delay is no more than 7 ms.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The measured delay is no more than 7 ms.", "subject": "delay", "predicate": "is no more than", "typed_value": {"kind": "quantity", "numeric": {"operator": "lte", "value": 7, "unit": "ms", "measurement_basis": "observed"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "interval_range",
+      "claim_text": "The observed interval is from 3 to 8 seconds.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The observed interval is from 3 to 8 seconds.", "subject": "interval", "predicate": "is", "typed_value": {"kind": "range", "numeric": {"operator": "range", "lower_bound": 3, "upper_bound": 8, "unit": "seconds", "measurement_basis": "observed"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "reported_peak_result",
+      "claim_text": "Report R states that Process P reached a peak output of 18 units.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "Report R states that Process P reached a peak output of 18 units.", "subject": "Process P", "predicate": "reached peak output", "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 18, "unit": "units", "measurement_basis": "reported", "extremum": "peak"}}, "polarity": "asserted", "modality": "reported", "attribution": "Report R"}]}
+    },
+    {
+      "case_id": "best_result",
+      "claim_text": "The trial records its best score as 11 points.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The trial records its best score as 11 points.", "subject": "trial", "predicate": "records best score", "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 11, "unit": "points", "extremum": "best"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "absolute_change",
+      "claim_text": "The balance increased by 5 units.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The balance increased by 5 units.", "subject": "balance", "predicate": "increased by", "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 5, "unit": "units", "change_type": "absolute"}}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "relative_change",
+      "claim_text": "The rate improved by approximately 8 percent relative to baseline B.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "single_proposition", "propositions": [{"proposition_text": "The rate improved by approximately 8 percent relative to baseline B.", "subject": "rate", "predicate": "improved by", "typed_value": {"kind": "quantity", "numeric": {"operator": "approx", "value": 8, "unit": "percent", "change_type": "relative"}}, "polarity": "asserted", "material_qualifiers": [{"category": "baseline", "key": "comparison_baseline", "value": "B", "materiality": "material", "source_span": "relative to baseline B"}]}]
+      }
+    },
+    {
+      "case_id": "multiple_propositions",
+      "claim_text": "Unit A stores record R and exports file F.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "decomposed", "propositions": [{"proposition_text": "Unit A stores record R.", "subject": "Unit A", "predicate": "stores", "typed_value": {"kind": "entity", "text": "record R"}, "polarity": "asserted"}, {"proposition_text": "Unit A exports file F.", "subject": "Unit A", "predicate": "exports", "typed_value": {"kind": "entity", "text": "file F"}, "polarity": "asserted"}]}
+    },
+    {
+      "case_id": "partially_ambiguous_composite_whole_claim_unresolved",
+      "claim_text": "Unit A stores record R and places the label near the marker.",
+      "response": {"schema_version": "atomic-proposition-schema-v2", "decomposition_status": "unresolved_decomposition", "propositions": [], "ambiguity_reason": "The relation and attachment in one fragment are ambiguous; the contract does not permit dropping that fragment and returning partial output."}
+    }
+  ]
+}

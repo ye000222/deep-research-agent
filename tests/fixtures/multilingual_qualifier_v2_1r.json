@@ -1,0 +1,175 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "multilingual-qualifier-v2.1r-v1",
+  "cases": [
+    {
+      "case_id": "english",
+      "language": "en",
+      "claim_text": "According to report R, under setting B, the measured rate may reach 8% for all users, not setting A, using method K with 12 samples.",
+      "propositions": [
+        {
+          "proposition_text": "The measured rate may reach 8% for all users, not setting A, using method K with 12 samples.",
+          "subject": "rate",
+          "predicate": "may reach",
+          "polarity": "negated",
+          "modality": "may",
+          "attribution": "report R",
+          "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 8, "unit": "%"}},
+          "material_qualifiers": [
+            {"category": "configuration", "key": "setting", "value": "setting B", "source_span": "setting B"},
+            {"category": "measurement", "key": "sample_count", "value": "12 samples", "source_span": "12 samples"},
+            {"category": "population", "key": "population", "value": "all users", "source_span": "all users"},
+            {"category": "method", "key": "method", "value": "method K", "source_span": "method K"},
+            {"category": "condition", "key": "condition", "value": "under setting B", "source_span": "under setting B"},
+            {"category": "scope", "key": "scope", "value": "all users", "source_span": "all users"}
+          ]
+        }
+      ],
+      "must_preserve": ["attribution", "condition", "configuration", "measurement", "modality", "negation", "population", "sample_count", "scope", "unit"]
+    },
+    {
+      "case_id": "english_structural",
+      "language": "en",
+      "claim_text": "In 2042, the amount was $40, and unit A ranked higher than unit B.",
+      "propositions": [
+        {
+          "proposition_text": "In 2042, the amount was $40, and unit A ranked higher than unit B.",
+          "subject": "unit A",
+          "predicate": "ranked higher than",
+          "polarity": "asserted",
+          "typed_value": {"kind": "comparison", "comparison_target": "unit B", "comparison_metric": "rank", "comparison_metric_status": "explicit", "numeric": {"operator": "exact", "value": 40, "currency": "USD"}},
+          "material_qualifiers": [{"category": "time", "key": "year", "value": "2042", "source_span": "2042"}]
+        }
+      ],
+      "must_preserve": ["date_time", "currency", "comparison"]
+    },
+    {
+      "case_id": "chinese_structural",
+      "language": "zh",
+      "claim_text": "在2042年，金额为40元，装置A排名高于装置B。",
+      "propositions": [
+        {
+          "proposition_text": "在2042年，金额为40元，装置A排名高于装置B。",
+          "subject": "装置A",
+          "predicate": "排名高于",
+          "polarity": "asserted",
+          "typed_value": {"kind": "comparison", "comparison_target": "装置B", "comparison_metric": "排名", "comparison_metric_status": "explicit", "numeric": {"operator": "exact", "value": 40, "currency": "CNY"}},
+          "material_qualifiers": [{"category": "time", "key": "年份", "value": "2042年", "source_span": "2042年"}]
+        }
+      ],
+      "must_preserve": ["date_time", "currency", "comparison"]
+    },
+    {
+      "case_id": "japanese_structural",
+      "language": "ja",
+      "claim_text": "2042年、金額は40円で、装置Aは装置Bより上位である。",
+      "propositions": [
+        {
+          "proposition_text": "2042年、金額は40円で、装置Aは装置Bより上位である。",
+          "subject": "装置A",
+          "predicate": "上位である",
+          "polarity": "asserted",
+          "typed_value": {"kind": "comparison", "comparison_target": "装置B", "comparison_metric": "順位", "comparison_metric_status": "explicit", "numeric": {"operator": "exact", "value": 40, "currency": "JPY"}},
+          "material_qualifiers": [{"category": "time", "key": "年", "value": "2042年", "source_span": "2042年"}]
+        }
+      ],
+      "must_preserve": ["date_time", "currency", "comparison"]
+    },
+    {
+      "case_id": "spanish_structural",
+      "language": "es",
+      "claim_text": "En 2042, el importe fue de 40 EUR y la unidad A quedó frente a la unidad B.",
+      "propositions": [
+        {
+          "proposition_text": "En 2042, el importe fue de 40 EUR y la unidad A quedó frente a la unidad B.",
+          "subject": "unidad A",
+          "predicate": "quedó frente a",
+          "polarity": "asserted",
+          "typed_value": {"kind": "comparison", "comparison_target": "unidad B", "comparison_metric": "posición", "comparison_metric_status": "explicit", "numeric": {"operator": "exact", "value": 40, "currency": "EUR"}},
+          "material_qualifiers": [{"category": "time", "key": "año", "value": "2042", "source_span": "2042"}]
+        }
+      ],
+      "must_preserve": ["date_time", "currency", "comparison"]
+    },
+    {
+      "case_id": "chinese",
+      "language": "zh",
+      "claim_text": "报告R称，在配置B条件下，采用方法K测得的比率可能达到8％，适用于全部用户而不适用于配置A，基于12个样本。",
+      "propositions": [
+        {
+          "proposition_text": "报告R称，在配置B条件下，采用方法K测得的比率可能达到8％，适用于全部用户而不适用于配置A，基于12个样本。",
+          "subject": "比率",
+          "predicate": "可能达到",
+          "polarity": "negated",
+          "modality": "可能",
+          "attribution": "报告R",
+          "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 8, "unit": "％"}},
+          "material_qualifiers": [
+            {"category": "configuration", "key": "配置", "value": "配置B", "source_span": "配置B"},
+            {"category": "measurement", "key": "样本数", "value": "12个样本", "source_span": "12个样本"},
+            {"category": "population", "key": "范围", "value": "全部用户", "source_span": "全部用户"},
+            {"category": "method", "key": "方法", "value": "方法K", "source_span": "方法K"},
+            {"category": "condition", "key": "条件", "value": "配置B条件下", "source_span": "配置B条件下"},
+            {"category": "scope", "key": "范围", "value": "全部用户", "source_span": "全部用户"}
+          ]
+        }
+      ],
+      "must_preserve": ["attribution", "condition", "configuration", "measurement", "modality", "negation", "population", "sample_count", "scope", "unit"]
+    },
+    {
+      "case_id": "japanese",
+      "language": "ja",
+      "claim_text": "報告Rによると、設定Bの場合、方法Kで測定した率は8％となる可能性があり、全利用者を対象とする。",
+      "propositions": [
+        {
+          "proposition_text": "報告Rによると、設定Bの場合、方法Kで測定した率は8％となる可能性があり、全利用者を対象とする。",
+          "subject": "率",
+          "predicate": "となる",
+          "polarity": "asserted",
+          "modality": "可能性",
+          "attribution": "報告R",
+          "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 8, "unit": "%"}},
+          "material_qualifiers": [
+            {"category": "configuration", "key": "設定", "value": "設定B", "source_span": "設定B"},
+            {"category": "population", "key": "対象", "value": "全利用者", "source_span": "全利用者"},
+            {"category": "method", "key": "方法", "value": "方法K", "source_span": "方法K"},
+            {"category": "condition", "key": "場合", "value": "設定Bの場合", "source_span": "設定Bの場合"},
+            {"category": "measurement", "key": "測定率", "value": "測定した率", "source_span": "測定した率"},
+            {"category": "scope", "key": "対象範囲", "value": "全利用者", "source_span": "全利用者"}
+          ]
+        }
+      ],
+      "must_preserve": ["attribution", "condition", "configuration", "measurement", "modality", "population", "scope", "unit"]
+    },
+    {
+      "case_id": "spanish",
+      "language": "es",
+      "claim_text": "Según el informe R, bajo configuración B, la tasa medida podría alcanzar 8 % para todos los hogares mediante el método K.",
+      "propositions": [
+        {
+          "proposition_text": "Según el informe R, bajo configuración B, la tasa medida podría alcanzar 8 % para todos los hogares mediante el método K.",
+          "subject": "tasa",
+          "predicate": "podría alcanzar",
+          "polarity": "asserted",
+          "modality": "podría",
+          "attribution": "informe R",
+          "typed_value": {"kind": "quantity", "numeric": {"operator": "exact", "value": 8, "unit": "%"}},
+          "material_qualifiers": [
+            {"category": "configuration", "key": "configuración", "value": "configuración B", "source_span": "configuración B"},
+            {"category": "population", "key": "población", "value": "todos los hogares", "source_span": "todos los hogares"},
+            {"category": "method", "key": "método", "value": "método K", "source_span": "método K"},
+            {"category": "condition", "key": "condición", "value": "bajo configuración B", "source_span": "bajo configuración B"},
+            {"category": "measurement", "key": "medición", "value": "tasa medida", "source_span": "tasa medida"},
+            {"category": "scope", "key": "alcance", "value": "todos los hogares", "source_span": "todos los hogares"}
+          ]
+        }
+      ],
+      "must_preserve": ["attribution", "condition", "configuration", "measurement", "modality", "population", "scope", "unit"]
+    }
+  ],
+  "hard_negatives": [
+    {"text": "A notebook contains reference identifier REF-48321.", "not_detected": ["negation", "date_time", "unit", "currency"]},
+    {"text": "The methodology describes a stable interface.", "not_detected": ["method", "modality", "negation", "currency"]},
+    {"text": "The organization has a notable internal catalog.", "not_detected": ["negation", "comparison", "condition", "unit"]}
+  ]
+}

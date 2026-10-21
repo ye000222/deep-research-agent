@@ -77,3 +77,11 @@ Thumbs.db
 DeepResearch_Agent_V1_功能审查结果.txt
 DeepResearch_Agent_V1_开发计划.txt
 新内容.txt
+
+# Temporary test and diagnostic outputs
+.pytest-tmp-*/
+tmp_canonical_*/
+tmp_schema_meta_*/
+pytest_all.txt
+pytest_disp.txt
+pytest_p33.txt

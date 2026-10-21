@@ -17,13 +17,17 @@ import httpx
 import trafilatura
 from pypdf import PdfReader
 
+from app.domain.document_evidence_context import (
+    DocumentSourceSegment,
+    SourceLocator,
+    SourceLocatorType,
+)
 from app.domain.research_tools import ReadPage
 from app.tools.errors import ToolExecutionError
 
 _MAX_DOWNLOAD_BYTES = 2_000_000
 _MAX_PDF_DOWNLOAD_BYTES = 12_000_000
 _MAX_PDF_PAGES = 80
-_MAX_CLEAN_CHARS = 30_000
 _MAX_REDIRECTS = 3
 _HTML_PARSE_TIMEOUT_SECONDS = 20.0
 
@@ -181,9 +185,7 @@ class PublicWebReader:
                         )
                     body = await _bounded_body(
                         response,
-                        max_bytes=(
-                            _MAX_PDF_DOWNLOAD_BYTES if is_pdf else _MAX_DOWNLOAD_BYTES
-                        ),
+                        max_bytes=(_MAX_PDF_DOWNLOAD_BYTES if is_pdf else _MAX_DOWNLOAD_BYTES),
                     )
                     encoding = response.encoding or "utf-8"
                     events.append(
@@ -241,6 +243,10 @@ class PublicWebReader:
 
             html = ""
             extracted: str | None
+            body_extracted = ""
+            citation_abstract = ""
+            source_segments: tuple[DocumentSourceSegment, ...] = ()
+            truncation_reason: str | None = None
             events.append(
                 self._event(
                     "source.parse_started",
@@ -252,7 +258,11 @@ class PublicWebReader:
             )
             try:
                 if is_pdf:
-                    extracted = await asyncio.to_thread(_extract_pdf_text, body)
+                    extracted, source_segments, pdf_page_limit_hit = await asyncio.to_thread(
+                        _extract_pdf_document, body
+                    )
+                    if pdf_page_limit_hit:
+                        truncation_reason = "PDF_PAGE_LIMIT"
                 else:
                     html = body.decode(encoding, errors="replace")
                     metadata_parser = _MetadataParser()
@@ -281,7 +291,9 @@ class PublicWebReader:
                         raise ToolExecutionError(
                             "WEBPAGE_EXTRACTION_TIMEOUT", retryable=False
                         ) from exc
-                    extracted = _merge_extracted_text(extracted, metadata_parser.metadata_text)
+                    body_extracted = extracted.strip() if extracted else ""
+                    citation_abstract = metadata_parser.citation_abstract_text
+                    extracted = _merge_extracted_text(body_extracted, metadata_parser.metadata_text)
             except ToolExecutionError:
                 raise
             except Exception:
@@ -298,7 +310,15 @@ class PublicWebReader:
                 raise
 
             clean_extracted = extracted.strip() if extracted else ""
-            if not clean_extracted and not is_pdf and _looks_like_dynamic_page(html):
+            if is_pdf:
+                substantive_text = clean_extracted
+            else:
+                substantive_candidates = (body_extracted, citation_abstract)
+                substantive_text = next(
+                    (candidate for candidate in substantive_candidates if len(candidate) >= 100),
+                    max(substantive_candidates, key=len),
+                )
+            if not substantive_text and not is_pdf and _looks_like_dynamic_page(html):
                 events.append(
                     self._event(
                         "source.parse_failed",
@@ -327,6 +347,10 @@ class PublicWebReader:
                     metrics={
                         "extracted": bool(clean_extracted),
                         "clean_chars": len(clean_extracted),
+                        "substantive_chars": len(substantive_text),
+                        "auxiliary_metadata_chars": max(
+                            0, len(clean_extracted) - len(substantive_text)
+                        ),
                     },
                 )
             )
@@ -342,7 +366,7 @@ class PublicWebReader:
                 )
                 self._finish_events(requested_url, events)
                 raise ToolExecutionError("WEBPAGE_EXTRACTION_EMPTY", retryable=False)
-            if len(clean_extracted) < 100:
+            if len(substantive_text) < 100:
                 events.append(
                     self._event(
                         "source.content_quality_rejected",
@@ -350,7 +374,10 @@ class PublicWebReader:
                         current_url=current,
                         stage="content",
                         reason="body_too_short",
-                        metrics={"clean_chars": len(clean_extracted)},
+                        metrics={
+                            "clean_chars": len(clean_extracted),
+                            "substantive_chars": len(substantive_text),
+                        },
                     )
                 )
                 self._finish_events(requested_url, events)
@@ -361,12 +388,16 @@ class PublicWebReader:
                     requested_url=requested_url,
                     current_url=current,
                     stage="content",
-                    metrics={"clean_chars": len(clean_extracted)},
+                    metrics={
+                        "clean_chars": len(clean_extracted),
+                        "substantive_chars": len(substantive_text),
+                    },
                 )
             )
-            clean = extracted.strip()
-            truncated = len(clean) > _MAX_CLEAN_CHARS
-            clean = clean[:_MAX_CLEAN_CHARS]
+            clean = clean_extracted
+            if not is_pdf:
+                source_segments = _html_text_segments(clean)
+            truncated = truncation_reason is not None
             title_parser = _MetadataParser()
             if html:
                 title_parser.feed(html[:200_000])
@@ -382,7 +413,13 @@ class PublicWebReader:
                     requested_url=requested_url,
                     current_url=current,
                     stage="reader",
-                    metrics={"clean_chars": len(clean), "truncated": truncated},
+                    metrics={
+                        "clean_chars": len(clean),
+                        "available_chars": len(clean_extracted),
+                        "truncated": truncated,
+                        "truncation_reason": truncation_reason,
+                        "document_type": "PDF" if is_pdf else "HTML",
+                    },
                 )
             )
             self._finish_events(requested_url, events)
@@ -394,6 +431,10 @@ class PublicWebReader:
                 fetched_at=datetime.now(UTC),
                 published_at=_extract_published_at(html),
                 truncated=truncated,
+                available_char_count=len(clean_extracted),
+                truncation_reason=truncation_reason,
+                document_type="PDF" if is_pdf else "HTML",
+                source_segments=source_segments,
             )
         self._finish_events(requested_url, events)
         raise ToolExecutionError("WEBPAGE_REDIRECT_REJECTED", retryable=False)
@@ -466,15 +507,85 @@ def _extract_published_at(html: str) -> datetime | None:
     return None
 
 
-def _extract_pdf_text(body: bytes) -> str:
+def _extract_pdf_document(
+    body: bytes,
+) -> tuple[str, tuple[DocumentSourceSegment, ...], bool]:
     try:
         reader = PdfReader(io.BytesIO(body), strict=False)
         if reader.is_encrypted and not reader.decrypt(""):
-            return ""
-        parts = [page.extract_text() or "" for page in reader.pages[:_MAX_PDF_PAGES]]
+            return "", (), False
+        page_count = len(reader.pages)
+        parts: list[tuple[int, str]] = []
+        for page_index, page in enumerate(reader.pages[:_MAX_PDF_PAGES], start=1):
+            page_text = (page.extract_text() or "").strip()
+            if page_text:
+                parts.append((page_index, page_text))
     except Exception:
-        return ""
-    return "\n\n".join(part.strip() for part in parts if part.strip())
+        return "", (), False
+    text_parts: list[str] = []
+    segments: list[DocumentSourceSegment] = []
+    offset = 0
+    for page_number, page_text in parts:
+        if text_parts:
+            text_parts.append("\n\n")
+            offset += 2
+        start = offset
+        text_parts.append(page_text)
+        offset += len(page_text)
+        segments.append(
+            DocumentSourceSegment(
+                canonical_start=start,
+                canonical_end=offset,
+                ordinal=len(segments),
+                locator=SourceLocator(
+                    locator_type=SourceLocatorType.PDF_PAGE,
+                    page_start=page_number,
+                    page_end=page_number,
+                ),
+            )
+        )
+    return "".join(text_parts), tuple(segments), page_count > _MAX_PDF_PAGES
+
+
+def _extract_pdf_text(body: bytes) -> str:
+    """Compatibility wrapper retained for existing callers and fixtures."""
+    return _extract_pdf_document(body)[0]
+
+
+def _html_text_segments(text: str) -> tuple[DocumentSourceSegment, ...]:
+    """Retain only actual paragraph/block boundaries in canonical HTML text."""
+    segments: list[DocumentSourceSegment] = []
+    start = 0
+    for match in re.finditer(r"\n\s*\n", text):
+        end = match.start()
+        if end > start:
+            segments.append(
+                DocumentSourceSegment(
+                    canonical_start=start,
+                    canonical_end=end,
+                    ordinal=len(segments),
+                    segment_type="TEXT_BLOCK",
+                    locator=SourceLocator(
+                        locator_type=SourceLocatorType.DOCUMENT_BLOCK,
+                        block_ordinal=len(segments),
+                    ),
+                )
+            )
+        start = match.end()
+    if start < len(text):
+        segments.append(
+            DocumentSourceSegment(
+                canonical_start=start,
+                canonical_end=len(text),
+                ordinal=len(segments),
+                segment_type="TEXT_BLOCK",
+                locator=SourceLocator(
+                    locator_type=SourceLocatorType.DOCUMENT_BLOCK,
+                    block_ordinal=len(segments),
+                ),
+            )
+        )
+    return tuple(segments)
 
 
 def _extract_html_text(html: str) -> str | None:
@@ -604,6 +715,17 @@ class _MetadataParser(HTMLParser):
                 seen.add(identity)
         return "\n\n".join(values)
 
+    @property
+    def citation_abstract_text(self) -> str:
+        values: list[str] = []
+        seen: set[str] = set()
+        for key, value in self._metadata:
+            identity = value.casefold()
+            if key == "citation_abstract" and identity not in seen:
+                values.append(value)
+                seen.add(identity)
+        return "\n\n".join(values)
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() == "title":
             self._inside_title = True
@@ -612,10 +734,7 @@ class _MetadataParser(HTMLParser):
             return
         values = {key.casefold(): value for key, value in attrs if value is not None}
         key = (
-            values.get("name")
-            or values.get("property")
-            or values.get("itemprop")
-            or ""
+            values.get("name") or values.get("property") or values.get("itemprop") or ""
         ).casefold()
         content = _clean_metadata_value(values.get("content") or "")
         if key in _CONTENT_META_KEYS and content:

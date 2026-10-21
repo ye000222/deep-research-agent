@@ -6,8 +6,9 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql import Select
 
 from app.domain.identifiers import uuid7
 from app.domain.planning import (
@@ -29,10 +30,14 @@ from app.domain.research_runs import (
     TERMINAL_RUN_STATUSES,
     AgentEventView,
     ResearchRunView,
+    RunKind,
     RunPhase,
     RunStatus,
 )
+from app.domain.run_state import EvidenceUniverse, EvidenceUniverseEntry, ResearchRunState
+from app.infrastructure.db.evidence_graph_models import ResearchSourceSnapshotRow
 from app.infrastructure.db.models import CredentialVersionRow, ProviderProfileRow
+from app.infrastructure.db.research_models import ResearchEvidenceRow, ResearchSourceRow
 from app.infrastructure.db.run_models import (
     AgentEventRow,
     ResearchPlanItemRow,
@@ -216,9 +221,149 @@ class InvalidRunTransitionError(ValueError):
     pass
 
 
+class RunStatePointerConflictError(RuntimeError):
+    """Raised when a stale or out-of-order state tries to advance the pointer."""
+
+
 class ResearchRunRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+
+    @staticmethod
+    def _active_credential_binding_query(
+        owner_hash: str, credential_version_id: UUID
+    ) -> Select[tuple[ProviderProfileRow, CredentialVersionRow]]:
+        """Resolve only an active credential version owned by this client."""
+        return (
+            select(ProviderProfileRow, CredentialVersionRow)
+            .join(
+                CredentialVersionRow,
+                CredentialVersionRow.profile_id == ProviderProfileRow.id,
+            )
+            .where(
+                ProviderProfileRow.owner_hash == owner_hash,
+                ProviderProfileRow.status == "active",
+                ProviderProfileRow.deleted_at.is_(None),
+                CredentialVersionRow.id == credential_version_id,
+                CredentialVersionRow.revoked_at.is_(None),
+                CredentialVersionRow.deleted_at.is_(None),
+            )
+        )
+
+    async def load_evidence_universe(self, run_id: UUID) -> EvidenceUniverse:
+        """Read the exact persisted Evidence set and its source snapshot identities."""
+
+        async with self._sessions() as session:
+            exists = await session.scalar(
+                select(ResearchRunRow.id).where(ResearchRunRow.id == run_id)
+            )
+            if exists is None:
+                raise ResearchRunNotFoundError(str(run_id))
+            rows = (
+                await session.execute(
+                    select(
+                        ResearchEvidenceRow.id,
+                        ResearchEvidenceRow.claim_id,
+                        ResearchEvidenceRow.source_id,
+                        ResearchSourceRow.run_id,
+                        ResearchEvidenceRow.snapshot_id,
+                        ResearchEvidenceRow.accepted,
+                        ResearchSourceSnapshotRow.content_hash,
+                        ResearchSourceSnapshotRow.run_id,
+                        ResearchSourceSnapshotRow.source_id,
+                    )
+                    .outerjoin(
+                        ResearchSourceRow,
+                        ResearchSourceRow.id == ResearchEvidenceRow.source_id,
+                    )
+                    .outerjoin(
+                        ResearchSourceSnapshotRow,
+                        and_(
+                            ResearchSourceSnapshotRow.id == ResearchEvidenceRow.snapshot_id,
+                            ResearchSourceSnapshotRow.run_id == run_id,
+                            ResearchSourceSnapshotRow.source_id == ResearchEvidenceRow.source_id,
+                        ),
+                    )
+                    .where(ResearchEvidenceRow.run_id == run_id)
+                    .order_by(ResearchEvidenceRow.id)
+                )
+            ).all()
+        entries = tuple(
+            EvidenceUniverseEntry(
+                evidence_ref=evidence_id,
+                claim_ref=claim_id,
+                source_ref=source_id,
+                source_snapshot_ref=snapshot_id,
+                source_content_hash=content_hash,
+                accepted=bool(accepted),
+                semantic_eligible=bool(accepted),
+            )
+            for evidence_id, claim_id, source_id, source_run_id, snapshot_id, accepted,
+            content_hash, snapshot_run_id, snapshot_source_id in rows
+            if _validate_evidence_source_binding(source_run_id, run_id)
+            if _validate_evidence_snapshot_binding(
+                snapshot_id, snapshot_run_id, snapshot_source_id, source_id
+            )
+        )
+        return EvidenceUniverse.build(run_id, entries)
+
+    async def get_run_state_inputs(self, run_id: UUID) -> dict[str, object]:
+        """Return the persisted control projection needed for deterministic reduction."""
+
+        async with self._sessions() as session:
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id)
+            )
+            if run is None:
+                raise ResearchRunNotFoundError(str(run_id))
+            return {
+                "orchestrator_version": run.orchestrator_version,
+                "lease_owner": run.lease_owner,
+                "status": run.status,
+                "phase": run.phase,
+                "budget": dict(run.budget_snapshot),
+                "usage": dict(run.usage_snapshot),
+                "termination_reason": run.termination_reason,
+                "latest_run_state_ref": run.latest_run_state_ref,
+                "latest_run_state_hash": run.latest_run_state_hash,
+                "latest_run_state_version": run.latest_run_state_version,
+            }
+
+    async def advance_run_state_pointer(self, state: ResearchRunState) -> None:
+        """CAS the mutable latest pointer after its immutable artifact is durable."""
+
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow)
+                .where(ResearchRunRow.id == state.run_ref)
+                .with_for_update()
+            )
+            if run is None:
+                raise ResearchRunNotFoundError(str(state.run_ref))
+            if run.orchestrator_version != "V3":
+                raise RunStatePointerConflictError("legacy_run_cannot_receive_v3_pointer")
+            current_version = run.latest_run_state_version
+            if (
+                current_version == state.state_version
+                and run.latest_run_state_ref == state.state_ref
+                and run.latest_run_state_hash == state.state_hash
+            ):
+                return
+            if state.state_version != (1 if current_version is None else current_version + 1):
+                raise RunStatePointerConflictError("run_state_version_conflict")
+            if current_version is None:
+                if state.parent_state_ref is not None or state.parent_state_hash is not None:
+                    raise RunStatePointerConflictError("run_state_genesis_parent_mismatch")
+            elif (
+                state.expected_parent_version != current_version
+                or state.parent_state_ref != run.latest_run_state_ref
+                or state.parent_state_hash != run.latest_run_state_hash
+            ):
+                raise RunStatePointerConflictError("run_state_parent_conflict")
+            run.latest_run_state_ref = state.state_ref
+            run.latest_run_state_hash = state.state_hash
+            run.latest_run_state_version = state.state_version
+            await session.flush()
 
     async def create(
         self,
@@ -229,7 +374,10 @@ class ResearchRunRepository:
         normalized_goal: str,
         credential_version_id: UUID,
         budget_snapshot: dict[str, object],
+        orchestrator_version: str = "V2_LEGACY",
     ) -> tuple[ResearchRunView, bool]:
+        if orchestrator_version not in {"V2_LEGACY", "V3"}:
+            raise ValueError("unsupported_orchestrator_version")
         async with self._sessions() as session, session.begin():
             existing = await session.scalar(
                 select(ResearchRunRow).where(
@@ -243,18 +391,8 @@ class ResearchRunRepository:
             binding = (
                 (
                     await session.execute(
-                        select(ProviderProfileRow, CredentialVersionRow)
-                        .join(
-                            CredentialVersionRow,
-                            CredentialVersionRow.profile_id == ProviderProfileRow.id,
-                        )
-                        .where(
-                            ProviderProfileRow.owner_hash == owner_hash,
-                            ProviderProfileRow.status == "active",
-                            ProviderProfileRow.deleted_at.is_(None),
-                            CredentialVersionRow.id == credential_version_id,
-                            CredentialVersionRow.revoked_at.is_(None),
-                            CredentialVersionRow.deleted_at.is_(None),
+                        self._active_credential_binding_query(
+                            owner_hash, credential_version_id
                         )
                     )
                 )
@@ -293,6 +431,8 @@ class ResearchRunRepository:
                 original_query=original_query,
                 normalized_goal=normalized_goal,
                 status=RunStatus.QUEUED.value,
+                run_kind=RunKind.RESEARCH.value,
+                orchestrator_version=orchestrator_version,
                 phase=RunPhase.INITIALIZING.value,
                 credential_status="ready",
                 saved_profile_id=profile.id,
@@ -333,12 +473,225 @@ class ResearchRunRepository:
             await session.flush()
         return self._view(run), True
 
+    async def create_for_prospective_acquisition(
+        self,
+        execution_context: object,
+        *,
+        run_id: UUID,
+        worker_task_id: str,
+        idempotency_key: str,
+        task_text: str,
+        task_ordinal: int,
+        task_execution_id: str,
+        budget_snapshot: dict[str, object],
+    ) -> tuple[ResearchRunView, bool]:
+        """Create a leased acquisition run without creating a dispatch outbox row."""
+        from urllib.parse import urlsplit
+
+        from app.services.prospective_acquisition_execution_identity import (
+            ProspectiveAcquisitionExecutionContext,
+            validate_frozen_context,
+        )
+        from app.services.provider_fingerprint_contract import safe_provider_fingerprint
+
+        if not isinstance(execution_context, ProspectiveAcquisitionExecutionContext):
+            raise ValueError("authenticated_execution_context_required")
+        validate_frozen_context(execution_context)
+        binding = execution_context.provider_binding
+        if (
+            binding is None
+            or task_ordinal < 1
+            or not worker_task_id
+            or not task_text.strip()
+            or not idempotency_key
+            or len(idempotency_key) > 200
+        ):
+            raise ValueError("acquisition_run_identity_invalid")
+
+        async with self._sessions() as session, session.begin():
+            existing = await session.scalar(
+                select(ResearchRunRow).where(
+                    ResearchRunRow.owner_hash == execution_context.owner_hash,
+                    ResearchRunRow.idempotency_key == idempotency_key,
+                ).with_for_update()
+            )
+            if existing is not None:
+                identity = existing.constraints.get("prospective_acquisition", {})
+                if (
+                    existing.id != run_id
+                    or existing.run_kind != RunKind.PROSPECTIVE_ACQUISITION_TASK.value
+                    or identity.get("execution_context_id")
+                    != execution_context.execution_context_id
+                    or identity.get("task_execution_id") != task_execution_id
+                    or identity.get("task_ordinal") != task_ordinal
+                ):
+                    raise ValueError("acquisition_run_identity_conflict")
+                return self._view(existing), False
+
+            resolved = (
+                await session.execute(
+                    select(ProviderProfileRow, CredentialVersionRow)
+                    .join(
+                        CredentialVersionRow,
+                        CredentialVersionRow.profile_id == ProviderProfileRow.id,
+                    )
+                    .where(
+                        ProviderProfileRow.id == UUID(binding.profile_id),
+                        ProviderProfileRow.owner_hash == execution_context.owner_hash,
+                        ProviderProfileRow.status == "active",
+                        ProviderProfileRow.is_default.is_(True),
+                        ProviderProfileRow.deleted_at.is_(None),
+                        CredentialVersionRow.id == UUID(binding.credential_version_id),
+                        CredentialVersionRow.revoked_at.is_(None),
+                        CredentialVersionRow.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).tuples().first()
+            if resolved is None:
+                raise ValueError("EXECUTION_PROVIDER_BINDING_CHANGED")
+            profile, credential = resolved
+            safe_profile = {
+                "profile_id": str(profile.id),
+                "adapter": profile.adapter_type,
+                "model": profile.model,
+                "base_url": profile.normalized_base_url,
+                "auth_type": profile.auth_type,
+                "profile_version": profile.version,
+                "credential": {
+                    "id": str(credential.id),
+                    "version": credential.credential_version,
+                    "present": bool(credential.ciphertext),
+                },
+                "non_secret_settings": profile.non_secret_settings,
+            }
+            _, fingerprint = safe_provider_fingerprint(safe_profile)
+            endpoint = urlsplit(profile.normalized_base_url)
+            endpoint_family = f"{endpoint.scheme.lower()}://{(endpoint.hostname or '').lower()}"
+            if endpoint.port and endpoint.port not in {80, 443}:
+                endpoint_family += f":{endpoint.port}"
+            if (
+                str(profile.id).lower() != binding.profile_id.lower()
+                or profile.adapter_type != binding.adapter
+                or profile.model != binding.model
+                or profile.version != binding.profile_version
+                or credential.credential_version != binding.credential_version
+                or str(credential.id).lower() != binding.credential_version_id.lower()
+                or endpoint_family != binding.endpoint_family
+                or fingerprint != binding.provider_safe_config_fingerprint
+            ):
+                raise ValueError("EXECUTION_PROVIDER_BINDING_CHANGED")
+
+            now = datetime.now(UTC)
+            run = ResearchRunRow(
+                id=run_id,
+                owner_hash=execution_context.owner_hash,
+                idempotency_key=idempotency_key,
+                original_query=task_text,
+                normalized_goal=task_text,
+                constraints={"prospective_acquisition": {
+                    "execution_context_id": execution_context.execution_context_id,
+                    "population_id": execution_context.population_id,
+                    "batch_id": execution_context.batch_id,
+                    "task_execution_id": task_execution_id,
+                    "task_ordinal": task_ordinal,
+                    "provider_fingerprint": binding.provider_safe_config_fingerprint,
+                }},
+                run_kind=RunKind.PROSPECTIVE_ACQUISITION_TASK.value,
+                status=RunStatus.RUNNING.value,
+                phase=RunPhase.RESEARCHING.value,
+                credential_status="ready",
+                saved_profile_id=profile.id,
+                credential_version_id=credential.id,
+                llm_config_snapshot={
+                    "adapter_type": profile.adapter_type,
+                    "base_url": profile.normalized_base_url,
+                    "endpoint_host": profile.endpoint_host,
+                    "model": profile.model,
+                    "profile_version": profile.version,
+                    "credential_version": credential.credential_version,
+                    "context_window": profile.non_secret_settings.get("context_window"),
+                    "max_output_tokens": profile.non_secret_settings.get("max_output_tokens"),
+                },
+                budget_snapshot=budget_snapshot,
+                usage_snapshot={
+                    "resource_pools": build_resource_pool_snapshot(budget_snapshot, {})
+                },
+                lease_owner="prospective-acquisition",
+                lease_until=now + timedelta(seconds=EXECUTION_LEASE_SECONDS),
+                worker_task_id=worker_task_id,
+                started_at=now,
+            )
+            session.add(run)
+            await session.flush()
+            await self._append_event(
+                session,
+                run,
+                event_type="prospective_acquisition.task.started",
+                public_summary="Prospective acquisition task acquired its bounded execution lease.",
+                refs={"run_id": str(run_id), "task_execution_id": task_execution_id},
+                metrics=None,
+            )
+            await session.flush()
+        return self._view(run), True
+
+    async def finalize_prospective_acquisition_task(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        success: bool,
+        safe_failure_code: str | None = None,
+    ) -> bool:
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(ResearchRunRow).where(ResearchRunRow.id == run_id).with_for_update()
+            )
+            if (
+                run is None
+                or run.run_kind != RunKind.PROSPECTIVE_ACQUISITION_TASK.value
+                or run.status != RunStatus.RUNNING.value
+                or run.worker_task_id != worker_task_id
+            ):
+                return False
+            now = datetime.now(UTC)
+            run.status = (RunStatus.COMPLETED if success else RunStatus.FAILED).value
+            run.phase = RunPhase.TERMINAL.value
+            run.termination_reason = (
+                None if success else (safe_failure_code or "acquisition_failed")[:100]
+            )
+            run.lease_owner = None
+            run.lease_until = None
+            run.finished_at = now
+            run.updated_at = now
+            run.state_version += 1
+            await self._append_event(
+                session,
+                run,
+                event_type=(
+                    "prospective_acquisition.task.completed"
+                    if success
+                    else "prospective_acquisition.task.failed"
+                ),
+                public_summary=(
+                    "Prospective acquisition task completed."
+                    if success
+                    else "Prospective acquisition task failed; no Research report was generated."
+                ),
+                refs={"run_id": str(run_id), "failure_code": safe_failure_code},
+                metrics=None,
+            )
+            return True
+
     async def list_recent(self, owner_hash: str, *, limit: int) -> list[ResearchRunView]:
         async with self._sessions() as session:
             rows = (
                 await session.scalars(
                     select(ResearchRunRow)
-                    .where(ResearchRunRow.owner_hash == owner_hash)
+                    .where(
+                        ResearchRunRow.owner_hash == owner_hash,
+                        ResearchRunRow.run_kind == RunKind.RESEARCH.value,
+                    )
                     .order_by(ResearchRunRow.created_at.desc())
                     .limit(limit)
                 )
@@ -351,6 +704,7 @@ class ResearchRunRepository:
                 select(ResearchRunRow).where(
                     ResearchRunRow.id == run_id,
                     ResearchRunRow.owner_hash == owner_hash,
+                    ResearchRunRow.run_kind == RunKind.RESEARCH.value,
                 )
             )
             if run is None:
@@ -636,6 +990,8 @@ class ResearchRunRepository:
             )
             if run is None:
                 return False
+            if run.run_kind != RunKind.RESEARCH.value:
+                return False
             now = datetime.now(UTC)
             current_status = RunStatus(run.status)
             expired_takeover = (
@@ -674,7 +1030,9 @@ class ResearchRunRepository:
                 run.termination_reason = None
             run.started_at = run.started_at or now
             run.updated_at = now
-            run.lease_owner = "celery-worker"
+            # The existing lease_owner column is also the durable fencing
+            # token for WorkAttempt ownership across redelivery/takeover.
+            run.lease_owner = f"celery-worker:{uuid7()}"
             run.lease_until = now + timedelta(seconds=lease_seconds)
             run.worker_task_id = worker_task_id
             run.state_version += 1
@@ -743,6 +1101,7 @@ class ResearchRunRepository:
                     select(ResearchRunRow)
                     .where(
                         ResearchRunRow.status == RunStatus.RUNNING.value,
+                        ResearchRunRow.run_kind == RunKind.RESEARCH.value,
                         ResearchRunRow.lease_until.is_not(None),
                         ResearchRunRow.lease_until <= now,
                     )
@@ -1681,6 +2040,7 @@ class ResearchRunRepository:
             .where(
                 ResearchRunRow.id == run_id,
                 ResearchRunRow.owner_hash == owner_hash,
+                ResearchRunRow.run_kind == RunKind.RESEARCH.value,
             )
             .with_for_update()
         )
@@ -1757,3 +2117,24 @@ def _safe_int(value: object) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _validate_evidence_source_binding(source_run_id: UUID | None, run_id: UUID) -> bool:
+    if source_run_id != run_id:
+        raise ValueError("evidence_source_run_mismatch")
+    return True
+
+
+def _validate_evidence_snapshot_binding(
+    snapshot_id: UUID | None,
+    snapshot_run_id: UUID | None,
+    snapshot_source_id: UUID | None,
+    source_id: UUID,
+) -> bool:
+    if snapshot_id is None:
+        if snapshot_run_id is not None or snapshot_source_id is not None:
+            raise ValueError("unexpected_evidence_snapshot_identity")
+        return True
+    if snapshot_run_id is None or snapshot_source_id != source_id:
+        raise ValueError("evidence_source_snapshot_mismatch")
+    return True

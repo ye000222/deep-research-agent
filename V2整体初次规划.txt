@@ -1,0 +1,1274 @@
+V2 我不建议做成“继续往 V1 上堆功能”，而是应该有一个非常明确的能力升级：
+
+V1.1：能自主研究、搜集证据、闭环补缺并生成可追溯报告。
+V2：进一步做到“以 Claim 为核心进行多源验证、冲突识别和定向补证”。
+
+也就是说，V2 的核心不是“搜得更多”，而是：
+
+找到资料
+   ↓
+形成 Evidence
+   ↓
+识别 Claim
+   ↓
+判断哪些 Evidence 在支持同一个 Claim
+   ↓
+判断这些来源是否真正独立
+   ↓
+发现冲突 / 缺证
+   ↓
+针对这个 Claim 再研究
+   ↓
+最终给出“被什么证据支持、验证到什么程度”的报告
+
+这正好对应 V1.1 目前最明显的架构缺口。
+
+一、我打算 V2 重点做什么
+
+我建议把 V2 控制在 6 个核心能力，不要扩散。
+
+V2 核心能力	要解决的问题
+1. Semantic Claim Layer	不再只按字符串/维度看 Claim，而是理解“两个表述是不是同一个事实”
+2. Cross-source Corroboration	判断同一 Claim 是否被多个真正独立来源支持
+3. Per-claim Verification	verified_claims=0 不再作为架构遗留，而是真正实现逐 Claim 验证
+4. Contradiction Detection	不只是找支持证据，还能发现来源之间互相矛盾
+5. Evidence Formation Reliability	解决 Readable Source → Candidate Evidence 经常大量损失的问题
+6. Claim-driven Gap Closure	Research Loop 不再只是“这个维度还缺东西”，而是知道“哪个 Claim 缺什么证据”
+
+另外会做两项辅助能力：
+
+Source semantics 完善：继续区分 Source Role 和 Source Identity，明确什么叫 authoritative、primary、independent、same-owner。
+
+Research variance reduction：降低 Planner / Retrieval / Evidence formation 的随机波动，但不是通过加预算或多跑搜索硬堆。
+
+二、V2 最重要的架构变化
+
+现在 V1.1 大致可以理解为：
+
+Question
+   ↓
+Planner
+   ↓
+Search
+   ↓
+Reader
+   ↓
+Evidence
+   ↓
+Evaluation
+   ↓
+Gap
+   ↓
+Recovery
+   ↓
+Report
+
+V2 我希望变成：
+
+Question
+   ↓
+Research Plan
+   ↓
+Search / Reader
+   ↓
+Evidence Candidate
+   ↓
+Claim Extraction
+   ↓
+Claim Canonicalization
+   ↓
+┌──────────────────────────────┐
+│ Claim ↔ Evidence Graph       │
+│ Claim ↔ Source Identity      │
+│ Claim ↔ Claim Relationship   │
+└──────────────────────────────┘
+   ↓
+Corroboration / Contradiction
+   ↓
+Claim Verification State
+   ↓
+Claim-level Gap Requirement
+   ↓
+Targeted Research Need
+   ↓
+Query / Search / Evidence
+   ↓
+重新验证
+   ↓
+Report
+
+这会是 V1 → V2 最大的质变。
+
+三、一个具体例子
+
+例如研究：
+
+GPT-X 的上下文长度是多少？
+
+搜索得到：
+
+Source A：
+官方文档说 1M tokens
+
+Source B：
+新闻报道说支持 1 million tokens
+
+Source C：
+博客说 128K
+
+Source D：
+另一个网站复制了 Source B
+
+V1 更接近：
+
+有若干 Evidence
+有多个 Source
+Coverage 看起来不错
+
+V2 则应该形成：
+
+Canonical Claim C1：
+
+GPT-X context window = 1,000,000 tokens
+
+然后：
+
+Evidence A
+owner = official vendor
+role = primary
+supports C1
+
+Evidence B
+owner = Reuters
+role = secondary
+supports C1
+
+Evidence D
+owner = 某转载网站
+实际来源 = Reuters
+不算新的 independent validation
+
+同时：
+
+Claim C2：
+
+GPT-X context window = 128,000 tokens
+
+Evidence C supports C2
+
+于是系统发现：
+
+C1 ↔ C2 = CONTRADICTION
+
+Research Loop 就知道下一步不是泛泛地：
+
+“再搜一点 GPT-X。”
+
+而是：
+
+找一个新的、独立、权威来源，验证到底是 1M 还是 128K，并考虑版本/日期差异。
+
+这就是我认为 V2 真正应该达到的研究智能。
+
+四、V2 不准备做什么
+
+这部分很重要，否则又容易进入无限开发。
+
+V2 默认不做：
+
+不停增加 Search Provider
+单纯提高 Search Budget
+单纯增加 Token Budget
+降低 Evidence Acceptance threshold
+为了 Coverage 强行放宽标准
+benchmark-specific 逻辑
+question-specific 逻辑
+多 Agent 大规模重构
+重新设计整个 UI
+大型 Memory 系统
+复杂知识图谱平台
+
+尤其不会走：
+
+效果不好
+→ 再搜 20 次
+→ 加 Provider
+→ 加 Token
+→ Coverage 上升
+
+这种路线。
+
+V2 要提高的是：
+
+Research Intelligence / Evidence Reasoning Efficiency
+
+而不是 brute force。
+
+五、V2 详细阶段规划
+
+我建议整个 V2 只保留 5 个开发阶段 + 1 个 Release 阶段。
+
+不要再无限拆成几十个 Phase。
+
+V2.0 — Claim Architecture & Baseline
+
+这个阶段不优化 Research。
+
+先把 Claim 语义模型定义清楚。
+
+核心工作
+
+建立 Canonical Claim，例如：
+
+CanonicalClaim(
+    claim_id,
+    normalized_text,
+
+    subject,
+    predicate,
+    object_or_value,
+
+    qualifiers={
+        "time": ...,
+        "location": ...,
+        "unit": ...,
+        "version": ...
+    },
+
+    claim_type,
+)
+
+不要求所有 Claim 都必须完美解析成 SPO。
+
+结构化字段允许为空。
+
+因为很多 Research Claim 是：
+
+“A 方法通常比 B 方法在小样本任务中表现更稳定。”
+
+这种东西很难简单表示成 Subject-Predicate-Object。
+
+所以：
+
+normalized proposition
+
+才是 canonical identity 的核心。
+
+Claim relationship
+
+定义：
+
+SAME
+RELATED
+SUPPORTS
+CONTRADICTS
+UNKNOWN
+
+但第一版不要一次做太复杂。
+
+最核心的是：
+
+SAME / NOT_SAME
+CONTRADICTS
+UNKNOWN
+数据结构
+
+预计会引入类似：
+
+canonical_claims
+claim_evidence_links
+claim_relationships
+claim_verification_results
+
+但是否真的增加四张表，要以现有 schema 为准。
+
+不要为了架构漂亮过度 schema 化。
+
+V2.0 的 Metrics
+
+V1 的：
+
+coverage-v1
+
+继续保留。
+
+不要直接改定义。
+
+V2 新增单独指标：
+
+claim_matching
+claim_support
+claim_corroboration
+claim_verification
+contradiction
+
+例如：
+
+supported_claim_rate
+
+independently_corroborated_claim_rate
+
+verified_claim_rate
+
+contradicted_claim_rate
+
+unresolved_claim_rate
+
+这样不会破坏 V1 历史 benchmark 可比性。
+
+V2.0 Stop Gate
+
+必须先证明：
+
+同义表述
+→ 能归到同一个 Claim
+
+不同事实
+→ 不会轻易误合并
+
+时间/版本不同
+→ 不会错误认为完全相同
+
+才能继续。
+
+六、V2.1 — Semantic Claim Equivalence
+
+这是第一项真正的新 Research Intelligence。
+
+V1 当前一个重要问题是：
+
+Claim A：
+The company was founded in 2018.
+
+Claim B：
+The company started operations in 2018.
+
+Claim C：
+The organization was established in 2018.
+
+程序层面可能被当作不同 Claim。
+
+V2 要能够判断：
+
+A ≈ C
+
+而：
+
+B
+
+可能只是 related，而不一定完全等价。
+
+需要考虑的维度
+
+不能只 embedding cosine similarity。
+
+必须考虑：
+
+Entity
+Predicate
+Value
+Unit
+Time
+Version
+Scope
+Polarity
+
+例如：
+
+Revenue = $20B in 2025
+
+和：
+
+Revenue = $20B in 2024
+
+文本很像，但绝对不能合并。
+
+推荐架构
+
+先做：
+
+cheap deterministic normalization
+        ↓
+candidate semantic matches
+        ↓
+semantic classifier
+        ↓
+SAME / RELATED / CONFLICT / UNKNOWN
+
+避免每两个 Claim 都调用 LLM。
+
+七、V2.2 — Independent Corroboration & Verification
+
+这应该是 V2 的核心能力。
+
+V1 已经解决了一部分：
+
+Source Role ≠ Source Identity
+
+也有：
+
+source_owner_key
+
+所以 V2 不要推翻它。
+
+而是在它上面建立：
+
+Claim
+   ↓
+Evidence A → Owner A
+Evidence B → Owner B
+Evidence C → Owner B
+Evidence D → Owner C
+
+然后：
+
+Independent owners = 3
+
+而不是：
+
+Evidence count = 4
+Claim Verification State
+
+建议正式引入：
+
+UNSUPPORTED
+
+SUPPORTED
+
+CORROBORATED
+
+VERIFIED
+
+CONFLICTED
+
+INSUFFICIENT
+
+UNKNOWN
+
+具体不要一上来设计成十几个状态。
+
+可能最后压缩成：
+
+UNSUPPORTED
+SUPPORTED
+VERIFIED
+CONFLICTED
+
+再用 metadata 表达原因。
+
+八、V2.2 要真正解决 verified_claims = 0
+
+这次不能再像 V1：
+
+dimension-level verification 能 closure，但 claim-level verified 仍然全部是 0。
+
+V2 应该明确：
+
+Claim C1
+   ↓
+Evidence 1 — owner A
+Evidence 2 — owner B
+   ↓
+semantic support confirmed
+   ↓
+owners independent
+   ↓
+ClaimVerification = VERIFIED
+
+而不是：
+
+这个 dimension 有两个来源
+→ 算满足
+
+两者应该彻底分开：
+
+Dimension closure
+
+≠
+
+Claim verification
+九、V2.2 — Contradiction Detection
+
+这是 corroboration 的另一面。
+
+比如：
+
+Source A：
+Population = 124M
+
+Source B：
+Population = 126M
+
+系统不应该简单：
+
+2 个 independent sources
+→ verified
+
+而应该判断：
+
+是否同一年？
+是否同定义？
+是否 estimate？
+是否不同统计口径？
+
+如果条件相同：
+
+CONFLICT
+
+如果时间不同：
+
+RELATED / VERSIONED
+
+所以 contradiction 必须建立在 Claim semantics 上。
+
+不能只是数字不一样就冲突。
+
+十、V2.3 — Evidence Formation Reliability
+
+这是我认为第二重要的 V2 工作。
+
+因为 V1.1 已经出现：
+
+31 readable sources
+↓
+15 extraction calls
+↓
+0 Candidate Evidence
+
+这不能继续只是：
+
+candidate_count = 0
+
+V2 应该知道为什么是 0。
+
+新增 no-candidate diagnostics
+
+比如：
+
+SOURCE_IRRELEVANT
+
+CLAIM_NOT_PRESENT
+
+INSUFFICIENT_CONTEXT
+
+SOURCE_TOO_SHORT
+
+QUOTE_NOT_FOUND
+
+CLAIM_TOO_VAGUE
+
+VALUE_NOT_SUPPORTED
+
+TEMPORAL_MISMATCH
+
+ENTITY_MISMATCH
+
+MODEL_NO_EXTRACTION
+
+MODEL_OUTPUT_INVALID
+
+UNKNOWN
+
+不要一次搞几十个。
+
+最后应该控制在约 8–12 个稳定类别。
+
+十一、Evidence Formation 的正确优化路线
+
+不是：
+
+降低 acceptance threshold
+
+也不是：
+
+让 extractor 多生成一点
+
+而是先知道损失在哪里：
+
+Search
+→ URL
+→ Reader
+→ Useful Content
+→ Candidate Evidence
+→ Accepted Evidence
+
+然后分别计算：
+
+Readable → Candidate conversion
+
+Candidate → Accepted conversion
+
+Accepted → Claim support
+
+Claim support → Verified
+
+以后我们就不会只看到：
+
+Coverage = 0.42
+
+然后猜问题在哪里。
+
+十二、V2.4 — Claim-driven Gap Closure
+
+等 Claim Verification 真正建立起来，再改 Research Loop。
+
+这时候 Gap 不再只是：
+
+dimension_coverage
+independent_source
+claim_verification
+evidence_quality
+
+而可以表达：
+
+Claim C1:
+
+status = SUPPORTED
+
+missing:
+1 additional independent source
+
+preferred source:
+primary / authoritative
+
+excluded owners:
+example.com
+reuters.com
+
+ResearchNeed 就能变成：
+
+Find an independent primary source
+that verifies Claim C1,
+excluding already-used source owners.
+
+而不是：
+
+Research more about this dimension.
+十三、Research Loop 最终会变成
+Claim C1
+   │
+   ├── support = YES
+   ├── independent owners = 1
+   └── verification = INSUFFICIENT
+            ↓
+    GapRequirement
+            ↓
+    ResearchNeed
+            ↓
+    QueryIntent
+            ↓
+    Search
+            ↓
+    New Evidence
+            ↓
+    Claim matching
+            ↓
+    Owner identity
+            ↓
+    Verification
+
+这样之前 Phase 8–14 做的架构不会浪费。
+
+反而会被真正串起来。
+
+十四、V2.5 — Planner / Retrieval Variance Reduction
+
+这个阶段我建议设置一个非常重要的条件：
+
+不是默认必须做。
+
+先看 V2.3 / V2.4 后数据。
+
+如果 Evidence formation 和 Claim-driven search 已经显著改善，就不需要大改 Planner。
+
+只有仍然存在：
+
+Run 1
+→ 好计划
+
+Run 2
+→ 完全不同的问题
+
+Run 3
+→ 搜索方向严重偏移
+
+才进入 Planner robustness。
+
+可以研究
+Plan canonicalization
+
+Question deduplication
+
+Requirement-aware planning
+
+Query diversification
+
+Coverage-aware planning
+
+owner-aware targeting
+
+uncertainty-aware query generation
+不做
+固定 Planner 输出
+hardcode questions
+benchmark-specific templates
+
+目标是：
+
+降低无意义方差，而不是消灭合理探索。
+
+十五、V2 Report 也要升级
+
+V1 Report 更多是：
+
+结论
++ citations
++ verification
+
+V2 可以进一步做到：
+
+Claim
+├── status
+├── supporting sources
+├── independent source count
+├── conflicting evidence
+└── confidence / limitation
+
+例如最终用户可能看到：
+
+日本 2024 年人口约为 X。
+Verification: independently corroborated
+Sources: World Bank + Statistics Bureau of Japan
+
+而另一个结论：
+
+某模型训练成本约为 $Y。
+Verification: single-source support only
+Limitation: no independent confirmation found
+
+这会显著提升 Research Agent 的可信度。
+
+十六、V2 的测试策略已经和以前不同了
+
+你刚刚做完 L1/L2/L3，是非常关键的。
+
+以后：
+
+平时开发
+L1
++
+L2
+
+分钟级反馈。
+
+修改 Research Intelligence
+L1
++
+L2
++
+有限 L3
+每个 V2 Milestone
+
+不要直接 n=3 全套。
+
+先：
+
+Stage 1
+
+4 个不同任务族
+×
+1 Run
+
+看机制是否有方向性收益。
+
+只有结果值得继续：
+
+Stage 2
+
+关键任务
+×
+3 Runs
+
+这样不会再动不动烧掉几个小时。
+
+十七、V2 评价指标
+
+我建议 V2 不再把 Coverage 作为第一指标。
+
+优先级应该变成：
+
+1. Claim Support Correctness
+
+2. Independent Corroboration
+
+3. Claim Verification
+
+4. Contradiction Handling
+
+5. Evidence Conversion
+
+6. Coverage
+
+7. Cost / Runtime
+
+尤其关注：
+
+Readable → Candidate
+
+Candidate → Accepted
+
+Accepted → Supported Claim
+
+Supported → Independently Corroborated
+
+Corroborated → Verified
+
+这就是完整 Research Funnel。
+
+十八、V2 的 Stop Gates
+
+这是防止项目再次无限扩张最重要的一点。
+
+每一个阶段只有三种结果：
+
+SHIP
+
+ITERATE ONCE
+
+STOP / DEFER
+
+不允许：
+
+效果一般
+→ 15.1
+→ 15.2
+→ 15.3
+→ 15.4
+→ 无限优化
+
+例如 V2.3 Evidence Formation：
+
+如果：
+
+诊断完整
++
+转换明显改善
++
+质量没有下降
+
+→ SHIP
+
+如果：
+
+机制有效但收益不稳定
+
+→ 最多 ITERATE ONCE
+
+如果：
+
+负收益
+
+→ feature flag OFF，DEFER
+
+继续下一个 V2 核心能力。
+
+十九、V2 最终路线图
+
+我建议正式定成：
+
+阶段	目标
+V2.0	Claim Architecture + Baseline
+V2.1	Semantic Claim Equivalence
+V2.2	Independent Corroboration + Per-claim Verification + Contradiction
+V2.3	Evidence Formation Reliability
+V2.4	Claim-driven Gap Closure
+V2.5	Planner/Retrieval Variance Reduction，仅数据证明需要时进行
+V2 RC	Report upgrade + cross-family qualification + release hardening
+
+其中我认为真正不可删的是：
+
+V2.0
+V2.1
+V2.2
+V2.3
+V2.4
+
+而：
+
+V2.5
+
+是条件阶段。
+
+二十、什么时候认为 V2 完成
+
+不是要求“所有问题都解决”。
+
+V2 达到下面这些条件就应该收口：
+
+Semantic Claim matching 可用
+        ✅
+
+真正的 per-claim verification
+        ✅
+
+不同 owner 的独立证据能够正确 corroborate
+        ✅
+
+same-owner duplicate 不会被算成独立验证
+        ✅
+
+明显冲突能够识别
+        ✅
+
+Evidence 0-candidate 有可解释原因
+        ✅
+
+Claim 缺什么证据可以驱动新的 Research
+        ✅
+
+Report 能表达验证状态和限制
+        ✅
+
+多任务族没有严重 general regression
+        ✅
+
+L1/L2 稳定
+        ✅
+
+不是：
+
+verified_claim_rate = 100%
+Coverage = 100%
+run variance = 0
+
+那样永远发布不了。
+
+我对 V2 的最终定位
+
+如果 V1.1 是：
+
+Evidence-grounded autonomous research agent
+
+那么 V2 我建议定位成：
+
+Claim-verifying autonomous research agent
+
+最大的升级不是：
+
+“它会搜更多资料。”
+
+而是：
+
+“它开始真正理解自己正在验证哪个事实、哪些来源是在支持同一个事实、这些来源是不是独立、哪里存在冲突，以及下一步到底需要补什么证据。”
+
+这个方向和你前面 Phase 8～17 已经铺好的 GapRequirement → ResearchNeed → QueryPlan → Evidence → Closure 架构是连续的，不需要推翻 V1 重做。
+
+下一步我建议直接从 V2.0 — Claim Architecture & Baseline 开始，而且 V2.0 先以架构与诊断为主，不允许优化 Research 行为。这样先把 V2 的 Claim 语义基础打牢，再进入 V2.1。
+
+那么研究耗时和token的优化减少是V2后再主要做吗
+
+对，但要区分两件事：
+
+V2 期间要持续“监控和约束”耗时/token；真正把“降低耗时和 token”作为主要优化目标，建议放在 V2 核心研究能力稳定之后。
+
+原因是你现在如果过早把“更快、更省 token”放在第一优先级，很容易把 Research Intelligence 一起削弱。
+
+V2 期间：先做“成本可观测 + 不允许失控”
+
+V2 每个阶段都应该顺便记录：
+
+总 runtime
+总 token
+LLM calls
+Search 次数
+Reader 次数
+Evidence extraction 次数
+Recovery 次数
+每个 Claim 的研究成本
+每个 Verified Claim 的成本
+
+甚至可以开始引入几个很有价值的指标：
+
+tokens / accepted evidence
+
+tokens / supported claim
+
+tokens / verified claim
+
+seconds / verified claim
+
+searches / verified claim
+
+这样以后你不会只看到：
+
+Run = 120k tokens
+
+而不知道这些 token 到底换来了什么。
+
+但 V2 不应该为了省 token 主动削能力
+
+比如暂时不要为了成本去做：
+
+减少 Research budget
+减少 Search 上限
+减少 Recovery 次数
+强行缩短 context
+降低 evidence extraction 次数
+只搜一个来源
+关闭 verification
+
+因为 V2 正在建立：
+
+Claim matching
+Corroboration
+Verification
+Contradiction
+Claim-driven research
+
+如果这时候大幅削预算，很难判断：
+
+是新架构不行，还是你只是不给它足够资源。
+
+最合理的顺序
+
+我建议整体路线是：
+
+V2.0 Claim architecture
+        ↓
+V2.1 Claim equivalence
+        ↓
+V2.2 Corroboration / Verification
+        ↓
+V2.3 Evidence formation
+        ↓
+V2.4 Claim-driven gap closure
+        ↓
+可选 V2.5 Variance reduction
+        ↓
+V2 RC
+        ↓
+──────────────
+Efficiency Optimization
+        ↓
+Runtime / Token / Cost Optimization
+
+也就是：
+
+先让 Agent“做对”，再让它“更便宜、更快地做对”。
+
+为什么最好放在 V2 后
+
+因为 V2 做完以后，你才真正知道哪些步骤有价值。
+
+例如现在可能一次 Run：
+
+Planner              5k tokens
+Search               20 次
+Reader               40 pages
+Extraction           25 calls
+Gap closure           4 rounds
+Report                10k tokens
+
+但 V2 之后你可能发现：
+
+20 个 searches
+↓
+只有 6 个真正贡献 verified claims
+
+25 个 extraction
+↓
+只有 7 个形成 useful evidence
+
+4 个 recovery rounds
+↓
+第 3、4 轮收益接近 0
+
+这时优化就很有针对性：
+
+减少低收益 Search
+减少重复 Reader
+缓存 Claim matching
+避免重复 Extraction
+提前停止低收益 Recovery
+共享相同 Source 的解析结果
+只对 unresolved Claims 做 Verification
+
+这种优化往往可以同时：
+
+降低 token + 降低耗时 + 不损害质量。
+
+这比现在简单砍预算要安全得多。
+
+V2 后的效率优化，我会重点做 6 件事
+1. Early Stop / Marginal Utility
+
+现在可能：
+
+还有 budget
+→ 继续搜
+
+以后应该变成：
+
+新增搜索带来的 verified claim 增益持续接近 0
+→ STOP
+
+按边际收益停止，而不是单纯等 budget 用完。
+
+2. Claim-directed execution
+
+V2 之后已经知道：
+
+Claim A verified
+Claim B verified
+Claim C 还缺一个 independent source
+
+那么之后只研究：
+
+Claim C
+
+而不是整个问题重新搜。
+
+这通常会直接减少大量搜索和 token。
+
+3. Context compression
+
+不是粗暴截断，而是把：
+
+几十个原始 Evidence
+
+压缩成：
+
+Claim state
++ strongest evidence
++ source owners
++ unresolved gaps
+
+Planner/Recovery 就没必要每轮重新读所有历史文本。
+
+4. Source / Reader cache
+
+同一个 URL：
+
+Search 1 找到
+Search 2 又找到
+Recovery 又找到
+
+不应该反复：
+
+fetch
+read
+extract
+
+Reader content、source identity、甚至部分 extraction 都可以复用。
+
+5. Model routing
+
+并不是所有任务都需要最贵/最慢的模型。
+
+可以变成：
+
+简单 normalization
+→ cheap model / deterministic code
+
+Claim candidate matching
+→ cheap classifier first
+
+复杂 contradiction
+→ stronger model
+
+Final synthesis
+→ stronger model
+
+这可能是以后最大的 token/cost 优化点之一。
+
+6. Dynamic budget
+
+不要所有问题都给同样预算。
+
+例如：
+
+简单事实查询
+→ small research budget
+
+复杂多维比较
+→ larger budget
+
+高风险冲突 Claim
+→ targeted extra budget
+
+最终预算应该由：
+
+task complexity
+open claims
+verification difficulty
+marginal evidence gain
+
+共同决定。
+
+“耗时”还要拆成两种
+
+你后面优化时最好不要把 runtime 看成一个数字。
+
+应该拆成：
+
+LLM latency
+Search provider latency
+Reader network latency
+queue/wait
+DB
+Research algorithm work
+idle/retry/timeout
+
+因为：
+
+Token 多不一定就是耗时高的主因。
+
+例如你之前 60+ 分钟 Run，很可能其中有不少时间来自：
+
+公网 Search
+provider fallback
+网页读取
+timeout/retry
+
+这些优化和 Token Optimization 是两条不同的线。
+
+我建议给 V2 加一个“效率保护线”
+
+虽然暂时不把效率作为主目标，但每个 V2 milestone 都记录：
+
+Quality metrics
++
+Runtime
++
+Tokens
++
+Search count
++
+LLM calls
+
+如果某个新机制：
+
+verified_claim_rate +5%
+
+但代价是：
+
+tokens +300%
+runtime +250%
+
+那也不能直接 SHIP。
+
+可以设置类似原则：
+
+V2 可以接受合理的成本上涨来换取明显能力提升，但不能接受无界成本增长。
+
+这样到 V2 后做效率优化时，就有完整数据基础。
+
+所以整体上你的理解是对的：
+
+V2 的主任务是把 Claim-level Research Intelligence 做完整；V2 期间持续测量和限制成本；V2 核心能力稳定后，再专门进行 Research Runtime / Token / Cost Optimization。
+
+而且我预计，V2 完成以后再做效率优化，效果会比现在更好，因为那时系统已经知道：
+
+哪些 Claim 已经解决、哪些证据最重要、哪些搜索是重复的、哪些 Recovery 没收益。
+
+真正的优化空间会清楚很多。

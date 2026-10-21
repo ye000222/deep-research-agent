@@ -18,6 +18,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Final
 
+from app.domain.gap_research_intent import GapResearchIntent
+
 #: Metadata key written by ``feedback_analysis_metadata`` in Phase 14.0.
 PRIMARY_FAILURE_REASON_KEY: Final[str] = "primary_failure_reason"
 EVIDENCE_FAILURE_REASON_KEY: Final[str] = "evidence_failure_reason"
@@ -34,6 +36,7 @@ EXISTING_DOMAINS_KEY: Final[str] = "existing_domains"
 REQUIRED_SOURCE_COUNT_KEY: Final[str] = "required_source_count"
 MISSING_SOURCE_COUNT_KEY: Final[str] = "missing_source_count"
 TARGET_CLAIM_ID_KEY: Final[str] = "target_claim_id"
+PROPOSITION_GAP_INTENTS_KEY: Final[str] = "proposition_gap_intents"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +54,21 @@ class ResearchContext:
     required_source_count: int | None = None
     missing_source_count: int | None = None
     target_claim_id: str | None = None
+    #: V2.4 Step 2: typed proposition-scoped advisory metadata. It is kept
+    #: separate from legacy free-text hints and omitted from legacy payloads.
+    proposition_gap_intents: tuple[GapResearchIntent, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.proposition_gap_intents, tuple):
+            raise TypeError("proposition_gap_intents_must_be_immutable_tuple")
+        if any(not isinstance(item, GapResearchIntent) for item in self.proposition_gap_intents):
+            raise TypeError("proposition_gap_intents_must_be_validated_intents")
+        ordered = tuple(
+            sorted(self.proposition_gap_intents, key=lambda item: item.priority_ordering_key)
+        )
+        refs = tuple(item.intent_ref for item in ordered)
+        if ordered != self.proposition_gap_intents or len(refs) != len(set(refs)):
+            raise ValueError("proposition_gap_intents_must_be_canonical_and_unique")
 
     @property
     def is_empty(self) -> bool:
@@ -64,6 +82,7 @@ class ResearchContext:
             or self.required_source_count
             or self.missing_source_count
             or self.target_claim_id
+            or self.proposition_gap_intents
         )
 
     @property
@@ -73,7 +92,7 @@ class ResearchContext:
         return self.missing_source_count is not None and self.missing_source_count > 0
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "evidence_failure_reason": self.evidence_failure_reason,
             "missing_evidence_type": self.missing_evidence_type,
             "refined_need_type": self.refined_need_type,
@@ -84,6 +103,12 @@ class ResearchContext:
             MISSING_SOURCE_COUNT_KEY: self.missing_source_count,
             TARGET_CLAIM_ID_KEY: self.target_claim_id,
         }
+        if self.proposition_gap_intents:
+            result[PROPOSITION_GAP_INTENTS_KEY] = [
+                intent.model_dump(mode="json")
+                for intent in self.proposition_gap_intents
+            ]
+        return result
 
     @classmethod
     def from_mapping(cls, metadata: Mapping[str, object] | None) -> ResearchContext:
@@ -95,6 +120,14 @@ class ResearchContext:
 
         if not metadata:
             return EMPTY_RESEARCH_CONTEXT
+        typed_intents: tuple[GapResearchIntent, ...] = ()
+        if PROPOSITION_GAP_INTENTS_KEY in metadata:
+            raw_intents = metadata[PROPOSITION_GAP_INTENTS_KEY]
+            if not isinstance(raw_intents, (list, tuple)):
+                raise ValueError("proposition_gap_intents_must_be_a_sequence")
+            typed_intents = tuple(
+                GapResearchIntent.model_validate(item) for item in raw_intents
+            )
         reason = _text(metadata, EVIDENCE_FAILURE_REASON_KEY) or _text(
             metadata, PRIMARY_FAILURE_REASON_KEY
         )
@@ -108,6 +141,7 @@ class ResearchContext:
             required_source_count=_int(metadata, REQUIRED_SOURCE_COUNT_KEY),
             missing_source_count=_int(metadata, MISSING_SOURCE_COUNT_KEY),
             target_claim_id=_text(metadata, TARGET_CLAIM_ID_KEY),
+            proposition_gap_intents=typed_intents,
         )
 
 
@@ -214,6 +248,7 @@ __all__ = [
     "EXISTING_DOMAINS_KEY",
     "EXISTING_SOURCE_OWNERS_KEY",
     "MISSING_SOURCE_COUNT_KEY",
+    "PROPOSITION_GAP_INTENTS_KEY",
     "REQUIRED_SOURCE_COUNT_KEY",
     "TARGET_CLAIM_ID_KEY",
     "ResearchContext",

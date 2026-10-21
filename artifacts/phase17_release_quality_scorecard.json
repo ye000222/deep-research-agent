@@ -1,0 +1,12 @@
+{
+  "cross_task_coverage": "mean=0.606567; families=4",
+  "worst_family_coverage": "0.25",
+  "stability": "v1-dev-model-comparison mean=0.714267, SD=0.101022; v1-gen-low-altitude-economy mean=0.25, SD=0.178228; v1-gen-multimodal-manufacturing mean=0.6532, SD=0.146597",
+  "evidence_grounding": "Recorded per-run; verified_claims is informational and not a gate",
+  "gap_closure": "Recorded from canonical gap_requirements closure states",
+  "report_completion": "Recorded per-run",
+  "report_verification": "Recorded per-run",
+  "runtime_reliability": "One excluded queued infrastructure expiry; all other attempts reached terminal state",
+  "cost_consistency": "Recorded per-run token/runtime/provider metrics",
+  "known_limitations": "Low-altitude family has the weakest coverage and one failed no-evidence run"
+}

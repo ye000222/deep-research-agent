@@ -1,0 +1,24 @@
+{
+  "synthetic_only": true,
+  "fixture_version": "qualifier-version-positive-evidence-v1",
+  "positive_versions": [
+    {"case_id": "latin_v_prefix", "claim_text": "The component supports v2.3.", "value": "2.3"},
+    {"case_id": "english_version_marker", "claim_text": "The component supports version 2.3.", "value": "2.3"},
+    {"case_id": "english_release_marker", "claim_text": "The component shipped in release 4.1.", "value": "4.1"},
+    {"case_id": "product_attached_identifier", "claim_text": "Component-3.2 is supported.", "value": "3.2"},
+    {"case_id": "three_segment_identifier", "claim_text": "The compatible version is 1.2.3.", "value": "1.2.3"},
+    {"case_id": "chinese_version_marker", "claim_text": "组件版本号为2.3。", "value": "2.3"},
+    {"case_id": "japanese_version_marker", "claim_text": "対応バージョン2.3です。", "value": "2.3"},
+    {"case_id": "spanish_version_marker", "claim_text": "La versión 2.3 está disponible.", "value": "2.3"}
+  ],
+  "hard_negative_quantities": [
+    {"case_id": "bare_decimal", "claim_text": "The measured value is 12.34.", "version_not_applicable": true},
+    {"case_id": "percentage_decimal", "claim_text": "The segment holds 58.74% share.", "version_not_applicable": true},
+    {"case_id": "unit_bearing_model_size", "claim_text": "The model size is 325.30 MB.", "version_not_applicable": true},
+    {"case_id": "currency_decimal", "claim_text": "The cost is USD 12.34.", "version_not_applicable": true},
+    {"case_id": "ratio_decimal", "claim_text": "The ratio is 1.25.", "version_not_applicable": true},
+    {"case_id": "compute_measurement", "claim_text": "The compute requirement is 43.771 GFLOPs.", "version_not_applicable": true},
+    {"case_id": "plain_numeric_result", "claim_text": "The result was 12.34 in the test.", "version_not_applicable": true},
+    {"case_id": "date_not_version", "claim_text": "The test ran on 2024.01.02.", "version_not_applicable": true}
+  ]
+}
