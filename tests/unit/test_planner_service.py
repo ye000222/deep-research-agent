@@ -19,7 +19,7 @@ def plan_payload(*, priority: int = 1) -> dict[str, object]:
         "scope_summary": "覆盖技术、厂商、产品、大模型应用和未来趋势。",
         "questions": [
             {
-                "question": f"研究问题 {index} 的事实与变化是什么?",
+                "question": f"工业视觉缺陷检测的研究维度 {index} 有哪些事实与变化?",
                 "priority": priority if index == 1 else 2,
                 "rationale": "该维度直接影响研究目标的完整回答。",
                 "evidence_requirements": ["至少两个独立来源"],
@@ -339,7 +339,7 @@ async def test_compact_plan_deterministically_clips_length_overflow() -> None:
     assert isinstance(questions, list)
     for index, question in enumerate(questions):
         assert isinstance(question, dict)
-        question["question"] = f"问题{index}" + "很长" * 80
+        question["question"] = f"工业视觉缺陷检测问题{index}" + "很长" * 80
         question["rationale"] = "理由" * 80
         question["evidence_requirements"] = ["证据要求" * 40, "多余要求"]
         question["search_hints"] = ["搜索提示" * 40, "多余提示"]

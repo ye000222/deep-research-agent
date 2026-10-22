@@ -1,11 +1,40 @@
 """Lifecycle for the official PostgreSQL checkpoint saver."""
 
 from typing import Any
+from uuid import UUID
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
+
+from app.core.stage_timing import stage_timer
+
+
+class TimedPostgresSaver(AsyncPostgresSaver):
+    """Same official saver/serialization and synchronous durability, with timing."""
+
+    async def aget_tuple(self, *args: Any, **kwargs: Any) -> Any:
+        with stage_timer("checkpoint.read", run_id=_thread_run_id(args, kwargs)):
+            return await super().aget_tuple(*args, **kwargs)
+
+    async def aput(self, *args: Any, **kwargs: Any) -> Any:
+        with stage_timer("checkpoint.put", run_id=_thread_run_id(args, kwargs)):
+            return await super().aput(*args, **kwargs)
+
+    async def aput_writes(self, *args: Any, **kwargs: Any) -> Any:
+        with stage_timer("checkpoint.put_writes", run_id=_thread_run_id(args, kwargs)):
+            return await super().aput_writes(*args, **kwargs)
+
+
+def _thread_run_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> UUID | None:
+    config = args[0] if args else kwargs.get("config")
+    configurable = config.get("configurable") if isinstance(config, dict) else None
+    thread_id = configurable.get("thread_id") if isinstance(configurable, dict) else None
+    try:
+        return UUID(str(thread_id))
+    except ValueError:
+        return None  # readiness / non-run thread names are not logged
 
 
 class CheckpointRuntime:
@@ -33,9 +62,10 @@ class CheckpointRuntime:
                 "row_factory": dict_row,
             },
         )
-        await pool.open(wait=True)
+        with stage_timer("checkpoint.pool_open"):
+            await pool.open(wait=True)
         self._pool = pool
-        self.saver = AsyncPostgresSaver(pool)
+        self.saver = TimedPostgresSaver(pool)
         return self.saver
 
     async def setup_schema(self) -> None:

@@ -618,7 +618,7 @@ class FakeReader:
         return ReadPage(
             final_url=url,
             title=url,
-            clean_text="Evidence-bearing public page content. " * 5,
+            clean_text="Evidence-bearing public page content. " * 10,
             content_hash="a" * 64,
             fetched_at=datetime.now(UTC),
         )
@@ -632,7 +632,7 @@ class FirstThreePagesFailReader(FakeReader):
         return ReadPage(
             final_url=url,
             title=url,
-            clean_text="Evidence-bearing public page content. " * 5,
+            clean_text="Evidence-bearing public page content. " * 10,
             content_hash="b" * 64,
             fetched_at=datetime.now(UTC),
         )
@@ -703,7 +703,7 @@ class FakeArtifacts:
         return "runs/test/source.txt"
 
     async def read_text(self, artifact_uri: str) -> str:
-        return "Previously fetched evidence-bearing page content. " * 5
+        return "Previously fetched evidence-bearing page content. " * 10
 
 
 class FailingArtifacts(FakeArtifacts):
@@ -1398,7 +1398,7 @@ async def test_research_reuses_snapshot_artifact_without_http_read() -> None:
                 title="Industrial inspection technology routes snapshot",
                 artifact_uri="runs/test/snapshot.txt",
                 content_hash=hashlib.sha256(
-                    ("Previously fetched evidence-bearing page content. " * 5).encode("utf-8")
+                    ("Previously fetched evidence-bearing page content. " * 10).encode("utf-8")
                 ).hexdigest(),
                 fetched_at=datetime.now(UTC),
             ),

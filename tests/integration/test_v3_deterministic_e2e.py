@@ -205,6 +205,7 @@ def _plan(goal: str) -> ResearchPlan:
             ResearchQuestion(
                 id=f"q{index}",
                 question=(
+                    f"{goal} "
                     "What statement does the source make about the example program? "
                     f"Question {index}."
                 ),
@@ -255,6 +256,9 @@ class _Reader:
         content = (
             "The example program produced a documented result. "
             "This source statement is provided as deterministic test evidence."
+            " Additional source context describes the example program methodology, "
+            "its independent evaluation and the limits of the observed result. "
+            "The evaluation reports its measurement conditions and traceable public documents."
         )
         return ReadPage(
             final_url=url,

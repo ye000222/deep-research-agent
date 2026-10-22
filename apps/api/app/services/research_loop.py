@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from app.core.stage_timing import timed_call
 from app.domain.adaptive_scheduler import (
     cheap_triage,
     classify_source_role,
@@ -352,9 +353,13 @@ class ResearchLoopService:
     ) -> ResearchIterationResult:
         """Execute one bounded research iteration for one LangGraph super-step."""
 
-        target = await self._repository.prepare_target(
-            run_id,
-            worker_task_id=worker_task_id,
+        target = await timed_call(
+            "scheduler.prepare",
+            self._repository.prepare_target(
+                run_id,
+                worker_task_id=worker_task_id,
+            ),
+            run_id=run_id,
         )
         if target is None:
             replan_checker = getattr(self._repository, "replan_requested", None)
@@ -390,11 +395,15 @@ class ResearchLoopService:
             worker_task_id=worker_task_id,
             target=target,
         )
-        evaluation = await self._repository.finish_iteration(
-            run_id,
-            worker_task_id=worker_task_id,
-            target=target,
-            attempt_outcome=attempt.outcome,
+        evaluation = await timed_call(
+            "evaluation.persistence",
+            self._repository.finish_iteration(
+                run_id,
+                worker_task_id=worker_task_id,
+                target=target,
+                attempt_outcome=attempt.outcome,
+            ),
+            run_id=run_id,
         )
         recovery_recorder = getattr(self._repository, "record_recovery_event", None)
         if callable(recovery_recorder):
@@ -728,28 +737,34 @@ class ResearchLoopService:
                         provider_request_allowance=target.provider_request_allowance,
                         alternate_query=target.alternate_query or None,
                     )
-                    results = await asyncio.wait_for(
-                        adapter.search(
-                            target.query,
-                            limit=_MAX_SEARCH_RESULTS,
-                            exclude_domains=target.search_excluded_owner_keys,
-                            exclude_urls=target.search_excluded_urls,
-                            request_context=request_context,
+                    results = await timed_call(
+                        "search.request",
+                        asyncio.wait_for(
+                            adapter.search(
+                                target.query,
+                                limit=_MAX_SEARCH_RESULTS,
+                                exclude_domains=target.search_excluded_owner_keys,
+                                exclude_urls=target.search_excluded_urls,
+                                request_context=request_context,
+                            ),
+                            timeout=remaining,
                         ),
-                        timeout=remaining,
+                        run_id=run_id,
                     )
                 else:
-                    results = await asyncio.wait_for(
-                        self._search.search(target.query, limit=_MAX_SEARCH_RESULTS),
-                        timeout=remaining,
+                    results = await timed_call(
+                        "search.request",
+                        asyncio.wait_for(
+                            self._search.search(target.query, limit=_MAX_SEARCH_RESULTS),
+                            timeout=remaining,
+                        ),
+                        run_id=run_id,
                     )
                 search_latency_ms = int((time.monotonic() - search_started) * 1_000)
                 provider_requests = _provider_request_count(executed_source, default=1)
                 provider_timeouts = _provider_metric(executed_source, "last_timeout_count")
                 provider_fallbacks = _provider_metric(executed_source, "last_fallback_count")
-                provider_healthy = _provider_metric(
-                    executed_source, "last_healthy_response_count"
-                )
+                provider_healthy = _provider_metric(executed_source, "last_healthy_response_count")
                 provider_unresponsive = _provider_metric(
                     executed_source, "last_unresponsive_response_count"
                 )
@@ -1037,10 +1052,15 @@ class ResearchLoopService:
                 if normalize_source_url(result.url) not in reusable_pages:
                     batch_urls.append(result.url)
             if batch_urls:
-                read_map = await read_page_attempts_concurrently(
-                    batch_urls,
-                    self._reader,
-                    deadline_at=target.deadline_at,
+                read_map = await timed_call(
+                    "reader.batch",
+                    read_page_attempts_concurrently(
+                        batch_urls,
+                        self._reader,
+                        deadline_at=target.deadline_at,
+                        run_id=run_id,
+                    ),
+                    run_id=run_id,
                 )
                 for url, read_outcome in read_map.items():
                     await record_reader_events(url)
@@ -1068,6 +1088,9 @@ class ResearchLoopService:
         zero_yield_pages = 0
         question_budget_exhausted = False
         question_budget_yielded = False
+        model_budget_exhausted = False
+        zero_candidate_seen = False
+        attempted_pages: set[tuple[str, str]] = set()
 
         async def cleanup_attempt(attempt_id: UUID, *, uncertain: bool) -> None:
             """Close reservations when work fails between ledger boundaries.
@@ -1114,6 +1137,15 @@ class ResearchLoopService:
             await mark_dispatch_selected(result)
             fetch_started = time.monotonic()
             reusable_ref = reusable_pages.get(normalize_source_url(result.url))
+            if zero_candidate_seen and result.url not in prefetched and reusable_ref is None:
+                # Exploit already-read opportunities, not another unbounded
+                # fetch/retry round. Other questions keep their first-pass turn.
+                await record_selection_event(
+                    result.url,
+                    "selection_skipped",
+                    reason="not_already_read",
+                )
+                continue
             if reusable_ref is not None:
                 try:
                     text = await self._artifacts.read_text(reusable_ref.artifact_uri)
@@ -1146,9 +1178,13 @@ class ResearchLoopService:
                                 count=max(0, page_reservation.granted - settled_slots),
                             )
                             return attempt_result("deadline_exhausted")
-                        page = await asyncio.wait_for(
-                            self._reader.read(result.url),
-                            timeout=remaining,
+                        page = await timed_call(
+                            "reader.request",
+                            asyncio.wait_for(
+                                self._reader.read(result.url),
+                                timeout=remaining,
+                            ),
+                            run_id=run_id,
                         )
                     except TimeoutError:
                         await record_reader_events(result.url)
@@ -1199,6 +1235,14 @@ class ResearchLoopService:
                 settled_slots += 1
 
             await record_selection_event(result.url, "selection_started")
+            page_key = (normalize_source_url(page.final_url), page.content_hash)
+            if page_key in attempted_pages:
+                await record_selection_event(
+                    result.url,
+                    "selection_skipped",
+                    reason="already_attempted",
+                )
+                continue
             if await self._repository.page_already_processed(
                 run_id,
                 worker_task_id=worker_task_id,
@@ -1214,14 +1258,16 @@ class ResearchLoopService:
                 continue
             pages_read += 1
 
-            if target.cheap_triage_enabled:
+            if (
+                target.cheap_triage_enabled
+                or zero_candidate_seen
+                or len(page.clean_text.strip()) < 300
+            ):
                 triage = cheap_triage(
-                    question=target.question,
+                    question="\n".join(filter(None, (target.original_goal, target.question))),
                     criteria=tuple(criterion for _key, criterion in target.acceptance_dimensions),
                     query_hints=tuple(
-                        value
-                        for value in (target.query, target.alternate_query)
-                        if value
+                        value for value in (target.query, target.alternate_query) if value
                     ),
                     text=page.clean_text,
                     url=page.final_url,
@@ -1289,6 +1335,8 @@ class ResearchLoopService:
                     run_id,
                     worker_task_id=worker_task_id,
                 )
+                question_budget_yielded = model_budget.outcome == "yield_question"
+                model_budget_exhausted = not question_budget_yielded
                 break
 
             # Atomic per-attempt token reservation: the ledger holds the
@@ -1391,7 +1439,14 @@ class ResearchLoopService:
                     )
 
             source_id = reusable_ref.source_id if reusable_ref is not None else uuid7()
+            extraction_target = replace(target, active_source_url=result.url)
+            attempted_pages.add(page_key)
             try:
+                source_resolver = getattr(self._repository, "resolve_extraction_source_id", None)
+                if callable(source_resolver):
+                    source_id = await source_resolver(
+                        run_id, worker_task_id=worker_task_id, page=page, proposed_id=source_id,
+                    )
                 await record_selection_event(
                     result.url,
                     "selection_selected",
@@ -1406,7 +1461,7 @@ class ResearchLoopService:
                 await self._repository.record_extraction_started(
                     run_id,
                     worker_task_id=worker_task_id,
-                    target=target,
+                    target=extraction_target,
                     source_id=source_id,
                     artifact_uri=artifact_uri,
                     page=page,
@@ -1419,22 +1474,26 @@ class ResearchLoopService:
                 remaining = _deadline_remaining_seconds(target)
                 if remaining <= 0:
                     raise TimeoutError
-                evidence, usage, manifest = await asyncio.wait_for(
-                    self._extractor.extract(
-                        run_id,
-                        question=target.question,
-                        acceptance_dimensions=target.acceptance_dimensions,
-                        page=page,
-                        source_id=source_id,
-                        max_total_tokens=model_budget.max_call_tokens,
+                evidence, usage, manifest = await timed_call(
+                    "evidence.extract",
+                    asyncio.wait_for(
+                        self._extractor.extract(
+                            run_id,
+                            question=target.question,
+                            acceptance_dimensions=target.acceptance_dimensions,
+                            page=page,
+                            source_id=source_id,
+                            max_total_tokens=model_budget.max_call_tokens,
+                        ),
+                        timeout=remaining,
                     ),
-                    timeout=remaining,
+                    run_id=run_id,
                 )
             except TimeoutError:
                 await self._repository.record_extraction_failure(
                     run_id,
                     worker_task_id=worker_task_id,
-                    target=target,
+                    target=extraction_target,
                     source_id=source_id,
                     page=page,
                     artifact_uri=artifact_uri,
@@ -1455,7 +1514,7 @@ class ResearchLoopService:
                     await self._repository.record_extraction_failure(
                         run_id,
                         worker_task_id=worker_task_id,
-                        target=target,
+                        target=extraction_target,
                         source_id=source_id,
                         page=page,
                         artifact_uri=artifact_uri,
@@ -1513,17 +1572,21 @@ class ResearchLoopService:
                     page_candidate_count,
                     page_accepted,
                     page_evidence_refs,
-                ) = await self._record_page_with_shadow(
-                    run_id,
-                    worker_task_id=worker_task_id,
-                    target=target,
-                    source_id=source_id,
-                    page=page,
-                    artifact_uri=artifact_uri,
-                    evidence=evidence,
-                    usage=usage,
-                    context_manifest=manifest,
-                    attempt_id=attempt_id,
+                ) = await timed_call(
+                    "evidence.validation_persistence",
+                    self._record_page_with_shadow(
+                        run_id,
+                        worker_task_id=worker_task_id,
+                        target=extraction_target,
+                        source_id=source_id,
+                        page=page,
+                        artifact_uri=artifact_uri,
+                        evidence=evidence,
+                        usage=usage,
+                        context_manifest=manifest,
+                        attempt_id=attempt_id,
+                    ),
+                    run_id=run_id,
                 )
             except Exception:
                 await cleanup_attempt(attempt_id, uncertain=True)
@@ -1533,10 +1596,10 @@ class ResearchLoopService:
             persisted_evidence_refs.extend(page_evidence_refs)
             structured_extraction_failures = 0
             if page_candidate_count == 0:
-                # A readable page that yields no candidate is a failed query
-                # variant, not a reason to spend its second page slot. Return
-                # to the evaluator so the next attempt can rotate the query.
-                break
+                # Empty extraction is local to this source. The next iteration
+                # must still pass triage, dedupe, deadline, slot and token gates.
+                zero_candidate_seen = True
+                continue
             if page_accepted == 0:
                 zero_yield_pages += 1
             else:
@@ -1571,7 +1634,9 @@ class ResearchLoopService:
             count=max(0, page_reservation.granted - settled_slots),
         )
 
-        if question_budget_exhausted:
+        if model_budget_exhausted:
+            outcome = "budget_exhausted"
+        elif question_budget_exhausted:
             outcome = "question_budget_exhausted"
         elif question_budget_yielded:
             outcome = "yield_question"

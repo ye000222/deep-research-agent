@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from typing import Any, Literal, TypedDict, cast
 from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
+from app.core.stage_timing import stage_timer, timed_call
 from app.domain.memory import MemoryItemView
 from app.domain.planning import ResearchPlan
 from app.domain.providers import TokenUsage, UsageAccuracy
@@ -68,7 +71,9 @@ class ResearchGraphService:
         worker_task_id: str,
         checkpointer: BaseCheckpointSaver[Any],
     ) -> str:
-        initial = await self._states.ensure_initialized(run_id)
+        initial = await timed_call(
+            "state.initialize", self._states.ensure_initialized(run_id), run_id=run_id
+        )
         workflow = StateGraph(ResearchGraphState)
 
         async def planner_node(_graph_state: ResearchGraphState) -> ResearchGraphState:
@@ -99,7 +104,11 @@ class ResearchGraphService:
                     usage = TokenUsage(accuracy=UsageAccuracy.UNAVAILABLE)
                 else:
                     if self._memories is not None:
-                        memory_result = await self._memories.retrieve_for_run(run_id)
+                        memory_result = await timed_call(
+                            "memory.retrieve",
+                            self._memories.retrieve_for_run(run_id),
+                            run_id=run_id,
+                        )
                         memory_leads = memory_result.items
                     plan, usage = await self._generate_plan_with_retry(
                         run_id,
@@ -114,13 +123,21 @@ class ResearchGraphService:
                 )
                 if not saved:
                     raise RuntimeError("planner lost the worker lease before persisting the plan")
-            state = await self._states.synchronize(
-                run_id,
-                node_name="planner",
-                worker_task_id=worker_task_id,
+            state = await timed_call(
+                "state.synchronize.planner",
+                self._states.synchronize(
+                    run_id,
+                    node_name="planner",
+                    worker_task_id=worker_task_id,
+                ),
+                run_id=run_id,
             )
             if self._memories is not None:
-                await self._memories.capture_state(state, node_name="planner")
+                await timed_call(
+                    "memory.capture.planner",
+                    self._memories.capture_state(state, node_name="planner"),
+                    run_id=run_id,
+                )
             return {
                 "run_id": str(run_id),
                 "research_state": state.model_dump(mode="json"),
@@ -153,13 +170,21 @@ class ResearchGraphService:
                     run_id,
                     worker_task_id=worker_task_id,
                 )
-            state = await self._states.synchronize(
-                run_id,
-                node_name="research_iteration",
-                worker_task_id=worker_task_id,
+            state = await timed_call(
+                "state.synchronize.research",
+                self._states.synchronize(
+                    run_id,
+                    node_name="research_iteration",
+                    worker_task_id=worker_task_id,
+                ),
+                run_id=run_id,
             )
             if self._memories is not None:
-                await self._memories.capture_state(state, node_name="research_iteration")
+                await timed_call(
+                    "memory.capture.research",
+                    self._memories.capture_state(state, node_name="research_iteration"),
+                    run_id=run_id,
+                )
             return {
                 "run_id": str(run_id),
                 "research_state": state.model_dump(mode="json"),
@@ -213,17 +238,29 @@ class ResearchGraphService:
             }
 
         async def writer_node(_graph_state: ResearchGraphState) -> ResearchGraphState:
-            outcome = await self._report_writer.write(
-                run_id,
-                worker_task_id=worker_task_id,
+            outcome = await timed_call(
+                "report.write_and_verify",
+                self._report_writer.write(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                ),
+                run_id=run_id,
             )
-            state = await self._states.synchronize(
-                run_id,
-                node_name="report_writer",
-                worker_task_id=None,
+            state = await timed_call(
+                "state.synchronize.writer",
+                self._states.synchronize(
+                    run_id,
+                    node_name="report_writer",
+                    worker_task_id=None,
+                ),
+                run_id=run_id,
             )
             if self._memories is not None:
-                await self._memories.capture_state(state, node_name="report_writer")
+                await timed_call(
+                    "memory.capture.writer",
+                    self._memories.capture_state(state, node_name="report_writer"),
+                    run_id=run_id,
+                )
             return {
                 "run_id": str(run_id),
                 "research_state": state.model_dump(mode="json"),
@@ -246,10 +283,33 @@ class ResearchGraphService:
 
         # LangGraph's callable overload currently rejects async functions returning
         # this total TypedDict under strict MyPy, although they are valid runtime nodes.
-        workflow.add_node("planner", cast(Any, planner_node))
-        workflow.add_node("research_iteration", cast(Any, research_node))
-        workflow.add_node("replan", cast(Any, replan_node))
-        workflow.add_node("report_writer", cast(Any, writer_node))
+        last_exit: float | None = None
+
+        def measured_node(name: str, node: Any) -> Any:
+            async def invoke(state: ResearchGraphState) -> ResearchGraphState:
+                nonlocal last_exit
+                if last_exit is not None:
+                    # Includes graph scheduling/checkpoint time, NOT queue or
+                    # provider time. Concrete saver calls are timed separately.
+                    logging.getLogger(__name__).info(
+                        "research_transition run_id=%s next_node=%s "
+                        "elapsed_ms=%.3f clock=perf_counter",
+                        run_id,
+                        name,
+                        (time.perf_counter() - last_exit) * 1000,
+                    )
+                try:
+                    with stage_timer(f"graph.node.{name}", run_id=run_id):
+                        return await node(state)
+                finally:
+                    last_exit = time.perf_counter()
+
+            return invoke
+
+        workflow.add_node("planner", measured_node("planner", planner_node))
+        workflow.add_node("research_iteration", measured_node("research_iteration", research_node))
+        workflow.add_node("replan", measured_node("replan", replan_node))
+        workflow.add_node("report_writer", measured_node("report_writer", writer_node))
         workflow.add_edge(START, "planner")
         workflow.add_edge("planner", "research_iteration")
         workflow.add_conditional_edges(
@@ -312,5 +372,7 @@ class ResearchGraphService:
                     raise RuntimeError(
                         "planner lost the worker lease while scheduling retry"
                     ) from exc
-                await asyncio.sleep(delay_seconds)
+                await timed_call(
+                    "llm.planner_retry_backoff", asyncio.sleep(delay_seconds), run_id=run_id
+                )
         raise RuntimeError("planner retry loop exhausted without a result")

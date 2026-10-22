@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
+from app.core.stage_timing import timed_call
 from app.domain.research_tools import ReadPage
 from app.tools.errors import ToolExecutionError
 from app.tools.web_reader import PublicWebReader
@@ -57,6 +58,7 @@ async def read_page_attempts_concurrently(
     max_concurrency: int = 2,
     max_same_host: int = 1,
     deadline_at: datetime | None = None,
+    run_id: object = None,
 ) -> dict[str, ConcurrentReadOutcome]:
     """Return auditable outcomes for every HTTP read that was started."""
 
@@ -80,7 +82,7 @@ async def read_page_attempts_concurrently(
             started = time.monotonic()
             try:
                 if deadline_at is None:
-                    page = await reader.read(url)
+                    page = await timed_call("reader.request", reader.read(url), run_id=run_id)
                     return url, ConcurrentReadOutcome(
                         page=page,
                         error_code=None,
@@ -92,7 +94,11 @@ async def read_page_attempts_concurrently(
                 remaining = (deadline - datetime.now(UTC)).total_seconds()
                 if remaining <= 0:
                     return url, ConcurrentReadOutcome(None, "DEADLINE_EXHAUSTED", 0)
-                page = await asyncio.wait_for(reader.read(url), timeout=remaining)
+                page = await timed_call(
+                    "reader.request",
+                    asyncio.wait_for(reader.read(url), timeout=remaining),
+                    run_id=run_id,
+                )
                 return url, ConcurrentReadOutcome(
                     page=page,
                     error_code=None,

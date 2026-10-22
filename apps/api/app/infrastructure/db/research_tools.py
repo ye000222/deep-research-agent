@@ -12,7 +12,7 @@ from typing import TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import and_, distinct, exists, func, or_, select
+from sqlalchemy import and_, case, distinct, exists, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -274,6 +274,8 @@ _CANDIDATE_EVENT_TYPES = {
 _EVIDENCE_SELECTION_SKIP_REASONS = frozenset(
     {
         "already_processed",
+        "already_attempted",
+        "not_already_read",
         "duplicate_source",
         "extraction_budget",
         "question_budget",
@@ -580,6 +582,8 @@ class ResearchTarget:
     gap_id: UUID
     tool_call_id: UUID
     source_id_seed: UUID
+    original_goal: str = ""
+    active_source_url: str = ""
     alternate_query: str = ""
     priority: int = 2
     attempt_index: int = 0
@@ -864,6 +868,47 @@ class ResearchToolRepository:
                 minimum_call=effective_minimum,
                 maximum_call=maximum_call,
             )
+            # A small settled first call may leave enough of the original
+            # question target for a second feasible request. Do not reserve a
+            # larger fair-share envelope and accidentally turn that affordable
+            # continuation into a recovery-borrow denial. The atomic reservation
+            # remains authoritative; no question/global limit is raised here.
+            targets = allocation.get("question_token_budgets", {})
+            target_limit = _as_int(targets.get(question_id, 0)) if isinstance(targets, dict) else 0
+            if decision.outcome == "execute" and target_limit > 0:
+                spent = int(
+                    await session.scalar(
+                        select(
+                            func.coalesce(
+                                func.sum(
+                                    case(
+                                        (ModelBudgetReservationRow.status == "settled",
+                                         func.coalesce(ModelBudgetReservationRow.actual_total,
+                                                       ModelBudgetReservationRow.reserved_total)),
+                                        else_=ModelBudgetReservationRow.reserved_total,
+                                    )
+                                ),
+                                0,
+                            )
+                        ).where(
+                            ModelBudgetReservationRow.run_id == run_id,
+                            ModelBudgetReservationRow.question_id == question_id,
+                            ModelBudgetReservationRow.status.in_(
+                                ("reserved", "uncertain", "settled")
+                            ),
+                        )
+                    )
+                    or 0
+                )
+                remaining_target = max(0, target_limit - spent)
+                if remaining_target >= effective_minimum:
+                    decision = replace(
+                        decision,
+                        call_tokens=min(
+                            decision.call_tokens,
+                            remaining_target,
+                        ),
+                    )
             usage = dict(run.usage_snapshot)
             usage["model_tokens"] = used
             usage["model_tokens_remaining"] = remaining
@@ -3854,6 +3899,7 @@ class ResearchToolRepository:
                 gap_id=gap.id,
                 tool_call_id=tool_call.id,
                 source_id_seed=uuid7(),
+                original_goal=run.normalized_goal,
                 alternate_query=alternate_query,
                 priority=question.priority,
                 attempt_index=attempt_index,
@@ -4051,6 +4097,7 @@ class ResearchToolRepository:
             gap_id=tool_call.gap_id,
             tool_call_id=tool_call.id,
             source_id_seed=uuid7(),
+            original_goal=run.normalized_goal,
             acceptance_dimensions=dimensions,
             priority=question.priority,
             query_family=QueryFamily.SCOPE.value,
@@ -5147,6 +5194,29 @@ class ResearchToolRepository:
                 },
             )
 
+    async def resolve_extraction_source_id(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        page: ReadPage,
+        proposed_id: UUID,
+    ) -> UUID:
+        """Use the same canonical source identity as result persistence.
+
+        A new query may redirect to an already persisted source from another
+        question. Bind that identity before creating model input/start events.
+        """
+        async with self._sessions() as session, session.begin():
+            await self._locked_run(session, run_id, worker_task_id)
+            url_hash = hashlib.sha256(normalize_source_url(page.final_url).encode()).hexdigest()
+            existing = await session.scalar(select(ResearchSourceRow.id).where(
+                ResearchSourceRow.run_id == run_id,
+                or_(ResearchSourceRow.url_hash == url_hash,
+                    ResearchSourceRow.content_hash == page.content_hash),
+            ))
+            return existing if existing is not None else proposed_id
+
     async def record_extraction_started(
         self,
         run_id: UUID,
@@ -5179,10 +5249,11 @@ class ResearchToolRepository:
                         }
                     )
                     attempt.resume_metadata = progress
-            candidate = await self._candidate_identity_for_latest_fetch(
+            candidate = await self._candidate_identity_for_url(
                 session,
                 run_id=run_id,
                 target=target,
+                url=target.active_source_url or page.final_url,
             )
             if candidate is None:
                 candidate = CandidateIdentity(
@@ -5210,7 +5281,12 @@ class ResearchToolRepository:
                     "source_id": str(source_id),
                     "candidate_id": candidate.candidate_id,
                     "plan_version": target.plan_version,
+                    "requested_url": target.active_source_url or page.final_url,
+                    "final_url": page.final_url,
+                    "title": page.title[:300],
+                    "content_hash": page.content_hash,
                 },
+                metrics={"input_chars": len(page.clean_text)},
             )
             await self._append_formation_diagnostic(
                 session,
@@ -6462,7 +6538,7 @@ class ResearchToolRepository:
                 session,
                 run_id=run_id,
                 target=target,
-                url=page.final_url,
+                url=target.active_source_url or page.final_url,
             )
             url_hash = hashlib.sha256(canonical_url.encode()).hexdigest()
             source = await session.scalar(
@@ -7328,7 +7404,7 @@ class ResearchToolRepository:
                 session,
                 run_id=run_id,
                 target=target,
-                url=page.final_url,
+                url=target.active_source_url or page.final_url,
             )
             url_hash = hashlib.sha256(canonical_url.encode()).hexdigest()
             source = await session.scalar(
@@ -9396,7 +9472,9 @@ class ResearchToolRepository:
             session,
             run,
             event_type="report.writing_started",
-            public_summary=summary,
+            public_summary=_writing_start_summary(
+                reason, accepted_evidence=_as_int(run.usage_snapshot.get("accepted_evidence", 0))
+            ),
             refs={"reason": reason},
         )
         await self._finalize_run_closure_feedback(
@@ -9560,6 +9638,7 @@ class ResearchToolRepository:
                 public_summary=public_summary,
                 refs=refs,
                 metrics=metrics,
+                created_at=datetime.now(UTC),
             )
         )
         await session.flush()
@@ -9978,6 +10057,8 @@ def _writing_start_summary(reason: str | None, *, accepted_evidence: int) -> str
             )
         return _budget_stop_summary(reason)
     if reason == "stagnation":
+        if accepted_evidence <= 0:
+            return "边际信息增益过低; 尚无有效证据, 进入收尾检查, 不保证生成报告。"
         return "连续两轮边际信息增益过低且无关键缺口; 停止扩展并进入写作。"
     return "研究已停止扩展; 检查现有证据与未满足条件, 不能据此宣称质量门通过。"
 

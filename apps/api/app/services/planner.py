@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -11,6 +12,7 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from app.context.manager import ContextBudgetManager
+from app.core.stage_timing import timed_call
 from app.domain.context import ContextCandidate, ContextItemType
 from app.domain.memory import MemoryItemView
 from app.domain.planning import (
@@ -20,6 +22,7 @@ from app.domain.planning import (
     materialize_research_plan,
     normalize_research_plan_draft_payload,
 )
+from app.domain.planning_scope import PlanScopeError, enforce_plan_scope
 from app.domain.providers import (
     CanonicalModelRequest,
     CanonicalModelResult,
@@ -35,7 +38,10 @@ from app.llm.adapters import LLMGateway, ModelGatewayError
 from app.security.secrets import SecretCipher
 
 PLANNER_INSTRUCTIONS = """你是 DeepResearch Agent 的 Research Planner。
-只负责把研究目标拆成 5 到 8 个可验证、尽量互斥且共同完备的研究问题。
+只负责按实际需要把研究目标拆成 1 到 8 个可验证、尽量互斥且共同完备的研究问题。
+窄事实问题不要凑题数。保留原始主体、时间、地区及事件状态; 建成、开通、投入运营不可互换。
+每题 rationale 解释它如何直接回答原问题、提供必要前置事实或交叉验证。
+用户未要求时不要扩展性能、市场、升级路线等独立主题。
 严格控制长度: scope_summary 最多 160 字; question 最多 120 字; rationale 最多 80 字;
 evidence_requirements 每题 1 到 2 条且每条最多 60 字;
  search_hints 每题 1 到 2 条且每条最多 80 字; 必须保留该问题的专有主题词,
@@ -47,7 +53,7 @@ completion_criteria 2 到 4 条且每条最多 60 字。
 Priority 1 只分配给直接回答研究目标所必需的定义、核心技术路线和关键事实;
 厂商罗列、趋势和扩展案例通常为 Priority 2 或 3。
 不要把五个行业、全部厂商、市场规模和未来趋势合并为一个无法在两次检索内完成的宽泛问题。
-禁止背景介绍、重复研究目标和解释性段落。
+禁止无关背景介绍、重复研究目标和解释性段落; 必要背景也必须写为服务原问题的可验证子问题。
 不要声称已经搜索。
 不要生成答案。
 不要输出内部思维过程。
@@ -55,7 +61,8 @@ Priority 1 只分配给直接回答研究目标所必需的定义、核心技术
 
 COMPACT_PLANNER_INSTRUCTIONS = """你是 DeepResearch Agent 的 Compact Research Planner。
 上一次计划未能在结构化输出预算内完成。本次只生成最小可执行提纲:
-- 恰好 5 个研究问题;
+- 按原问题所需生成 1 到 5 个研究问题, 不要为凑数引入无关主题;
+- 保留原主体、时间、地区、事件状态, 每题说明与原问题的必要关系;
 - scope_summary 最多 100 字;
 - question 最多 100 字;
 - rationale 最多 50 字;
@@ -274,7 +281,7 @@ class PlannerService:
                 )
             else:
                 await settle_planner(result.usage)
-                return materialize_research_plan(binding.goal, draft), result.usage
+                return _scoped_plan(binding.goal, draft, result.usage), result.usage
 
         if first_error is None:  # pragma: no cover - defensive state guard
             raise ModelGatewayError("MODEL_OUTPUT_SCHEMA_INVALID", retryable=False)
@@ -331,7 +338,7 @@ class PlannerService:
             )
             raise _planner_retry_error(schema_error, first_error=first_error) from exc
         await settle_planner(usage)
-        return materialize_research_plan(binding.goal, compact_draft), usage
+        return _scoped_plan(binding.goal, compact_draft, usage), usage
 
     async def _generate_structured_with_deadline(
         self,
@@ -355,7 +362,11 @@ class PlannerService:
             raise ModelGatewayError("DEADLINE_EXHAUSTED", retryable=False)
         try:
             call = self._gateway.generate_structured(**kwargs)
-            return await asyncio.wait_for(call, timeout=remaining)
+            return await timed_call(
+                "llm.planner_request",
+                asyncio.wait_for(call, timeout=remaining),
+                run_id=run_id,
+            )
         except TimeoutError as exc:
             raise ModelGatewayError("DEADLINE_EXHAUSTED", retryable=False) from exc
 
@@ -431,6 +442,26 @@ class PlannerService:
                 "retry_mode": retry_mode,
             },
         )
+
+
+def _scoped_plan(goal: str, draft: Any, usage: TokenUsage) -> ResearchPlan:
+    original = materialize_research_plan(goal, draft)
+    try:
+        scoped = enforce_plan_scope(original, goal)
+    except PlanScopeError as exc:
+        raise ModelGatewayError(
+            "PLANNER_SCOPE_INVALID",
+            retryable=False,
+            detail_code=str(exc),
+            usage=usage,
+        ) from exc
+    if len(scoped.questions) != len(original.questions):
+        logging.getLogger(__name__).info(
+            "Planner scope repaired retained=%d rejected=%d",
+            len(scoped.questions),
+            len(original.questions) - len(scoped.questions),
+        )
+    return scoped
 
 
 def _combine_optional_usage(

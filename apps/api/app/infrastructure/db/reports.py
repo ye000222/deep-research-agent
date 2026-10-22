@@ -553,10 +553,20 @@ class ReportRepository:
             readable = int(event_counts.get("source.readable", 0))
             started = int(event_counts.get("evidence.extraction_started", 0))
             completed = int(event_counts.get("evidence.extracted", 0))
+            candidate_total = int(
+                await session.scalar(
+                    select(func.count(ResearchEvidenceRow.id)).where(
+                        ResearchEvidenceRow.run_id == run_id
+                    )
+                )
+                or 0
+            )
             if readable or started or pages or completed:
                 if completed or pages:
                     detail_code = "EVIDENCE_VALIDATION_EMPTY"
                     cause = "no_candidate_passed_provenance_validation"
+                    if completed and candidate_total == 0:
+                        cause = "extraction_returned_no_candidates"
                 else:
                     detail_code = "EVIDENCE_EXTRACTION_NOT_COMPLETED"
                     cause = "readable_source_without_completed_extraction"
@@ -595,6 +605,7 @@ class ReportRepository:
                     "readable_sources": readable,
                     "extraction_started": started,
                     "extraction_completed": completed,
+                    "candidate_evidence": candidate_total,
                 },
             )
 
@@ -812,6 +823,7 @@ class ReportRepository:
                 public_summary=public_summary,
                 refs=refs,
                 metrics=metrics,
+                created_at=datetime.now(UTC),
             )
         )
         await session.flush()

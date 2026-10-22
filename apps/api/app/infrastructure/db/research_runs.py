@@ -18,6 +18,7 @@ from app.domain.planning import (
     build_gap_resolution_hints,
     fit_plan_to_budget,
 )
+from app.domain.planning_scope import enforce_plan_scope
 from app.domain.providers import TokenUsage
 from app.domain.research_budget import (
     build_resource_pool_snapshot,
@@ -1163,6 +1164,7 @@ class ResearchRunRepository:
                 or run.worker_task_id != worker_task_id
             ):
                 return False
+            plan = enforce_plan_scope(plan, run.normalized_goal)
             plan = fit_plan_to_budget(
                 plan,
                 max_iterations=int(run.budget_snapshot.get("max_iterations", 0) or 0),
@@ -2028,6 +2030,7 @@ class ResearchRunRepository:
             public_summary=public_summary,
             refs=refs,
             metrics=metrics,
+            created_at=datetime.now(UTC),
         )
         session.add(event)
         await session.flush()

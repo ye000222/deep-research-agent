@@ -238,6 +238,7 @@ class ResearchStateRuntimeRepository:
                 public_summary=public_summary,
                 refs=refs,
                 metrics=None,
+                created_at=datetime.now(UTC),
             )
         )
         await session.flush()

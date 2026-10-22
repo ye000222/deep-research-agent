@@ -35,7 +35,7 @@ class ResearchPlan(BaseModel):
 
     goal: str = Field(min_length=5, max_length=2000)
     scope_summary: str = Field(min_length=5, max_length=1000)
-    questions: list[ResearchQuestion] = Field(min_length=5, max_length=MAX_DYNAMIC_QUESTIONS)
+    questions: list[ResearchQuestion] = Field(min_length=1, max_length=MAX_DYNAMIC_QUESTIONS)
     completion_criteria: list[str] = Field(min_length=2, max_length=8)
 
     @model_validator(mode="after")
@@ -59,12 +59,12 @@ class ResearchQuestionDraft(BaseModel):
 
 
 class ResearchPlanDraft(BaseModel):
-    """Normal Planner contract sized for a concise 5-8 question outline."""
+    """Bounded outline; narrow factual goals need not manufacture five topics."""
 
     model_config = ConfigDict(extra="forbid")
 
     scope_summary: str = Field(min_length=5, max_length=160)
-    questions: list[ResearchQuestionDraft] = Field(min_length=5, max_length=8)
+    questions: list[ResearchQuestionDraft] = Field(min_length=1, max_length=8)
     completion_criteria: list[ShortCriterion] = Field(min_length=2, max_length=4)
 
 
@@ -81,12 +81,12 @@ class CompactResearchQuestionDraft(BaseModel):
 
 
 class CompactResearchPlanDraft(BaseModel):
-    """Exactly five questions and two criteria for a sub-1,000-token retry."""
+    """At most five questions and two criteria for a sub-1,000-token retry."""
 
     model_config = ConfigDict(extra="forbid")
 
     scope_summary: str = Field(min_length=5, max_length=100)
-    questions: list[CompactResearchQuestionDraft] = Field(min_length=5, max_length=5)
+    questions: list[CompactResearchQuestionDraft] = Field(min_length=1, max_length=5)
     completion_criteria: list[ShortCriterion] = Field(min_length=2, max_length=2)
 
 

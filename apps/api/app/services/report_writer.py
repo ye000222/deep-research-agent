@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, ValidationError
 
 from app.context.manager import ContextBudgetInsufficientError, ContextBudgetManager
+from app.core.stage_timing import stage_timer, timed_call
 from app.domain.context import ContextCandidate, ContextEnvelope, ContextItemType
 from app.domain.providers import CanonicalModelRequest, ContentPart, TokenUsage, UsageAccuracy
 from app.domain.research_budget import estimate_writer_reserve_tokens
@@ -214,32 +215,39 @@ class ReportWriterService:
         else:
             fallback_reason = "WRITER_SKIPPED_RESEARCH_BUDGET_EXHAUSTED"
 
-        assembled = assemble_report(
-            context,
-            selected,
-            draft=draft,
-            fallback_reason=fallback_reason,
-        )
+        with stage_timer("report.assemble_and_verify", run_id=run_id):
+            assembled = assemble_report(
+                context,
+                selected,
+                draft=draft,
+                fallback_reason=fallback_reason,
+            )
         # The report may contain implementation-level notes (for example a
         # Writer schema fallback) even when the research quality gate was met.
         # Those notes must not downgrade an otherwise complete research run.
         completed_with_limitations = _research_completion_has_limitations(context)
-        report = await self._repository.save(
-            run_id,
-            worker_task_id=worker_task_id,
-            title=assembled.title,
-            final_markdown=assembled.final_markdown,
-            limitations=assembled.limitations,
-            verification_result=assembled.verification_result,
-            sections=assembled.sections,
-            citations=assembled.citations,
-            usage=usage,
-            writer_mode=(
-                "model"
-                if draft is not None and not draft_cache_hit
-                else "cache" if draft_cache_hit else "deterministic_fallback"
+        report = await timed_call(
+            "report.persistence",
+            self._repository.save(
+                run_id,
+                worker_task_id=worker_task_id,
+                title=assembled.title,
+                final_markdown=assembled.final_markdown,
+                limitations=assembled.limitations,
+                verification_result=assembled.verification_result,
+                sections=assembled.sections,
+                citations=assembled.citations,
+                usage=usage,
+                writer_mode=(
+                    "model"
+                    if draft is not None and not draft_cache_hit
+                    else "cache"
+                    if draft_cache_hit
+                    else "deterministic_fallback"
+                ),
+                completed_with_limitations=completed_with_limitations,
             ),
-            completed_with_limitations=completed_with_limitations,
+            run_id=run_id,
         )
         return f"report_completed:{report.status}:citations={len(report.citations)}"
 
@@ -372,11 +380,15 @@ class ReportWriterService:
             context_manifest_id=manifest_id,
             metadata={"run_id": str(context.run_id), "node": "report_writer"},
         )
-        result = await self._gateway.generate_structured(
-            adapter_type=binding.adapter_type,
-            base_url=binding.base_url,
-            api_key=api_key,
-            request=request,
+        result = await timed_call(
+            "llm.report_request",
+            self._gateway.generate_structured(
+                adapter_type=binding.adapter_type,
+                base_url=binding.base_url,
+                api_key=api_key,
+                request=request,
+            ),
+            run_id=context.run_id,
         )
         return ReportDraft.model_validate(result.parsed_object), result.usage
 

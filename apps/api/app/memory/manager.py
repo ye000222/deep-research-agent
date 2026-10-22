@@ -10,6 +10,7 @@ from uuid import UUID
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.stage_timing import stage_timer
 from app.domain.identifiers import uuid7
 from app.domain.memory import (
     MemoryAccessView,
@@ -105,7 +106,8 @@ class ResearchMemoryManager:
                 )
             # Keep the searchable projection transactionally aligned with memory facts.
             await session.flush()
-            await rebuild_memory(session, owner_hash=run.owner_hash)
+            with stage_timer("memory.rebuild_projection", run_id=state.run_id):
+                await rebuild_memory(session, owner_hash=run.owner_hash)
 
     async def retrieve_for_run(
         self,

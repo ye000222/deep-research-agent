@@ -166,6 +166,69 @@ async def test_global_budget_is_still_hard(store):
 
 
 @pytest.mark.asyncio
+async def test_affordable_continuation_reserves_only_remaining_nominal_target(store):
+    factory, run_id = store
+    add_event(store, "source.readable")
+    with factory._sync_factory() as session:
+        run = session.get(ResearchRunRow, run_id)
+        allocation = dict(run.budget_snapshot["allocation"])
+        allocation["question_token_budgets"] = {
+            **allocation["question_token_budgets"],
+            "q1": 4000,
+        }
+        run.budget_snapshot = {**run.budget_snapshot, "allocation": allocation}
+        session.commit()
+    first = uuid4()
+    assert (await reserve(store, attempt=first)).granted
+    actual = ResearchToolRepository(factory)
+    await actual.settle_model_reservation(
+        run_id,
+        worker_task_id="offline-worker",
+        attempt_id=first,
+        actual_total=698,
+        usage_estimated=False,
+    )
+    budget = await actual.evidence_model_budget(
+        run_id,
+        worker_task_id="offline-worker",
+        question_id="q1",
+        minimum_call=2700,
+    )
+    assert budget.allowed and 2700 <= budget.max_call_tokens <= 4000 - 698
+    assert (await reserve(store, amount=budget.max_call_tokens)).granted
+    with factory._sync_factory() as session:
+        rows = session.scalars(select(ModelBudgetReservationRow)).all()
+        committed = sum(
+            r.actual_total if r.actual_total is not None else r.reserved_total for r in rows
+        )
+        assert committed <= 4000  # no repeat first-pass borrowing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", ["deadline_exhausted", "quality_met", "token_budget_exhausted", "stagnation"]
+)
+async def test_every_writing_entry_recomputes_summary_from_real_evidence_state(store, reason):
+    factory, run_id = store
+    repository = ResearchToolRepository(factory)
+    async with factory() as session, session.begin():
+        run = await session.get(ResearchRunRow, run_id)
+        await repository._enter_writing(
+            session,
+            run,
+            reason=reason,
+            summary="全部质量门已满足; 使用现有有效证据生成报告。",
+        )
+    with factory._sync_factory() as session:
+        writing = session.scalar(
+            select(AgentEventRow).where(AgentEventRow.event_type == "report.writing_started")
+        )
+        assert "全部质量门已满足" not in writing.public_summary
+        assert "使用现有有效证据" not in writing.public_summary
+        assert writing.refs["reason"] == reason
+
+
+@pytest.mark.asyncio
 async def test_research_pool_cannot_overrun(store):
     for i in range(1, 5):
         add_event(store, "source.readable", f"q{i}")

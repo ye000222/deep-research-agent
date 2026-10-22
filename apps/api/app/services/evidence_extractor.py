@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from app.context.manager import ContextBudgetManager
 from app.context.source_selector import select_relevant_blocks
 from app.core.config import get_settings
+from app.core.stage_timing import stage_timer, timed_call
 from app.domain.adaptive_scheduler import (
     claim_quote_entails,
     classify_source_role,
@@ -422,7 +423,7 @@ class EvidenceExtractorService:
         transient_retry = False
         prior_usage: TokenUsage | None = None
         try:
-            result = await self._gateway.generate_structured(
+            result = await self._timed_model_request(
                 adapter_type=binding.adapter_type,
                 base_url=binding.base_url,
                 api_key=api_key,
@@ -468,9 +469,9 @@ class EvidenceExtractorService:
                 compact_fallback = True
                 transient_retry = True
                 truncated = len(selected_text) < len(page.clean_text)
-                await asyncio.sleep(1.0)
+                await timed_call("llm.evidence_retry_backoff", asyncio.sleep(1.0), run_id=run_id)
                 try:
-                    result = await self._gateway.generate_structured(
+                    result = await self._timed_model_request(
                         adapter_type=binding.adapter_type,
                         base_url=binding.base_url,
                         api_key=api_key,
@@ -508,7 +509,7 @@ class EvidenceExtractorService:
                 compact_fallback = True
                 truncated = len(selected_text) < len(page.clean_text)
                 try:
-                    result = await self._gateway.generate_structured(
+                    result = await self._timed_model_request(
                         adapter_type=binding.adapter_type,
                         base_url=binding.base_url,
                         api_key=api_key,
@@ -555,7 +556,7 @@ class EvidenceExtractorService:
             )
             repair_request = _schema_repair_request(repair_base, exc)
             try:
-                repair_result = await self._gateway.generate_structured(
+                repair_result = await self._timed_model_request(
                     adapter_type=binding.adapter_type,
                     base_url=binding.base_url,
                     api_key=api_key,
@@ -626,7 +627,7 @@ class EvidenceExtractorService:
             # a valid empty EvidenceBatch must not be converted into a model
             # failure merely because the focused retry is malformed.
             try:
-                rescue_result = await self._gateway.generate_structured(
+                rescue_result = await self._timed_model_request(
                     adapter_type=binding.adapter_type,
                     base_url=binding.base_url,
                     api_key=api_key,
@@ -648,18 +649,21 @@ class EvidenceExtractorService:
                 if rescue_batch.items:
                     batch = rescue_batch
 
-        scored = self._score_batch(
-            batch,
-            page=page,
-            dimension_criteria=dimension_criteria,
-            reliability=source_reliability(page.final_url, text=page.clean_text, title=page.title),
-            input_quality_enabled=get_settings().evidence_input_quality_enabled,
-        )
-        scored, localized_counts = _attach_canonical_spans(
-            scored,
-            document=document,
-            windows=selected_windows,
-        )
+        with stage_timer("evidence.local_validation", run_id=run_id):
+            scored = self._score_batch(
+                batch,
+                page=page,
+                dimension_criteria=dimension_criteria,
+                reliability=source_reliability(
+                    page.final_url, text=page.clean_text, title=page.title
+                ),
+                input_quality_enabled=get_settings().evidence_input_quality_enabled,
+            )
+            scored, localized_counts = _attach_canonical_spans(
+                scored,
+                document=document,
+                windows=selected_windows,
+            )
         if (
             self._extraction_cache is not None
             and binding.extraction_cache_enabled
@@ -823,6 +827,14 @@ class EvidenceExtractorService:
                 )
             )
         return scored
+
+    async def _timed_model_request(self, **kwargs: Any) -> Any:
+        request = kwargs["request"]
+        return await timed_call(
+            "llm.evidence_request",
+            self._gateway.generate_structured(**kwargs),
+            run_id=request.metadata.get("run_id"),
+        )
 
     @staticmethod
     def _cache_key(
