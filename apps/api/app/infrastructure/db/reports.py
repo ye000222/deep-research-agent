@@ -513,6 +513,7 @@ class ReportRepository:
                 ),
                 worker_task_id,
             )
+            stop_reason = _canonical_research_stop_reason(run)
             now = datetime.now(UTC)
             run.status = RunStatus.FAILED.value
             run.phase = RunPhase.TERMINAL.value
@@ -524,19 +525,51 @@ class ReportRepository:
             run.updated_at = now
             run.state_version += 1
             usage = dict(run.usage_snapshot)
+            if stop_reason is not None:
+                usage["research_stop_reason"] = stop_reason
+                run.usage_snapshot = usage
             searches = int(usage.get("searches", 0) or 0)
             pages = int(usage.get("pages", 0) or 0)
             search_failures = int(usage.get("search_provider_failures", 0) or 0)
             extraction_failures = int(usage.get("evidence_extraction_failures", 0) or 0)
-            if search_failures and pages == 0 and (searches == 0 or search_failures >= searches):
+            event_counts = dict(
+                (
+                    await session.execute(
+                        select(AgentEventRow.event_type, func.count())
+                        .where(
+                            AgentEventRow.run_id == run_id,
+                            AgentEventRow.event_type.in_(
+                                (
+                                    "source.readable",
+                                    "evidence.extraction_started",
+                                    "evidence.extracted",
+                                )
+                            ),
+                        )
+                        .group_by(AgentEventRow.event_type)
+                    )
+                ).all()
+            )
+            readable = int(event_counts.get("source.readable", 0))
+            started = int(event_counts.get("evidence.extraction_started", 0))
+            completed = int(event_counts.get("evidence.extracted", 0))
+            if readable or started or pages or completed:
+                if completed or pages:
+                    detail_code = "EVIDENCE_VALIDATION_EMPTY"
+                    cause = "no_candidate_passed_provenance_validation"
+                else:
+                    detail_code = "EVIDENCE_EXTRACTION_NOT_COMPLETED"
+                    cause = "readable_source_without_completed_extraction"
+                if (
+                    extraction_failures
+                    and not completed
+                    and (not pages or extraction_failures >= pages)
+                ):
+                    detail_code = "EVIDENCE_EXTRACTION_UNAVAILABLE"
+                    cause = "model_extraction_unavailable"
+            elif search_failures and (searches == 0 or search_failures >= searches):
                 detail_code = "SEARCH_PROVIDER_EXHAUSTED"
                 cause = "search_provider_unavailable"
-            elif pages and extraction_failures >= pages:
-                detail_code = "EVIDENCE_EXTRACTION_UNAVAILABLE"
-                cause = "model_extraction_unavailable"
-            elif pages:
-                detail_code = "EVIDENCE_VALIDATION_EMPTY"
-                cause = "no_candidate_passed_provenance_validation"
             else:
                 detail_code = "NO_READABLE_SOURCE"
                 cause = "no_readable_source"
@@ -550,6 +583,7 @@ class ReportRepository:
                     "detail_code": detail_code,
                     "failure_stage": "evidence_evaluation",
                     "failure_cause": cause,
+                    "research_stop_reason": stop_reason,
                 },
                 metrics={
                     "searches": searches,
@@ -558,6 +592,9 @@ class ReportRepository:
                     "page_read_failures": int(usage.get("page_read_failures", 0) or 0),
                     "evidence_extraction_failures": extraction_failures,
                     "accepted_evidence": 0,
+                    "readable_sources": readable,
+                    "extraction_started": started,
+                    "extraction_completed": completed,
                 },
             )
 

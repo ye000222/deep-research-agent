@@ -1301,6 +1301,7 @@ class ResearchLoopService:
                 question_id=target.question_id,
                 node="evidence_extractor",
                 attempt_id=attempt_id,
+                minimum_call_tokens=minimum_call.total_tokens,
                 max_output=min(model_budget.max_call_tokens // 4, 4_000),
                 estimated_input=(
                     model_budget.max_call_tokens - min(model_budget.max_call_tokens // 4, 4_000)

@@ -1296,6 +1296,7 @@ class ResearchToolRepository:
         estimated_input: int,
         max_output: int,
         lease_until: datetime | None = None,
+        minimum_call_tokens: int | None = None,
     ) -> ModelTokenReservation:
         """Atomically reserve tokens for one provider attempt before it starts.
 
@@ -1386,6 +1387,101 @@ class ResearchToolRepository:
                     if isinstance(question_limits, dict)
                     else 0
                 )
+                # Coordinate the fixed plan target with the same affordable-seat
+                # allocator used by evidence_model_budget(). A plan may contain
+                # more questions than the research pool can fund in one pass.
+                # Do not make its equal-share target an impossible first call.
+                # This is one opportunity, not a repeatable recovery exception:
+                # even uncertain/released attempts prevent granting it again.
+                if (
+                    node == "evidence_extractor"
+                    and question_limit > 0
+                    and minimum_call_tokens is not None
+                    and minimum_call_tokens > 0
+                    and minimum_call_tokens
+                    <= min(
+                        _MAX_EVIDENCE_MODEL_CALL_TOKENS,
+                        _as_int(
+                            run.budget_snapshot.get(
+                                "max_evidence_call_tokens", _MAX_EVIDENCE_MODEL_CALL_TOKENS
+                            )
+                        ),
+                    )
+                    and requested > question_limit
+                ):
+                    prior_calls = await session.scalar(
+                        select(func.count(ModelBudgetReservationRow.id)).where(
+                            ModelBudgetReservationRow.run_id == run_id,
+                            ModelBudgetReservationRow.question_id == question_id[:50],
+                        )
+                    )
+                    readable = await session.scalar(
+                        select(AgentEventRow.run_seq)
+                        .where(
+                            AgentEventRow.run_id == run_id,
+                            AgentEventRow.event_type == "source.readable",
+                            AgentEventRow.refs["question_id"].as_string() == question_id,
+                        )
+                        .limit(1)
+                    )
+                    if not prior_calls and readable is not None:
+                        pending = int(
+                            await session.scalar(
+                                select(func.count(ResearchPlanItemRow.id)).where(
+                                    ResearchPlanItemRow.run_id == run_id,
+                                    ResearchPlanItemRow.plan_version == run.plan_version,
+                                    ResearchPlanItemRow.status.in_(
+                                        (
+                                            "pending",
+                                            "active",
+                                            "blocked",
+                                            "partial",
+                                            "technical_retry",
+                                        )
+                                    ),
+                                )
+                            )
+                            or 0
+                        )
+                        research_available = (
+                            min(
+                                available - protected_reserve,
+                                max(0, pool_limit - pool_committed[pool_name]),
+                            )
+                            if pool_limit > 0
+                            else available - protected_reserve
+                        )
+                        fair = allocate_research_call(
+                            available=research_available,
+                            eligible_questions=pending,
+                            other_unattempted=0,
+                            current_attempts=0,
+                            minimum_call=minimum_call_tokens,
+                            maximum_call=min(
+                                _MAX_EVIDENCE_MODEL_CALL_TOKENS,
+                                _as_int(
+                                    run.budget_snapshot.get(
+                                        "max_evidence_call_tokens", _MAX_EVIDENCE_MODEL_CALL_TOKENS
+                                    )
+                                ),
+                            ),
+                        )
+                        if fair.outcome == "execute" and requested <= fair.call_tokens:
+                            await self._append_event(
+                                session,
+                                run,
+                                event_type="budget.question_first_pass_allocated",
+                                public_summary="首次证据抽取按可负担公平额度预留; 全局预算不变。",
+                                refs={"question_id": question_id},
+                                metrics={
+                                    "planned_target_tokens": question_limit,
+                                    "first_call_limit_tokens": fair.call_tokens,
+                                    "future_question_reserve_tokens": fair.future_reserve,
+                                    "minimum_call_tokens": minimum_call_tokens,
+                                },
+                            )
+                            borrowed_question_tokens = requested - question_limit
+                            question_limit = fair.call_tokens
                 if question_limit > 0:
                     question_spend = int(
                         await session.scalar(
@@ -9044,18 +9140,9 @@ class ResearchToolRepository:
                 session,
                 run,
                 event_type="report.writing_started",
-                public_summary=(
-                    _budget_stop_summary(stop_reason)
-                    if stop_reason is not None and stop_reason.endswith("_budget_exhausted")
-                    else (
-                        "连续两轮边际信息增益过低且无关键缺口; 停止扩展并进入写作。"
-                        if stop_reason == "stagnation"
-                        else (
-                            "计划已遍历但仍有未满足的验收条件; 使用现有证据生成带限制报告。"
-                            if stop_reason in {"sources_exhausted", "source_space_exhausted"}
-                            else "全部质量门已满足; 自动进入报告写作。"
-                        )
-                    )
+                public_summary=_writing_start_summary(
+                    stop_reason,
+                    accepted_evidence=int(run.usage_snapshot.get("accepted_evidence", 0) or 0),
                 ),
                 refs={"reason": run.termination_reason},
             )
@@ -9878,6 +9965,21 @@ def _deadline_at(run: ResearchRunRow) -> datetime | None:
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=UTC)
     return started_at + timedelta(seconds=maximum)
+
+
+def _writing_start_summary(reason: str | None, *, accepted_evidence: int) -> str:
+    if reason == "quality_met" and accepted_evidence > 0:
+        return "全部质量门已满足; 自动进入报告写作。"
+    if reason == "deadline_exhausted" or (reason and reason.endswith("_budget_exhausted")):
+        if accepted_evidence <= 0:
+            return (
+                _budget_stop_summary(reason).split(";", 1)[0]
+                + "; 尚无有效证据, 进入收尾检查, 不保证生成报告。"
+            )
+        return _budget_stop_summary(reason)
+    if reason == "stagnation":
+        return "连续两轮边际信息增益过低且无关键缺口; 停止扩展并进入写作。"
+    return "研究已停止扩展; 检查现有证据与未满足条件, 不能据此宣称质量门通过。"
 
 
 def _budget_stop_summary(reason: str) -> str:
