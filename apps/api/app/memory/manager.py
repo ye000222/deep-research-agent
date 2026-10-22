@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.stage_timing import stage_timer
@@ -25,9 +27,23 @@ from app.infrastructure.db.research_models import ResearchEvidenceRow
 from app.infrastructure.db.run_models import ResearchRunRow
 from app.retrieval.models import MemorySearchDocumentRow
 from app.retrieval.normalization import normalize_text, reciprocal_rank_fusion
-from app.retrieval.projections import rebuild_memory
+from app.retrieval.projections import lock_memory_owner, sync_memory_projection
 
 _WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*|[\u3400-\u9fff]")
+
+
+@asynccontextmanager
+async def _memory_transaction(
+    session: AsyncSession,
+    *,
+    run_id: UUID | None = None,
+) -> AsyncIterator[None]:
+    async with session.begin() as transaction:
+        yield
+        # Explicit commit inside the context preserves SQLAlchemy rollback on
+        # body/commit failure while measuring the actual commit boundary.
+        with stage_timer("memory.transaction.commit", run_id=run_id):
+            await transaction.commit()
 
 
 class ResearchMemoryManager:
@@ -43,21 +59,15 @@ class ResearchMemoryManager:
         node_name: str,
     ) -> None:
         now = datetime.now(UTC)
-        async with self._sessions() as session, session.begin():
+        async with self._sessions() as session, _memory_transaction(session, run_id=state.run_id):
             run = await session.get(ResearchRunRow, state.run_id)
             if run is None:
                 return
-            await session.execute(
-                update(MemoryItemRow)
-                .where(
-                    MemoryItemRow.origin_run_id == state.run_id,
-                    MemoryItemRow.memory_type == MemoryType.WORKING.value,
-                    MemoryItemRow.status == MemoryStatus.ACTIVE.value,
-                )
-                .values(status=MemoryStatus.SUPERSEDED.value, updated_at=now)
-            )
+            with stage_timer("memory.capture.owner_lock", run_id=state.run_id):
+                await lock_memory_owner(session, run.owner_hash)
+            changed_ids: set[UUID] = set()
             working_summary = _working_summary(state)
-            await self._insert_if_absent(
+            working_id = await self._insert_if_absent(
                 session,
                 run=run,
                 memory_type=MemoryType.WORKING,
@@ -68,8 +78,25 @@ class ResearchMemoryManager:
                 fingerprint=_fingerprint(f"working:{state.state_version}:{working_summary}"),
                 now=now,
             )
+            if working_id is not None:
+                changed_ids.add(working_id)
+                superseded = await session.execute(
+                    update(MemoryItemRow)
+                    .where(
+                        MemoryItemRow.owner_hash == run.owner_hash,
+                        MemoryItemRow.origin_run_id == state.run_id,
+                        MemoryItemRow.memory_type == MemoryType.WORKING.value,
+                        MemoryItemRow.status == MemoryStatus.ACTIVE.value,
+                        MemoryItemRow.id != working_id,
+                    )
+                    .values(status=MemoryStatus.SUPERSEDED.value, updated_at=now)
+                    .returning(MemoryItemRow.id)
+                )
+                changed_ids.update(superseded.scalars())
+            # Repeated capture of the same state must not supersede its only
+            # working memory and then refuse to reinsert the same fingerprint.
             episode = _episodic_summary(state, node_name=node_name)
-            await self._insert_if_absent(
+            episode_id = await self._insert_if_absent(
                 session,
                 run=run,
                 memory_type=MemoryType.EPISODIC,
@@ -80,6 +107,8 @@ class ResearchMemoryManager:
                 fingerprint=_fingerprint(f"episodic:{node_name}:{state.state_version}"),
                 now=now,
             )
+            if episode_id is not None:
+                changed_ids.add(episode_id)
             evidence_rows = (
                 await session.scalars(
                     select(ResearchEvidenceRow).where(
@@ -89,7 +118,7 @@ class ResearchMemoryManager:
                 )
             ).all()
             for evidence in evidence_rows:
-                await self._insert_if_absent(
+                memory_id = await self._insert_if_absent(
                     session,
                     run=run,
                     memory_type=MemoryType.SEMANTIC,
@@ -104,10 +133,17 @@ class ResearchMemoryManager:
                     fingerprint=_fingerprint(f"semantic:evidence:{evidence.id}"),
                     now=now,
                 )
-            # Keep the searchable projection transactionally aligned with memory facts.
-            await session.flush()
-            with stage_timer("memory.rebuild_projection", run_id=state.run_id):
-                await rebuild_memory(session, owner_hash=run.owner_hash)
+                if memory_id is not None:
+                    changed_ids.add(memory_id)
+            with stage_timer("memory.transaction.flush", run_id=state.run_id):
+                await session.flush()
+            # Facts and just their dirty projections commit/rollback together.
+            await sync_memory_projection(
+                session,
+                owner_hash=run.owner_hash,
+                changed_ids=changed_ids,
+                run_id=state.run_id,
+            )
 
     async def retrieve_for_run(
         self,
@@ -220,31 +256,56 @@ class ResearchMemoryManager:
         """Expire stale memory and forget low-value unused items."""
         current = now or datetime.now(UTC)
         decay_cutoff = current - timedelta(days=30)
-        async with self._sessions() as session, session.begin():
-            stale_result = await session.execute(
-                update(MemoryItemRow)
-                .where(
-                    MemoryItemRow.status == MemoryStatus.ACTIVE.value,
-                    MemoryItemRow.expires_at.is_not(None),
-                    MemoryItemRow.expires_at <= current,
+        stale_filter = (
+            MemoryItemRow.status == MemoryStatus.ACTIVE.value,
+            MemoryItemRow.expires_at.is_not(None),
+            MemoryItemRow.expires_at <= current,
+        )
+        forgotten_filter = (
+            MemoryItemRow.status == MemoryStatus.ACTIVE.value,
+            MemoryItemRow.memory_type != MemoryType.WORKING.value,
+            MemoryItemRow.importance < 0.35,
+            MemoryItemRow.access_count == 0,
+            MemoryItemRow.updated_at < decay_cutoff,
+        )
+        async with self._sessions() as session, _memory_transaction(session):
+            # Lifecycle maintenance may scan for eligible facts; normal capture
+            # does not. Lock owners in stable order *before* modifying facts.
+            owners = (
+                await session.scalars(
+                    select(MemoryItemRow.owner_hash)
+                    .where(
+                        or_(
+                            and_(*stale_filter),
+                            and_(*forgotten_filter),
+                        )
+                    )
+                    .distinct()
+                    .order_by(MemoryItemRow.owner_hash)
                 )
-                .values(status=MemoryStatus.STALE.value, updated_at=current)
-            )
-            forgotten_result = await session.execute(
-                update(MemoryItemRow)
-                .where(
-                    MemoryItemRow.status == MemoryStatus.ACTIVE.value,
-                    MemoryItemRow.memory_type != MemoryType.WORKING.value,
-                    MemoryItemRow.importance < 0.35,
-                    MemoryItemRow.access_count == 0,
-                    MemoryItemRow.updated_at < decay_cutoff,
-                )
-                .values(status=MemoryStatus.FORGOTTEN.value, updated_at=current)
-            )
-            return {
-                "stale": _affected_rows(stale_result),
-                "forgotten": _affected_rows(forgotten_result),
-            }
+            ).all()
+            counts = {"stale": 0, "forgotten": 0}
+            for owner in owners:
+                await lock_memory_owner(session, owner)
+                changed_ids = set()
+                for name, filters, status in (
+                    ("stale", stale_filter, MemoryStatus.STALE.value),
+                    ("forgotten", forgotten_filter, MemoryStatus.FORGOTTEN.value),
+                ):
+                    result = await session.execute(
+                        update(MemoryItemRow)
+                        .where(
+                            MemoryItemRow.owner_hash == owner,
+                            *filters,
+                        )
+                        .values(status=status, updated_at=current)
+                        .returning(MemoryItemRow.id)
+                    )
+                    ids = result.scalars().all()
+                    counts[name] += len(ids)
+                    changed_ids.update(ids)
+                await sync_memory_projection(session, owner_hash=owner, changed_ids=changed_ids)
+            return counts
 
     async def list_items(self, owner_hash: str, run_id: UUID) -> list[MemoryItemView]:
         async with self._sessions() as session:
@@ -309,19 +370,21 @@ class ResearchMemoryManager:
         importance: float,
         fingerprint: str,
         now: datetime,
-    ) -> None:
+    ) -> UUID | None:
         existing = await session.scalar(
             select(MemoryItemRow.id).where(
                 MemoryItemRow.origin_run_id == run.id,
+                MemoryItemRow.owner_hash == run.owner_hash,
                 MemoryItemRow.memory_type == memory_type.value,
                 MemoryItemRow.fingerprint == fingerprint,
             )
         )
         if existing is not None:
-            return
+            return None
+        memory_id = uuid7()
         session.add(
             MemoryItemRow(
-                id=uuid7(),
+                id=memory_id,
                 origin_run_id=run.id,
                 owner_hash=run.owner_hash,
                 scope_type="run",
@@ -341,6 +404,7 @@ class ResearchMemoryManager:
                 updated_at=now,
             )
         )
+        return memory_id
 
     @staticmethod
     def _item_view(row: MemoryItemRow, *, current_run_id: UUID) -> MemoryItemView:
@@ -399,11 +463,6 @@ def _state_refs(state: ResearchState) -> list[str]:
 
 def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _affected_rows(result: object) -> int:
-    rowcount = getattr(result, "rowcount", 0)
-    return rowcount if isinstance(rowcount, int) else 0
 
 
 def _terms(value: str) -> set[str]:
