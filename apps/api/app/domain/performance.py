@@ -8,6 +8,8 @@ from app.domain.research_runs import ResearchRunView
 def summarize_performance(
     run: ResearchRunView,
     calls: list[dict[str, object]],
+    *,
+    accepted_evidence_count: int | None = None,
 ) -> dict[str, object]:
     def number(value: object) -> int:
         return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
@@ -29,6 +31,11 @@ def summarize_performance(
             retry_tokens += total
         model_latency += number(call.get("latency_ms"))
     ended = run.finished_at or datetime.now(UTC)
+    created_at = run.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=UTC)
     latency_samples = sorted(
         number(call.get("latency_ms")) for call in calls if number(call.get("latency_ms")) > 0
     )
@@ -52,16 +59,16 @@ def summarize_performance(
     logical_queries = number(usage.get("logical_queries", usage.get("searches", 0)))
     provider_requests = number(usage.get("search_provider_requests", 0))
     healthy_provider_responses = number(usage.get("search_provider_healthy_responses", 0))
-    productive_provider_responses = number(
-        usage.get("search_provider_productive_responses", 0)
-    )
-    unresponsive_provider_responses = number(
-        usage.get("search_provider_unresponsive_responses", 0)
-    )
+    productive_provider_responses = number(usage.get("search_provider_productive_responses", 0))
+    unresponsive_provider_responses = number(usage.get("search_provider_unresponsive_responses", 0))
     zero_yield = number(usage.get("zero_yield_pages", 0))
-    accepted_evidence = number(usage.get("accepted_evidence", 0))
+    accepted_evidence = number(
+        accepted_evidence_count
+        if accepted_evidence_count is not None
+        else run.quality_snapshot.get("accepted_evidence", 0)
+    )
     quality = run.quality_snapshot
-    elapsed_ms = max(0, int((ended - run.created_at).total_seconds() * 1000))
+    elapsed_ms = max(0, int((ended - created_at).total_seconds() * 1000))
     elapsed_samples = usage.get("completion_elapsed_samples_ms", [])
     if not isinstance(elapsed_samples, list) or not elapsed_samples:
         elapsed_samples = [elapsed_ms]

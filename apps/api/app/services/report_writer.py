@@ -6,16 +6,26 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, ValidationError
 
-from app.context.manager import ContextBudgetInsufficientError, ContextBudgetManager
+from app.context.manager import (
+    ContextBudgetInsufficientError,
+    ContextBudgetManager,
+    allocate_budget,
+)
 from app.core.stage_timing import stage_timer, timed_call
 from app.domain.context import ContextCandidate, ContextEnvelope, ContextItemType
+from app.domain.event_coverage import (
+    MISSING_EVENT_TEXT,
+    event_types,
+    project_event_coverage,
+    temporal_support,
+)
 from app.domain.providers import CanonicalModelRequest, ContentPart, TokenUsage, UsageAccuracy
 from app.domain.research_budget import estimate_writer_reserve_tokens
 from app.evaluation.report_verifier import verify_citation_integrity, verify_evidence_support
@@ -30,6 +40,7 @@ from app.infrastructure.db.reports import (
 from app.infrastructure.db.run_providers import RunProviderBindingRepository
 from app.llm.adapters import LLMGateway, ModelGatewayError
 from app.security.secrets import SecretCipher
+from app.services.writer_context import compact_json, pack_writer_context
 
 _MAX_WRITER_EVIDENCE = 20
 _MAX_QUOTE_CHARS = 900
@@ -57,6 +68,46 @@ WRITER_INSTRUCTIONS = """你是 Deep Research Agent 的报告 Writer。
 不要自己生成 [1] 等引用编号,系统会把 Evidence ID 映射为稳定引用。
 避免夸大因果关系;证据不足、单一来源、预算耗尽或定义不一致必须写入 limitations。
 输出中文、结构清晰、适合 Markdown 报告,并严格满足 JSON Schema。"""
+WRITER_INSTRUCTIONS += (
+    "\ncoverage_targets 必须分别回答; section.question_id 使用 target_id。"
+    "事件不可互相替代。缺失节点写入 limitations; 无年份的月日不能作为完整历史日期。"
+)
+
+
+@dataclass(slots=True)
+class WriterAttempt:
+    gateway_dispatched: bool = False
+    response_received: bool = False
+    usage: TokenUsage | None = None
+    input_evidence_ids: set[str] = field(default_factory=set)
+    packing: dict[str, Any] = field(default_factory=dict)
+
+
+class WriterStageError(RuntimeError):
+    pass
+
+
+def _writer_failure(exc: Exception, attempt: WriterAttempt) -> tuple[str, str]:
+    if isinstance(exc, ContextBudgetInsufficientError):
+        return "WRITER_CONTEXT_BUDGET_INSUFFICIENT", str(exc)
+    if isinstance(exc, WriterStageError):
+        return "WRITER_OUTPUT_EMPTY", "empty_provider_output"
+    if not attempt.gateway_dispatched:
+        return "WRITER_CALL_NOT_DISPATCHED", type(exc).__name__
+    if isinstance(exc, ModelGatewayError):
+        length = _safe_int(exc.diagnostics.get("response_length", 0))
+        if exc.code == "UNSUPPORTED_ADAPTER":
+            return "WRITER_CALL_NOT_DISPATCHED", exc.code
+        if "PARSE_EMPTY" in (exc.detail_code or ""):
+            return "WRITER_OUTPUT_EMPTY", exc.code
+        if length > 0 and ("OUTPUT" in exc.code or "PARSE_" in (exc.detail_code or "")):
+            return "WRITER_SCHEMA_INVALID", exc.code
+        return "WRITER_PROVIDER_ERROR", exc.code
+    if isinstance(exc, ValidationError) and attempt.response_received:
+        return "WRITER_SCHEMA_INVALID", "returned_content_failed_schema"
+    return "WRITER_PROVIDER_ERROR", "timeout_outcome_unknown" if isinstance(
+        exc, TimeoutError
+    ) else type(exc).__name__
 
 
 class DraftParagraph(BaseModel):
@@ -82,7 +133,7 @@ class AssembledReport:
     title: str
     final_markdown: str
     limitations: list[str]
-    verification_result: dict[str, float | int | bool | list[int]]
+    verification_result: dict[str, Any]
     sections: list[PersistedSection]
     citations: list[PersistedCitation]
 
@@ -116,6 +167,8 @@ class ReportWriterService:
         draft: ReportDraft | None = None
         usage: TokenUsage | None = None
         fallback_reason: str | None = None
+        fallback_detail: str | None = None
+        attempt = WriterAttempt()
         draft_cache_hit = False
         cache_key: dict[str, str] | None = None
         if (
@@ -130,7 +183,7 @@ class ReportWriterService:
             if cached_draft is not None:
                 try:
                     cached_candidate = ReportDraft.model_validate(cached_draft)
-                    if _draft_rejection_reason(cached_candidate, selected) is None:
+                    if _draft_rejection_reason(cached_candidate, selected, context=context) is None:
                         draft = cached_candidate
                         draft_cache_hit = True
                 except ValidationError:
@@ -160,6 +213,7 @@ class ReportWriterService:
                                 context,
                                 selected,
                                 max_total_tokens=writer_limit,
+                                attempt=attempt,
                             ),
                             timeout=_context_deadline_remaining(context),
                         )
@@ -172,7 +226,13 @@ class ReportWriterService:
                                 actual_total=usage.total_tokens,
                                 usage_estimated=usage.accuracy != UsageAccuracy.EXACT,
                             )
-                        fallback_reason = _draft_rejection_reason(candidate, selected)
+                        dispatched_cards = [
+                            c for c in selected if str(c.evidence_id) in attempt.input_evidence_ids
+                        ]
+                        fallback_detail = _draft_rejection_reason(
+                            candidate, dispatched_cards, context=context
+                        )
+                        fallback_reason = "WRITER_VALIDATION_FAILED" if fallback_detail else None
                         if fallback_reason is None:
                             draft = candidate
                             if cache_key is not None and self._draft_cache is not None:
@@ -181,23 +241,37 @@ class ReportWriterService:
                                     **cache_key,
                                     draft=draft.model_dump(mode="json"),
                                 )
-                    except ContextBudgetInsufficientError:
+                    except (
+                        ContextBudgetInsufficientError,
+                        ModelGatewayError,
+                        ValidationError,
+                        TimeoutError,
+                        WriterStageError,
+                        LookupError,
+                        ValueError,
+                    ) as exc:
+                        if isinstance(exc, ModelGatewayError) and (
+                            exc.usage is not None or "response_length" in exc.diagnostics
+                        ):
+                            attempt.response_received = True
                         if reservation is not None and self._budget_repository is not None:
-                            await self._budget_repository.release_model_reservation(
-                                run_id,
-                                worker_task_id=worker_task_id,
-                                attempt_id=reservation_id,
+                            known_usage = (
+                                exc.usage if isinstance(exc, ModelGatewayError) else attempt.usage
                             )
-                        fallback_reason = "WRITER_SCHEMA_INVALID"
-                    except (ModelGatewayError, ValidationError, TimeoutError) as exc:
-                        if reservation is not None and self._budget_repository is not None:
-                            if isinstance(exc, ModelGatewayError) and exc.usage is not None:
+                            if known_usage is not None:
+                                usage = known_usage
                                 await self._budget_repository.settle_model_reservation(
                                     run_id,
                                     worker_task_id=worker_task_id,
                                     attempt_id=reservation_id,
-                                    actual_total=exc.usage.total_tokens,
-                                    usage_estimated=exc.usage.accuracy != UsageAccuracy.EXACT,
+                                    actual_total=known_usage.total_tokens,
+                                    usage_estimated=known_usage.accuracy != UsageAccuracy.EXACT,
+                                )
+                            elif not attempt.gateway_dispatched:
+                                await self._budget_repository.release_model_reservation(
+                                    run_id,
+                                    worker_task_id=worker_task_id,
+                                    attempt_id=reservation_id,
                                 )
                             else:
                                 await self._budget_repository.mark_model_reservation_uncertain(
@@ -205,14 +279,8 @@ class ReportWriterService:
                                     worker_task_id=worker_task_id,
                                     attempt_id=reservation_id,
                                 )
-                        fallback_reason = (
-                            exc.code
-                            if isinstance(exc, ModelGatewayError)
-                            else "DEADLINE_EXHAUSTED"
-                            if isinstance(exc, TimeoutError)
-                            else "WRITER_SCHEMA_INVALID"
-                        )
-        else:
+                        fallback_reason, fallback_detail = _writer_failure(exc, attempt)
+        elif draft is None:
             fallback_reason = "WRITER_SKIPPED_RESEARCH_BUDGET_EXHAUSTED"
 
         with stage_timer("report.assemble_and_verify", run_id=run_id):
@@ -222,10 +290,30 @@ class ReportWriterService:
                 draft=draft,
                 fallback_reason=fallback_reason,
             )
+        assembled.verification_result["writer"] = {
+            "gateway_dispatched": attempt.gateway_dispatched,
+            "response_received": attempt.response_received,
+            "dispatch_status": (
+                "RESPONSE_RECEIVED"
+                if attempt.response_received
+                else "GATEWAY_DISPATCHED_OUTCOME_UNKNOWN"
+                if attempt.gateway_dispatched
+                else "NOT_DISPATCHED"
+            ),
+            "fallback_reason": fallback_reason,
+            "fallback_detail": fallback_detail,
+            "fallback_type": "evidence_template" if fallback_reason else None,
+            "cache_hit": draft_cache_hit,
+            "context_packing": attempt.packing,
+        }
         # The report may contain implementation-level notes (for example a
         # Writer schema fallback) even when the research quality gate was met.
         # Those notes must not downgrade an otherwise complete research run.
-        completed_with_limitations = _research_completion_has_limitations(context)
+        completed_with_limitations = (
+            _research_completion_has_limitations(context)
+            or not assembled.verification_result.get("event_coverage", {}).get("complete", True)
+            or not assembled.verification_result["verified"]
+        )
         report = await timed_call(
             "report.persistence",
             self._repository.save(
@@ -257,7 +345,9 @@ class ReportWriterService:
         evidence: list[ReportEvidenceCard],
         *,
         max_total_tokens: int | None = None,
+        attempt: WriterAttempt | None = None,
     ) -> tuple[ReportDraft, TokenUsage]:
+        attempt = attempt or WriterAttempt()
         binding = await self._bindings.get(context.run_id)
         api_key = self._cipher.decrypt(
             binding.encrypted_secret,
@@ -265,47 +355,34 @@ class ReportWriterService:
             adapter_type=binding.adapter_type.value,
             credential_version=binding.credential_version,
         )
-        task_payload = {
-            "goal": context.goal,
-            "questions": [
-                {
-                    "question_id": question.question_id,
-                    "question": question.question,
-                    "priority": question.priority,
-                }
-                for question in context.questions
-            ],
-            "quality_snapshot": context.quality_snapshot,
-            "stop_reason": context.stop_reason,
-        }
-        evidence_payloads = {
-            str(card.evidence_id): {
-                "evidence_id": str(card.evidence_id),
-                "question_id": card.question_id,
-                "claim": card.claim,
-                "exact_quote": card.exact_quote[:_MAX_QUOTE_CHARS],
-                "source_title": card.source_title,
-                "source_domain": card.source_domain,
-                "evidence_score": card.evidence_score,
-                "analysis": (
-                    {
-                        "analysis_artifact_id": str(card.analysis_artifact_id),
-                        "operation": card.analysis_operation,
-                        "formula": card.analysis_formula,
-                        "result": card.analysis_result,
-                    }
-                    if card.analysis_artifact_id is not None
-                    else None
-                ),
-            }
-            for card in evidence
-        }
-        selected_ids = set(evidence_payloads)
         output_tokens = min(5000, binding.max_output_tokens or 5000)
         input_token_cap: int | None = None
         if max_total_tokens is not None:
             output_tokens = min(output_tokens, _writer_output_reserve(max_total_tokens))
-            input_token_cap = max(512, max_total_tokens - output_tokens - 512)
+            input_token_cap = max_total_tokens - output_tokens - 512
+        allocation = allocate_budget(
+            context_window=binding.context_window,
+            requested_output_tokens=output_tokens,
+            provider_max_output_tokens=binding.max_output_tokens,
+            max_input_tokens=input_token_cap,
+        )
+        payload = pack_writer_context(
+            context,
+            evidence,
+            instructions=WRITER_INSTRUCTIONS,
+            schema=ReportDraft.model_json_schema(),
+            input_budget=allocation.input_budget,
+        )
+        evidence_payloads = {c["evidence_id"]: c for c in payload["evidence_cards"]}
+        attempt.input_evidence_ids = set(evidence_payloads)
+        attempt.packing = {
+            "input_budget": allocation.input_budget,
+            "output_reserve": output_tokens,
+            "available_cards": len(evidence),
+            "packed_cards": len(evidence_payloads),
+            "source_count": len(payload["sources"]),
+        }
+        task_payload = {k: v for k, v in payload.items() if k != "evidence_cards"}
         manifest_id = uuid4()
         if self._contexts is not None:
             envelope = await self._contexts.build(
@@ -332,16 +409,17 @@ class ReportWriterService:
                         ContextCandidate(
                             item_type=ContextItemType.EVIDENCE_CARD,
                             content=json.dumps(card, ensure_ascii=False, separators=(",", ":")),
-                            rank_score=_safe_float(card["evidence_score"]),
+                            rank_score=1.0,
                             source_ref_type="evidence",
                             source_ref_id=evidence_id,
+                            protected=True,
                             selected_reason_code="evidence_quality_rank",
                         )
                         for evidence_id, card in evidence_payloads.items()
                     ],
                     ContextCandidate(
                         item_type=ContextItemType.OUTPUT_SCHEMA,
-                        content=json.dumps(ReportDraft.model_json_schema(), ensure_ascii=False),
+                        content=compact_json(ReportDraft.model_json_schema()),
                         rank_score=1.0,
                         protected=True,
                         selected_reason_code="output_contract_required",
@@ -354,15 +432,7 @@ class ReportWriterService:
                 max_input_tokens=input_token_cap,
             )
             manifest_id = envelope.manifest_id
-            selected_ids = _selected_writer_evidence_ids(envelope)
-        payload = {
-            **task_payload,
-            "evidence_cards": [
-                evidence_payloads[str(card.evidence_id)]
-                for card in evidence
-                if str(card.evidence_id) in selected_ids
-            ],
-        }
+            _selected_writer_evidence_ids(envelope)
         request = CanonicalModelRequest(
             task_kind="report_writing",
             role="writer",
@@ -380,6 +450,7 @@ class ReportWriterService:
             context_manifest_id=manifest_id,
             metadata={"run_id": str(context.run_id), "node": "report_writer"},
         )
+        attempt.gateway_dispatched = True
         result = await timed_call(
             "llm.report_request",
             self._gateway.generate_structured(
@@ -390,6 +461,10 @@ class ReportWriterService:
             ),
             run_id=context.run_id,
         )
+        attempt.response_received = True
+        attempt.usage = result.usage
+        if result.parsed_object is None and not getattr(result, "text", None):
+            raise WriterStageError("WRITER_OUTPUT_EMPTY")
         return ReportDraft.model_validate(result.parsed_object), result.usage
 
 
@@ -439,6 +514,7 @@ def assemble_report(
     draft: ReportDraft | None,
     fallback_reason: str | None,
 ) -> AssembledReport:
+    event_coverage = project_event_coverage(context.goal, context.evidence)
     card_by_id = {str(card.evidence_id): card for card in selected}
     card_by_uuid = {card.evidence_id: card for card in selected}
     citation_numbers: dict[UUID, int] = {}
@@ -451,7 +527,7 @@ def assemble_report(
             if card is not None and card not in cards:
                 cards.append(card)
         text = _clean_paragraph(paragraph.text)
-        if not cards or not text:
+        if not cards or not text or not temporal_support(text):
             return None
         markers: list[str] = []
         for card in cards:
@@ -490,8 +566,9 @@ def assemble_report(
         summary_lines = render_many(
             [
                 DraftParagraph(text=card.claim, evidence_ids=[str(card.evidence_id)])
-                for card in top_cards[:3]
-            ]
+                for card in top_cards
+                if temporal_support(card.claim) and temporal_support(card.exact_quote)
+            ][:3]
         )
 
     persisted_sections: list[PersistedSection] = []
@@ -513,7 +590,8 @@ def assemble_report(
     )
 
     draft_sections = {section.question_id: section for section in (draft.sections if draft else [])}
-    for question in context.questions:
+    section_questions = context.questions if not event_coverage["targets"] else ()
+    for question in section_questions:
         section = draft_sections.get(question.question_id)
         lines = render_many(section.paragraphs if section else [])
         if not lines:
@@ -535,6 +613,56 @@ def assemble_report(
                 title=title,
                 markdown=section_markdown,
                 verification_result=_section_verification(lines),
+            )
+        )
+
+    # User-requested events own their sections. A source about opening may be
+    # cited for opening, but never fills a construction/completion/operation gap.
+    for target in event_coverage["targets"]:
+        ids = set(target["temporally_complete_evidence_ids"])
+        cards = [card for card in selected if str(card.evidence_id) in ids]
+        section = draft_sections.get(target["target_id"])
+        paragraphs = section.paragraphs if section else []
+        paragraphs = [
+            p
+            for p in paragraphs
+            if p.evidence_ids
+            and set(p.evidence_ids) <= ids
+            and target["target_id"] in event_types(p.text)
+        ]
+        lines = render_many(paragraphs) or render_many(
+            [
+                DraftParagraph(
+                    text=(
+                        card.claim
+                        if target["target_id"] in event_types(card.claim)
+                        else card.exact_quote
+                    ),
+                    evidence_ids=[str(card.evidence_id)],
+                )
+                for card in cards[:3]
+            ]
+        )
+        title = target["label"]
+        section_markdown = "\n\n".join(lines)
+        if target["coverage_status"] != "SUPPORTED" or not lines:
+            section_markdown = (section_markdown + "\n\n" + MISSING_EVENT_TEXT).strip()
+        verification_section = (
+            _section_verification(lines)
+            if lines
+            else {
+                "verified": True,
+                "factual_paragraphs": 0,
+            }
+        )
+        verification_section["coverage_status"] = target["coverage_status"]
+        markdown_parts.extend(["", f"## {title}", "", section_markdown])
+        persisted_sections.append(
+            PersistedSection(
+                section_key=target["target_id"],
+                title=title,
+                markdown=section_markdown,
+                verification_result=verification_section,
             )
         )
 
@@ -564,7 +692,7 @@ def assemble_report(
         for section in persisted_sections
         if section.section_key not in {"executive_summary", "limitations"}
         for line in section.markdown.split("\n\n")
-        if line.strip()
+        if line.strip() and line != MISSING_EVENT_TEXT
     ]
     numeric_lines = [line for line in factual_lines if any(char.isdigit() for char in line)]
     citation_complete = sum(bool(_CITATION_PATTERN.search(line)) for line in factual_lines)
@@ -600,6 +728,16 @@ def assemble_report(
     verification["analysis_artifact_citations"] = sum(
         citation.analysis_artifact_id is not None for citation in citations
     )
+    verification["event_coverage"] = event_coverage
+    # Full technical success is established by the repository only after the
+    # report and citations join the Run's persisted acquisition evidence.
+    verification["technical_e2e_success"] = False
+    verification["research_complete"] = (
+        bool(verification["verified"])
+        and event_coverage["complete"]
+        and _research_quality_gate_met(context.quality_snapshot)
+        and not _research_completion_has_limitations(context)
+    )
     return AssembledReport(
         title=(draft.title if draft else context.goal).strip(),
         final_markdown="\n".join(markdown_parts).strip() + "\n",
@@ -610,12 +748,14 @@ def assemble_report(
     )
 
 
-_WRITER_VERSION = "report_writer.v2"
+_WRITER_VERSION = "report_writer.v3"
 
 
 def _draft_rejection_reason(
     draft: ReportDraft,
     selected: list[ReportEvidenceCard],
+    *,
+    context: ReportContext | None = None,
 ) -> str | None:
     """Reject structurally valid Writer output that contradicts its evidence input."""
 
@@ -633,6 +773,43 @@ def _draft_rejection_reason(
     )
     if not available_ids.intersection(referenced_ids):
         return "WRITER_DRAFT_NO_VALID_EVIDENCE_REFERENCES"
+    if referenced_ids - available_ids:
+        return "WRITER_DRAFT_UNKNOWN_EVIDENCE_REFERENCES"
+    if context is not None and event_types(context.goal):
+        coverage = project_event_coverage(context.goal, selected)
+        target_ids = {
+            t["target_id"]: set(t["temporally_complete_evidence_ids"]) for t in coverage["targets"]
+        }
+        for section in draft.sections:
+            if section.question_id in target_ids and any(
+                not set(p.evidence_ids) <= target_ids[section.question_id]
+                for p in section.paragraphs
+            ):
+                return "WRITER_EVENT_BOUNDARY_MISMATCH"
+        if any(
+            not temporal_support(p.text)
+            for p in draft.executive_summary + [p for s in draft.sections for p in s.paragraphs]
+        ):
+            return "WRITER_PARTIAL_TEMPORAL_SUPPORT"
+        by_id = {str(c.evidence_id): c for c in selected}
+        for paragraph in draft.executive_summary + [
+            p for s in draft.sections for p in s.paragraphs
+        ]:
+            requested = event_types(paragraph.text) & event_types(context.goal)
+            supported = set().union(
+                *(event_types(by_id[i].exact_quote) for i in paragraph.evidence_ids)
+            )
+            if requested - supported:
+                return "WRITER_EVENT_BOUNDARY_MISMATCH"
+            years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", paragraph.text))
+            supported_years = set().union(
+                *(
+                    set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", by_id[i].exact_quote))
+                    for i in paragraph.evidence_ids
+                )
+            )
+            if years - supported_years:
+                return "WRITER_PARTIAL_TEMPORAL_SUPPORT"
 
     refusal_text = " ".join((draft.title, *draft.limitations)).casefold()
     compact_refusal = re.sub(r"[\W_]+", "", refusal_text)
@@ -669,7 +846,9 @@ def _draft_context_hash(
                 "id": str(card.evidence_id),
                 "question_id": card.question_id,
                 "claim": card.claim,
-                "quote": card.exact_quote[:_MAX_QUOTE_CHARS],
+                "quote": card.exact_quote,
+                "source_url": card.source_url,
+                "source_content_hash": card.source_content_hash,
                 "score": card.evidence_score,
             }
             for card in selected
@@ -693,9 +872,7 @@ def _writer_budget_available(context: ReportContext) -> bool:
 def _writer_token_limit(context: ReportContext) -> int:
     allocation = context.budget_snapshot.get("allocation", {})
     allocated_writer = (
-        _safe_int(allocation.get("writer_tokens_initial", 0))
-        if isinstance(allocation, dict)
-        else 0
+        _safe_int(allocation.get("writer_tokens_initial", 0)) if isinstance(allocation, dict) else 0
     )
     return allocated_writer or estimate_writer_reserve_tokens(
         question_count=len(context.questions),
@@ -725,7 +902,16 @@ def _limitations(
         items.append("部分研究问题尚未达到多来源交叉验证阈值。")
     if float(quality.get("source_quality", 0.0) or 0.0) < 0.75:
         items.append("当前来源整体质量低于目标阈值,应补充官方、政府或论文来源。")
-    if fallback_reason is not None and _research_completion_has_limitations(context):
+    projection = project_event_coverage(context.goal, context.evidence)
+    for target in projection["targets"]:
+        if target["coverage_status"] != "SUPPORTED":
+            items.append(f"{target['label']}: {MISSING_EVENT_TEXT}")
+    if any(
+        not temporal_support(card.claim) or not temporal_support(card.exact_quote)
+        for card in context.evidence
+    ):
+        items.append("部分日期缺少可追溯的年份, 未作为完整历史时间点输出。")
+    if fallback_reason is not None:
         items.append(f"Writer 使用证据模板降级生成({fallback_reason})。")
     if draft is not None:
         items.extend(_clean_paragraph(item) for item in draft.limitations if item.strip())
@@ -737,6 +923,10 @@ def _research_quality_gate_met(quality: dict[str, object]) -> bool:
 
     return (
         _safe_float(quality.get("coverage", 0.0)) >= 0.85
+        and (
+            not isinstance(quality.get("event_coverage"), dict)
+            or quality["event_coverage"].get("complete") is True
+        )
         and _safe_float(quality.get("priority_one_coverage", 0.0)) >= 0.80
         and _safe_float(quality.get("source_quality", 0.0)) >= 0.75
         and _safe_float(quality.get("cross_validation", 0.0)) >= 0.70
@@ -746,14 +936,8 @@ def _research_quality_gate_met(quality: dict[str, object]) -> bool:
             "numeric_scope_consistency" not in quality
             or _safe_float(quality.get("numeric_scope_consistency")) >= 1.0
         )
-        and (
-            "source_role_fit" not in quality
-            or _safe_float(quality.get("source_role_fit")) >= 1.0
-        )
-        and (
-            "freshness" not in quality
-            or _safe_float(quality.get("freshness")) >= 0.70
-        )
+        and ("source_role_fit" not in quality or _safe_float(quality.get("source_role_fit")) >= 1.0)
+        and ("freshness" not in quality or _safe_float(quality.get("freshness")) >= 0.70)
     )
 
 

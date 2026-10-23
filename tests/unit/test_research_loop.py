@@ -700,6 +700,15 @@ class AlwaysInvalidExtractor:
 
 
 class FakeArtifacts:
+    async def save_immutable_json(self, artifact_uri: str, value: object) -> str:
+        if not hasattr(self, "json_values"):
+            self.json_values = {}
+        self.json_values[artifact_uri] = value
+        return artifact_uri
+
+    async def read_json(self, artifact_uri: str) -> object:
+        return self.json_values[artifact_uri]
+
     async def save_page(self, run_id: object, source_id: object, text: str) -> str:
         return "runs/test/source.txt"
 

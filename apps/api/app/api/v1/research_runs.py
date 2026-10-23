@@ -209,7 +209,10 @@ async def get_performance(
 ) -> dict[str, object]:
     run = await _get_run(service, client, run_id)
     calls = await service.list_llm_calls(client.owner_hash, run_id)
-    return summarize_performance(run, calls)
+    evidence = await service.list_evidence(client.owner_hash, run_id)
+    return summarize_performance(
+        run, calls, accepted_evidence_count=sum(item.accepted for item in evidence)
+    )
 
 
 @router.get("/{run_id}/plan", response_model=ResearchPlan)

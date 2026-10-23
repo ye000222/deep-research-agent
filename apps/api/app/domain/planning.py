@@ -8,6 +8,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.domain.query_expansion import intent_gap_hints, query_intent
+
 MAX_DYNAMIC_QUESTIONS = 12
 MAX_DYNAMIC_APPEND = 3
 DEFAULT_RESEARCH_RESERVE_RATIO = 0.20
@@ -222,132 +224,63 @@ def build_gap_resolution_hints(
     *,
     rotation: int = 0,
 ) -> list[str]:
-    """Create gap-specific queries without increasing the coverage denominator.
-
-    ``rotation`` is advanced by each persisted REPLAN.  Without it, repeated
-    replans regenerate the same three hints forever, so the query-hash guard
-    correctly rejects them and the run eventually reports ``sources_exhausted``
-    despite remaining open gaps.
-    """
-
-    reason_text = " ".join(missing_reasons).casefold()
-    fallback_base = " ".join(question.question.split())[:160]
-    topic_hints: list[str] = []
-    for hint in question.search_hints:
-        compact = " ".join(hint.split())
-        compact = re.split(r"[?\uff1f]", compact, maxsplit=1)[0].strip()
-        compact = re.split(
-            r"(?:official|authoritative|independent|benchmark|comparative|survey|"
-            r"systematic)\s+(?:documentation|report|source|study|evidence|data)?|"
-            r"(?:公开报告|实证数据|标准数据集|权威报告)|"
-            r"(?:industry|market)\s+outlook|adoption\s+statistics|"
-            r"government\s+forecast\s+primary\s+data|"
-            r"independent\s+market\s+report\s+methodology|"
-            r"official\s+report\s+benchmark\s+independent\s+source|"
-            r"survey\s+comparative\s+study\s+evidence|"
-            r"systematic\s+review\s+validation\s+evidence|"
-            r"peer[- ]reviewed\s+evaluation\s+dataset|"
-            r"comparative\s+benchmark\s+results\s+study|"
-            r"industry\s+outlook\s+adoption\s+statistics|"
-            r"manufacturer\s+product(?:\s+page)?|vendor\s+solution|"
-            r"customer\s+case(?:\s+study)?|field\s+trial|evaluation\s+report|"
-            r"technical\s+specification|peer[- ]reviewed",
-            compact,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0].strip()
-        if compact and compact.casefold() not in {
-            value.casefold() for value in topic_hints
-        }:
-            topic_hints.append(compact[:160])
-    if not topic_hints:
-        topic_hints.append(fallback_base)
-    primary_base = topic_hints[0]
-    primary_is_chinese = any("\u4e00" <= char <= "\u9fff" for char in primary_base)
-    alternate_base = next(
-        (
-            hint
-            for hint in topic_hints[1:]
-            if any("\u4e00" <= char <= "\u9fff" for char in hint)
-            != primary_is_chinese
-        ),
-        min(topic_hints, key=len),
-    )
-    if "独立" in reason_text or "second" in reason_text:
-        suffix_banks = (
+    """Rotate source genres within the question's intent, never its event."""
+    hints = intent_gap_hints(question.question, rotation=max(0, rotation))
+    if query_intent(question.question) != "factual_date_event":
+        fallback_base = " ".join(question.question.split())[:160]
+        topic_hints: list[str] = []
+        for hint in question.search_hints:
+            compact = " ".join(hint.split())
+            compact = re.split(r"[?\uff1f]", compact, maxsplit=1)[0].strip()
+            compact = re.split(
+                r"(?:official|authoritative|independent|benchmark|comparative|survey|"
+                r"systematic)\s+(?:documentation|report|source|study|evidence|data)?|"
+                r"(?:公开报告|实证数据|标准数据集|权威报告)|"
+                r"(?:industry|market)\s+outlook|adoption\s+statistics|"
+                r"government\s+forecast\s+primary\s+data|"
+                r"independent\s+market\s+report\s+methodology|"
+                r"official\s+report\s+benchmark\s+independent\s+source|"
+                r"survey\s+comparative\s+study\s+evidence|"
+                r"systematic\s+review\s+validation\s+evidence|"
+                r"peer[- ]reviewed\s+evaluation\s+dataset|"
+                r"comparative\s+benchmark\s+results\s+study|"
+                r"industry\s+outlook\s+adoption\s+statistics|"
+                r"manufacturer\s+product(?:\s+page)?|vendor\s+solution|"
+                r"customer\s+case(?:\s+study)?|field\s+trial|evaluation\s+report|"
+                r"technical\s+specification|peer[- ]reviewed",
+                compact,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+            for expanded in intent_gap_hints(question.question):
+                suffix = expanded[len(" ".join(question.question.split())[:220]) + 1:]
+                compact = compact.split(suffix, 1)[0].strip()
+            if compact and compact.casefold() not in {
+                value.casefold() for value in topic_hints
+            }:
+                topic_hints.append(compact[:160])
+        if not topic_hints:
+            topic_hints.append(fallback_base)
+        primary_base = topic_hints[0]
+        primary_is_chinese = any("\u4e00" <= char <= "\u9fff" for char in primary_base)
+        alternate_base = next(
             (
-                "official report benchmark independent source",
-                "survey comparative study evidence",
-                "标准 数据集 权威报告",
+                hint
+                for hint in topic_hints[1:]
+                if any("\u4e00" <= char <= "\u9fff" for char in hint)
+                != primary_is_chinese
             ),
-            (
-                "independent market report methodology",
-                "comparative benchmark results study",
-                "独立 统计 报告 研究方法",
-            ),
-            (
-                "government forecast primary data",
-                "peer reviewed evaluation dataset",
-                "政府 预测 原始数据 评估",
-            ),
-            (
-                "industry outlook adoption statistics",
-                "systematic review validation evidence",
-                "行业 趋势 渗透率 统计",
-            ),
+            min(topic_hints, key=len),
         )
-    elif "原文" in reason_text or "网页" in reason_text or "证据" in reason_text:
-        suffix_banks = (
-            (
-                "official documentation case study",
-                "survey benchmark dataset",
-                "公开报告 实证 数据",
-            ),
-            (
-                "manufacturer product page deployment",
-                "technical specification customer case",
-                "厂商 产品页 应用案例",
-            ),
-            (
-                "official catalog application example",
-                "independent implementation report",
-                "官方 目录 落地 案例",
-            ),
-            (
-                "vendor solution datasheet industry",
-                "field trial evaluation report",
-                "供应商 方案 规格书 行业",
-            ),
-        )
-    else:
-        suffix_banks = (
-            (
-                "systematic review evidence",
-                "official report statistics",
-                "benchmark case study",
-            ),
-            (
-                "comparative evaluation results",
-                "primary source technical report",
-                "对比 评估 结果 原始报告",
-            ),
-            (
-                "deployment lessons learned",
-                "independent field evidence",
-                "落地 经验 独立 实证",
-            ),
-            (
-                "failure analysis validation",
-                "industry survey evidence",
-                "失败分析 行业调查 证据",
-            ),
-        )
-    suffixes = suffix_banks[max(0, rotation) % len(suffix_banks)]
-    bases = (primary_base, alternate_base, primary_base)
-    return [
-        f"{base} {suffix}"[:320]
-        for base, suffix in zip(bases, suffixes, strict=True)
-    ]
+        anchor = " ".join(question.question.split())[:220]
+        suffixes = [hint[len(anchor) + 1:] for hint in hints]
+        hints = [f"{base} {suffix}" for base, suffix in zip(
+            (primary_base, alternate_base, primary_base), suffixes, strict=True
+        )]
+    reason = " ".join(missing_reasons).casefold()
+    if "独立" in reason or "second" in reason or "independent" in reason:
+        hints = [f"{hint} 独立来源 independent source" for hint in hints]
+    return hints
 
 
 def append_dynamic_questions(

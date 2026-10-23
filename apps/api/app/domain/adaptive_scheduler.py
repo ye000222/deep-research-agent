@@ -9,6 +9,7 @@ from enum import StrEnum
 from urllib.parse import urlsplit
 
 from app.domain.passage_relevance import events, passage_score
+from app.domain.query_expansion import query_intent
 from app.domain.source_text_quality import assess_text_quality
 
 
@@ -197,6 +198,20 @@ def build_family_query(
         if normalized and normalized not in seen:
             unique.append(part)
             seen.add(normalized)
+    if query_intent(question) == "factual_date_event":
+        # A short alternate hint can contain only an entity. Keep the actual
+        # event/time question rather than turning recovery into generic search.
+        factual_suffix = {
+            QueryFamily.SCOPE: "日期 date",
+            QueryFamily.AUTHORITATIVE: "官方 公告 official announcement date",
+            QueryFamily.ALTERNATE: "原始报道 press release chronology date",
+            QueryFamily.CONTRADICTION: "官方 更正 澄清 correction date",
+        }[family]
+        anchor = " ".join(question.split())[:180]
+        # Preserve the Planner's bilingual entity aliases as retrieval hints.
+        # They supplement, never replace, the explicit event/time question.
+        hint = base[:90] if base and base not in anchor else ""
+        return " ".join(part for part in (hint, anchor, factual_suffix) if part)[:320]
     return " ".join(unique)[:320]
 
 

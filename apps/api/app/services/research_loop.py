@@ -41,6 +41,7 @@ from app.infrastructure.db.research_tools import (
 from app.llm.adapters import ModelGatewayError
 from app.services.evidence_extractor import EvidenceExtractorService, source_reliability
 from app.services.parallel_reads import read_page_attempts_concurrently
+from app.services.run_page_reader import RunPageReader
 from app.services.semantic_research_shadow import (
     SemanticResearchShadowPipeline,
     SemanticShadowMode,
@@ -555,10 +556,11 @@ class ResearchLoopService:
         worker_task_id: str,
         target: ResearchTarget,
         telemetry: SimpleNamespace,
+        excluded_providers: tuple[str, ...] = (),
     ) -> tuple[list[SearchResult], str]:
         """One reserved query, bounded distinct adapters sharing its HTTP allowance."""
         selector = getattr(self._repository, "select_provider_for_target", None)
-        visited: list[str] = []
+        visited: list[str] = list(excluded_providers)
         metrics = (
             "last_request_count",
             "last_timeout_count",
@@ -568,7 +570,7 @@ class ResearchLoopService:
             "last_productive_response_count",
         )
         max_adapters = min(3, len(self._search_adapters))
-        for index in range(max_adapters):
+        for index in range(max_adapters - len(visited)):
             if _deadline_expired(target):
                 raise TimeoutError
             if callable(selector):
@@ -642,7 +644,8 @@ class ResearchLoopService:
                 )  # keep existing HTTP slots for distinct fallback providers
             source = getattr(adapter, "execution_source", adapter)
             visited.append(selected)
-            fallback = index > 0 or decision.fallback_used
+            telemetry.provider_attempt_order = tuple(visited)
+            fallback = bool(excluded_providers) or index > 0 or decision.fallback_used
             error = None
             interrupted = False
             try:
@@ -679,7 +682,7 @@ class ResearchLoopService:
             if telemetry.last_request_count > target.provider_request_allowance:
                 raise RuntimeError("SEARCH_ADAPTER_EXCEEDED_REQUEST_ALLOWANCE")
             can_continue = (
-                index + 1 < max_adapters
+                len(visited) < max_adapters
                 and error is not None
                 and error.retryable
                 and telemetry.last_request_count < target.provider_request_allowance
@@ -708,11 +711,101 @@ class ResearchLoopService:
         raise AssertionError("bounded search dispatch did not terminate")
 
     async def _research_target(
+        self, run_id: UUID, *, worker_task_id: str, target: ResearchTarget,
+    ) -> ResearchAttemptResult:
+        """One durable logical opportunity; downstream ineligibility may continue it.
+
+        Reader/triage stay in the ordinary loop, never in a provider adapter.
+        Accepted evidence is deliberately NOT the continuation criterion.
+        """
+        finish = getattr(self._repository, "finish_search_opportunity", None)
+        routed = isinstance(self._search, SearXNGSearchProvider) and callable(finish)
+        if not routed:
+            return await self._research_target_once(
+                run_id, worker_task_id=worker_task_id, target=target
+            )
+        cycle = SimpleNamespace(
+            providers=(), target=target, requests=0, allowance=target.provider_request_allowance,
+            readable=0, usable=0, triage_rejected=0, duplicates=0, quality_rejected=0,
+            raw_results=0, provider=None,
+        )
+        pages = 0
+        for _ in range(len(self._search_adapters)):
+            current = cycle.target
+            if cycle.providers:
+                current = replace(
+                    current, provider_request_allowance=cycle.allowance - cycle.requests,
+                    reusable_results=(), reusable_pages=(), query_already_executed=False,
+                )
+            previous = tuple(cycle.providers)
+            cycle.readable = cycle.usable = cycle.triage_rejected = 0
+            cycle.duplicates = cycle.quality_rejected = cycle.raw_results = 0
+            cycle.inspected_urls = set()
+            requests_before = cycle.requests
+            result = await self._research_target_once(
+                run_id, worker_task_id=worker_task_id, target=current, cycle=cycle
+            )
+            pages += result.pages_read
+            can_continue = (
+                cycle.target.search_dispatch_ref is not None
+                and cycle.usable == 0
+                and result.outcome in {"no_evidence", "unreadable", "zero_results"}
+                and tuple(cycle.providers) != previous
+                and len(cycle.providers) < len(self._search_adapters)
+                and cycle.requests < cycle.allowance
+                and not _deadline_expired(target)
+            )
+            stop_reason = (
+                "usable_source_found" if cycle.usable else
+                "provider_request_budget_exhausted" if cycle.requests >= cycle.allowance else
+                "distinct_providers_exhausted" if len(cycle.providers) >= len(self._search_adapters)
+                else result.outcome
+            )
+            diagnostics = {
+                "logical_search_id": cycle.target.search_dispatch_ref,
+                "query": target.query, "research_question_id": target.question_id,
+                "provider_attempt_order": list(cycle.providers), "provider": cycle.provider,
+                "selected_provider": cycle.provider, "attempted_provider": cycle.provider,
+                "provider_requests": cycle.requests - requests_before,
+                "logical_search_budget_charged": (
+                    cycle.target.search_dispatch_ref is not None and requests_before == 0
+                ),
+                "provider_raw_result_count": cycle.raw_results,
+                "provider_result_count_scope": "adapter_returned_candidates",
+                "inspected_candidate_count": len(cycle.inspected_urls),
+                "uninspected_candidate_count": max(
+                    0, cycle.raw_results - len(cycle.inspected_urls)
+                ),
+                "provider_nonempty": cycle.raw_results > 0,
+                "readable_count": cycle.readable, "usable_sources_after_reader": cycle.readable,
+                "duplicate_count": cycle.duplicates,
+                "text_quality_rejected_count": cycle.quality_rejected,
+                "triage_rejected_count": cycle.triage_rejected,
+                "usable_count": cycle.usable, "usable_sources_after_triage": cycle.usable,
+                "extraction_eligible": cycle.usable > 0,
+                "continuation_decision": "continue" if can_continue else "stop",
+                "continuation_reason": "no_downstream_usable_source" if can_continue else None,
+                "stop_reason": None if can_continue else stop_reason,
+            }
+            await self._repository.record_search_opportunity_diagnostic(
+                run_id, worker_task_id=worker_task_id, diagnostics=diagnostics
+            )
+            if not can_continue:
+                if cycle.target.search_dispatch_ref is not None:
+                    await finish(
+                        run_id, worker_task_id=worker_task_id, target=cycle.target,
+                        diagnostics=diagnostics,
+                    )
+                return replace(result, pages_read=pages)
+        raise AssertionError("bounded downstream provider continuation did not terminate")
+
+    async def _research_target_once(
         self,
         run_id: UUID,
         *,
         worker_task_id: str,
         target: ResearchTarget,
+        cycle: SimpleNamespace | None = None,
     ) -> ResearchAttemptResult:
         if target.feedback_id is not None:
             anchored = bind_feedback_query(
@@ -787,7 +880,7 @@ class ResearchLoopService:
             or (cached_candidates and target.gap_attempt_index % 2 == 0)
         )
         dispatch_guard = getattr(self._repository, "reserve_search_dispatch", None)
-        if not reuse_only and callable(dispatch_guard):
+        if not reuse_only and callable(dispatch_guard) and target.search_dispatch_ref is None:
             reservation = await dispatch_guard(
                 run_id, worker_task_id=worker_task_id, target=target
             )
@@ -801,6 +894,9 @@ class ResearchLoopService:
                     target, search_dispatch_ref=reservation.dispatch_ref,
                     provider_request_allowance=reservation.provider_allowance,
                 )
+                if cycle is not None:
+                    cycle.target = target
+                    cycle.allowance = reservation.provider_allowance
         query_started_recorder = getattr(
             self._repository,
             "record_search_query_started",
@@ -849,6 +945,7 @@ class ResearchLoopService:
                                 worker_task_id=worker_task_id,
                                 target=target,
                                 telemetry=executed_source,
+                                excluded_providers=cycle.providers if cycle is not None else (),
                             ),
                             timeout=remaining,
                         ),
@@ -874,7 +971,16 @@ class ResearchLoopService:
                 provider_productive = _provider_metric(
                     executed_source, "last_productive_response_count"
                 )
+                if cycle is not None:
+                    cycle.providers = getattr(executed_source, "provider_attempt_order", ())
+                    cycle.requests += provider_requests
+                    cycle.provider = executed_provider
+                    cycle.raw_results = len(results)
             except TimeoutError:
+                if cycle is not None:
+                    cycle.providers = getattr(executed_source, "provider_attempt_order", ())
+                    cycle.requests += _provider_request_count(executed_source, default=0)
+                    cycle.provider = getattr(executed_source, "attempted_provider", None)
                 await self._repository.record_tool_failure(
                     run_id,
                     worker_task_id=worker_task_id,
@@ -906,6 +1012,10 @@ class ResearchLoopService:
                 provider_productive = _provider_metric(
                     executed_source, "last_productive_response_count"
                 )
+                if cycle is not None:
+                    cycle.providers = getattr(executed_source, "provider_attempt_order", ())
+                    cycle.requests += provider_requests
+                    cycle.provider = getattr(executed_source, "attempted_provider", None)
                 selected_provider = getattr(executed_source, "selected_provider", executed_provider)
                 executed_provider = getattr(
                     executed_source, "attempted_provider", executed_provider
@@ -1008,6 +1118,7 @@ class ResearchLoopService:
             provider_productive=provider_productive,
             latency_ms=search_latency_ms,
             executed_provider=executed_provider,
+            **({"dispatch_pending": True} if cycle is not None and not reuse_only else {}),
         )
 
         dispatch_recorder = getattr(self._repository, "record_candidate_dispatch_event", None)
@@ -1097,6 +1208,14 @@ class ResearchLoopService:
                 reason=reason,
             )
         structured_extraction_failures = 0
+        reader = RunPageReader(
+            self._reader, self._repository, self._artifacts, run_id, worker_task_id
+        )
+        cached_bodies: dict[str, ReadPage] = {}
+        for result in page_results:
+            cached_body = await reader.cached(result.url)
+            if cached_body is not None:
+                cached_bodies[normalize_source_url(result.url)] = cached_body
         page_reservation = await self._repository.reserve_page_slots(
             run_id,
             worker_task_id=worker_task_id,
@@ -1109,7 +1228,8 @@ class ResearchLoopService:
             ),
             fresh_search=not reuse_only,
         )
-        if page_reservation.granted == 0:
+        cached_count = len(set(cached_bodies) | set(reusable_pages))
+        if page_reservation.granted == 0 and not cached_count:
             for result in candidate_results:
                 await record_dispatch_event(
                     result.url,
@@ -1122,7 +1242,7 @@ class ResearchLoopService:
             if not target.first_pass or target.priority == 1
             else 1
         )
-        page_limit = min(page_reservation.granted, desired_page_limit)
+        page_limit = min(page_reservation.granted + cached_count, desired_page_limit)
         prefetched: dict[str, ReadPage] = {}
         batch_urls: list[str] = []
         settled_slots = 0
@@ -1155,9 +1275,11 @@ class ResearchLoopService:
                 return
             await record_dispatch_event(result.url, "dispatch_selected")
             dispatch_selected_urls.add(normalized_url)
+            if cycle is not None:
+                cycle.inspected_urls.add(normalized_url)
 
         async def record_reader_events(requested_url: str) -> None:
-            event_consumer = getattr(self._reader, "consume_events", None)
+            event_consumer = reader.consume_events
             lifecycle_recorder = getattr(self._repository, "record_reader_lifecycle", None)
             if not callable(event_consumer) or not callable(lifecycle_recorder):
                 return
@@ -1201,14 +1323,18 @@ class ResearchLoopService:
             batch_sample = ordered_results[:page_limit]
             for result in batch_sample:
                 await mark_dispatch_selected(result)
-                if normalize_source_url(result.url) not in reusable_pages:
+                if (
+                    normalize_source_url(result.url) not in reusable_pages
+                    and normalize_source_url(result.url) not in cached_bodies
+                    and len(batch_urls) < page_reservation.granted
+                ):
                     batch_urls.append(result.url)
             if batch_urls:
                 read_map = await timed_call(
                     "reader.batch",
                     read_page_attempts_concurrently(
                         batch_urls,
-                        self._reader,
+                        reader,
                         deadline_at=target.deadline_at,
                         run_id=run_id,
                     ),
@@ -1224,6 +1350,7 @@ class ResearchLoopService:
                             url=url,
                             error_code=read_outcome.error_code or "WEBPAGE_PREFETCH_FAILED",
                             latency_ms=read_outcome.latency_ms,
+                            **({"reused": True} if not reader.physical_fetch(url) else {}),
                         )
                     else:
                         prefetched[url] = read_outcome.page
@@ -1232,10 +1359,11 @@ class ResearchLoopService:
                             worker_task_id=worker_task_id,
                             target=target,
                             url=read_outcome.page.final_url,
-                            reused=False,
+                            requested_url=url,
+                            reused=not reader.physical_fetch(url),
                             latency_ms=read_outcome.latency_ms,
                         )
-                    settled_slots += 1
+                    settled_slots += int(reader.physical_fetch(url))
 
         zero_yield_pages = 0
         question_budget_exhausted = False
@@ -1290,7 +1418,11 @@ class ResearchLoopService:
             await mark_dispatch_selected(result)
             fetch_started = time.monotonic()
             reusable_ref = reusable_pages.get(normalize_source_url(result.url))
-            if zero_candidate_seen and result.url not in prefetched and reusable_ref is None:
+            cached_body = cached_bodies.get(normalize_source_url(result.url))
+            if (
+                zero_candidate_seen and result.url not in prefetched
+                and reusable_ref is None and cached_body is None
+            ):
                 # Exploit already-read opportunities, not another unbounded
                 # fetch/retry round. Other questions keep their first-pass turn.
                 await record_selection_event(
@@ -1315,13 +1447,25 @@ class ResearchLoopService:
                     )
                 except (OSError, ValueError):
                     reusable_ref = None
-            if reusable_ref is None:
+            if cached_body is not None:
+                page = cached_body
+            if reusable_ref is None and cached_body is None:
                 if self._parallel_reads_enabled and result.url in batch_urls:
                     prefetched_page = prefetched.get(result.url)
                     if prefetched_page is None:
                         continue
                     page = prefetched_page
                 else:
+                    if settled_slots >= page_reservation.granted:
+                        extra = await self._repository.reserve_page_slots(
+                            run_id, worker_task_id=worker_task_id, requested=1,
+                            fresh_search=not reuse_only,
+                        )
+                        if not extra.granted:
+                            break
+                        page_reservation = replace(
+                            page_reservation, granted=page_reservation.granted + extra.granted
+                        )
                     try:
                         remaining = _deadline_remaining_seconds(target)
                         if remaining <= 0:
@@ -1334,7 +1478,7 @@ class ResearchLoopService:
                         page = await timed_call(
                             "reader.request",
                             asyncio.wait_for(
-                                self._reader.read(result.url),
+                                reader.read(result.url),
                                 timeout=remaining,
                             ),
                             run_id=run_id,
@@ -1365,8 +1509,9 @@ class ResearchLoopService:
                             url=result.url,
                             error_code=exc.code,
                             latency_ms=int((time.monotonic() - fetch_started) * 1_000),
+                            **({"reused": True} if not reader.physical_fetch(result.url) else {}),
                         )
-                        settled_slots += 1
+                        settled_slots += int(reader.physical_fetch(result.url))
                         continue
                     except Exception:
                         await record_reader_events(result.url)
@@ -1374,7 +1519,8 @@ class ResearchLoopService:
 
             await record_reader_events(result.url)
             fetch_latency_ms = (
-                0 if reusable_ref is not None else int((time.monotonic() - fetch_started) * 1_000)
+                0 if reusable_ref is not None or cached_body is not None
+                else int((time.monotonic() - fetch_started) * 1_000)
             )
             if result.url not in batch_urls:
                 await self._repository.record_page_fetched(
@@ -1382,14 +1528,21 @@ class ResearchLoopService:
                     worker_task_id=worker_task_id,
                     target=target,
                     url=page.final_url,
-                    reused=reusable_ref is not None,
+                    requested_url=result.url,
+                    reused=(reusable_ref is not None or cached_body is not None
+                            or not reader.physical_fetch(result.url)),
                     latency_ms=fetch_latency_ms,
                 )
-                settled_slots += 1
+                settled_slots += int(reader.physical_fetch(result.url))
+
+            if cycle is not None:
+                cycle.readable += 1
 
             await record_selection_event(result.url, "selection_started")
             page_key = (normalize_source_url(page.final_url), page.content_hash)
             if page_key in attempted_pages:
+                if cycle is not None:
+                    cycle.duplicates += 1
                 await record_selection_event(
                     result.url,
                     "selection_skipped",
@@ -1403,6 +1556,8 @@ class ResearchLoopService:
                 requested_url=result.url,
                 page=page,
             ):
+                if cycle is not None:
+                    cycle.duplicates += 1
                 await record_selection_event(
                     result.url,
                     "selection_skipped",
@@ -1412,7 +1567,8 @@ class ResearchLoopService:
             pages_read += 1
 
             if (
-                target.cheap_triage_enabled
+                cycle is not None
+                or target.cheap_triage_enabled
                 or zero_candidate_seen
                 or len(page.clean_text.strip()) < 300
                 or not assess_text_quality(page.clean_text).accepted
@@ -1428,6 +1584,9 @@ class ResearchLoopService:
                     title=page.title,
                 )
                 if not triage.accepted:
+                    if cycle is not None:
+                        cycle.triage_rejected += 1
+                        cycle.quality_rejected += int(triage.reason != "topic_mismatch")
                     await record_selection_event(
                         result.url,
                         "selection_skipped",
@@ -1449,6 +1608,8 @@ class ResearchLoopService:
                     )
                     continue
 
+            if cycle is not None:
+                cycle.usable += 1
             if not await self._repository.reserve_extraction_slot(
                 run_id,
                 worker_task_id=worker_task_id,

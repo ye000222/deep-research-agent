@@ -28,6 +28,7 @@ def test_performance_preserves_unknown_usage_and_checks_owner() -> None:
             )
         ),
         list_llm_calls=AsyncMock(return_value=[{"usage": {}, "latency_ms": 10}]),
+        list_evidence=AsyncMock(return_value=[]),
     )
     app = create_app(
         Settings(app_env="test", external_probes_enabled=False, langgraph_strict_msgpack=False)

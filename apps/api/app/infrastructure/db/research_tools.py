@@ -39,6 +39,7 @@ from app.domain.closure_feedback_completeness_pass import (
 from app.domain.closure_feedback_dispatcher import ClosureFeedbackDispatcher
 from app.domain.document_evidence_context import CanonicalEvidenceSpan
 from app.domain.evaluation import EvaluationScope, EvaluationSnapshot, EvaluationVerdict
+from app.domain.event_coverage import project_event_coverage, reconcile_coverage_map
 from app.domain.evidence_alignment import EvidenceAlignment
 from app.domain.evidence_alignment_executor import EvidenceAlignmentExecutor
 from app.domain.evidence_alignment_request import EvidenceAlignmentRequest
@@ -99,6 +100,7 @@ from app.domain.query_candidate import QueryCandidateGenerator
 from app.domain.query_candidate_ranking import QueryCandidateRanker
 from app.domain.query_candidate_validation import QueryCandidateValidator
 from app.domain.query_execution import QueryExecutionAdapter
+from app.domain.query_expansion import query_intent
 from app.domain.query_plan_validation import QueryPlanValidator
 from app.domain.question_research_state import (
     QuestionResearchFacts,
@@ -165,6 +167,7 @@ from app.domain.semantic_control_projection import (
 )
 from app.domain.source_policy import normalize_source_url, source_owner_key
 from app.infrastructure.db.evaluation_models import EvaluationSnapshotRow
+from app.infrastructure.db.evidence_counts import sync_accepted_evidence_count
 from app.infrastructure.db.evidence_graph_models import (
     ResearchClaimEdgeRow,
     ResearchClaimRow,
@@ -892,9 +895,13 @@ class ResearchToolRepository:
                             func.coalesce(
                                 func.sum(
                                     case(
-                                        (ModelBudgetReservationRow.status == "settled",
-                                         func.coalesce(ModelBudgetReservationRow.actual_total,
-                                                       ModelBudgetReservationRow.reserved_total)),
+                                        (
+                                            ModelBudgetReservationRow.status == "settled",
+                                            func.coalesce(
+                                                ModelBudgetReservationRow.actual_total,
+                                                ModelBudgetReservationRow.reserved_total,
+                                            ),
+                                        ),
                                         else_=ModelBudgetReservationRow.reserved_total,
                                     )
                                 ),
@@ -1045,6 +1052,7 @@ class ResearchToolRepository:
         url: str,
         reused: bool,
         latency_ms: int,
+        requested_url: str | None = None,
     ) -> None:
         """Settle one fetch slot before cheap triage or model extraction."""
 
@@ -1060,7 +1068,7 @@ class ResearchToolRepository:
             owners_raw = usage.get("page_slots_reserved_by_worker", {})
             owners = dict(owners_raw) if isinstance(owners_raw, dict) else {}
             owned = _as_int(owners.get(worker_task_id, 0))
-            settled = 1 if not owners else min(1, max(0, owned))
+            settled = 0 if reused else (1 if not owners else min(1, max(0, owned)))
             if owners:
                 owners[worker_task_id] = max(0, owned - settled)
                 if owners[worker_task_id] == 0:
@@ -1072,14 +1080,37 @@ class ResearchToolRepository:
             usage["page_fetch_attempts"] = _as_int(usage.get("page_fetch_attempts", 0)) + int(
                 not reused
             )
-            if not reused:
+            identities = list(usage.get("fetched_page_identities", []))
+            identity = normalize_source_url(url)
+            page_charged = not reused and identity not in identities
+            if page_charged:
                 usage["pages_fetched"] = (
                     _as_int(usage.get("pages_fetched", usage.get("pages", 0))) + 1
                 )
+                identities.append(identity)
+                usage["fetched_page_identities"] = identities
             usage["page_fetch_latency_ms"] = _as_int(usage.get("page_fetch_latency_ms", 0)) + max(
                 0, latency_ms
             )
             run.usage_snapshot = _usage_with_resource_pools(run, usage)
+            await self._append_event(
+                session,
+                run,
+                event_type="reader.body.resolved",
+                public_summary="已记录正文复用与物理请求计费。",
+                refs={
+                    "question_id": target.question_id,
+                    "source_identity": identity,
+                    "requested_url": requested_url or url,
+                    "normalized_url": normalize_source_url(requested_url or url),
+                    "canonical_url": identity,
+                    "cache_hit": reused,
+                    "identity_basis": "observed_final_url",
+                    "reused_existing_body": reused,
+                    "physical_fetch_performed": not reused,
+                    "page_budget_charged": page_charged,
+                },
+            )
             await self._append_candidate_event(
                 session,
                 run,
@@ -2874,9 +2905,7 @@ class ResearchToolRepository:
                 gap_artifact=gap_artifact,
                 intent_artifact=intent_artifact,
             )
-        if work_item is not None and not isinstance(
-            work_item.objective, LegacyResearchObjective
-        ):
+        if work_item is not None and not isinstance(work_item.objective, LegacyResearchObjective):
             raise ValueError("selected_work_objective_kind_unsupported")
 
         if not question_id:
@@ -2912,9 +2941,10 @@ class ResearchToolRepository:
             final_url = metadata.get("reader_final_url")
             content_hash = metadata.get("reader_content_hash")
             fetched_at_value = metadata.get("reader_fetched_at")
-            if all(isinstance(value, str) and value for value in (
-                artifact_uri, final_url, content_hash, fetched_at_value
-            )):
+            if all(
+                isinstance(value, str) and value
+                for value in (artifact_uri, final_url, content_hash, fetched_at_value)
+            ):
                 try:
                     fetched_at = datetime.fromisoformat(str(fetched_at_value))
                 except ValueError:
@@ -3176,11 +3206,15 @@ class ResearchToolRepository:
     ) -> ResearchTarget | None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
-            if expected_state is not None and (
-                run.latest_run_state_ref,
-                run.latest_run_state_hash,
-                run.latest_run_state_version,
-            ) != expected_state:
+            if (
+                expected_state is not None
+                and (
+                    run.latest_run_state_ref,
+                    run.latest_run_state_hash,
+                    run.latest_run_state_version,
+                )
+                != expected_state
+            ):
                 raise ValueError("gap_target_run_state_pointer_stale")
             budget_stop_reason = _budget_exhaustion_reason(run)
             search_budget_exhausted = _search_acquisition_budget_exhausted(budget_stop_reason)
@@ -3375,6 +3409,11 @@ class ResearchToolRepository:
                 )
                 for candidate in candidates
             }
+            if search_budget_exhausted and any(
+                isinstance(entry, dict) and entry.get("state") == "READABLE"
+                for entry in run.usage_snapshot.get("reader_body_cache", {}).values()
+            ):
+                cached_question_ids.update(candidate.question_id for candidate in candidates)
             zero_yield_deprioritized_questions = {
                 candidate.question_id
                 for candidate in candidates
@@ -3733,7 +3772,9 @@ class ResearchToolRepository:
                     candidate_query = " ".join(
                         (
                             candidate_query,
-                            _source_hint_for_requirement(unmet_criterion),
+                            _source_hint_for_requirement(
+                                unmet_criterion, question=question.question
+                            ),
                         )
                     )[:400]
                 candidate_hash = hashlib.sha256(
@@ -3946,6 +3987,10 @@ class ResearchToolRepository:
                 (event_type, refs)
                 for event_type, refs in failure_event_rows
                 if isinstance(refs, dict)
+                and (
+                    event_type != "source.triage_rejected"
+                    or refs.get("question_id") == question.question_id
+                )
             )
             reusable_results = tuple(
                 SearchResult(
@@ -3961,6 +4006,26 @@ class ResearchToolRepository:
                     and normalize_source_url(row.url) not in rejected_urls
                 )
             )
+            if search_budget_exhausted:
+                # A body rejected for q1 can still answer q3. Keep it a
+                # candidate, never evidence, and let q3's normal triage decide.
+                cache = run.usage_snapshot.get("reader_body_cache", {})
+                cached_urls = {normalize_source_url(item.url) for item in reusable_results}
+                for entry in cache.values():
+                    if not isinstance(entry, dict) or entry.get("state") != "READABLE":
+                        continue
+                    cached_url = normalize_source_url(str(entry["final_url"]))
+                    if cached_url in cached_urls or cached_url in rejected_urls:
+                        continue
+                    reusable_results += (
+                        SearchResult(
+                            title=str(entry.get("title", cached_url)),
+                            url=cached_url,
+                            snippet="Existing run-scoped body; requires question-specific triage.",
+                            rank=len(reusable_results) + 1,
+                        ),
+                    )
+                    cached_urls.add(cached_url)
             source_searched_for_question = exists(
                 select(SearchResultRow.id)
                 .join(SearchQueryRow, SearchResultRow.search_query_id == SearchQueryRow.id)
@@ -4271,17 +4336,22 @@ class ResearchToolRepository:
             for index, criterion in enumerate(question.evidence_requirements, start=1)
         )
         remaining_provider_requests = max(
-            0, _as_int(run.budget_snapshot.get("max_provider_requests", 0))
+            0,
+            _as_int(run.budget_snapshot.get("max_provider_requests", 0))
             - _as_int(run.usage_snapshot.get("search_provider_requests", 0))
             - _as_int(run.usage_snapshot.get("search_provider_requests_reserved", 0)),
         )
-        unattempted_questions = _as_int(await session.scalar(
-            select(func.count()).select_from(ResearchPlanItemRow).where(
-                ResearchPlanItemRow.run_id == run.id,
-                ResearchPlanItemRow.plan_version == run.plan_version,
-                ResearchPlanItemRow.status == "pending",
+        unattempted_questions = _as_int(
+            await session.scalar(
+                select(func.count())
+                .select_from(ResearchPlanItemRow)
+                .where(
+                    ResearchPlanItemRow.run_id == run.id,
+                    ResearchPlanItemRow.plan_version == run.plan_version,
+                    ResearchPlanItemRow.status == "pending",
+                )
             )
-        ))
+        )
         return ResearchTarget(
             plan_version=run.plan_version,
             question_id=question_id,
@@ -4518,18 +4588,24 @@ class ResearchToolRepository:
             entries = dict(usage.get("search_dispatches", {}))
             used = _as_int(usage.get("logical_queries", usage.get("searches", 0)))
             limit = min(
-                _as_int(run.budget_snapshot.get(
-                    "max_searches", run.budget_snapshot.get("max_logical_queries", 15)
-                )),
-                _as_int(run.budget_snapshot.get(
-                    "max_logical_queries", run.budget_snapshot.get("max_searches", 15)
-                )),
+                _as_int(
+                    run.budget_snapshot.get(
+                        "max_searches", run.budget_snapshot.get("max_logical_queries", 15)
+                    )
+                ),
+                _as_int(
+                    run.budget_snapshot.get(
+                        "max_logical_queries", run.budget_snapshot.get("max_searches", 15)
+                    )
+                ),
             )
             reason = "reserved"
             if key in entries:
                 reason = "search_dispatch_no_replay"
-            elif any(e.get("state") in {"RESERVED_NO_REPLAY", "UNKNOWN_NO_REPLAY"}
-                     for e in entries.values()):
+            elif any(
+                e.get("state") in {"RESERVED_NO_REPLAY", "UNKNOWN_NO_REPLAY"}
+                for e in entries.values()
+            ):
                 reason = "search_dispatch_in_flight_or_unknown"
             elif _deadline_at(run) is not None and _deadline_remaining_seconds(run) <= 0:
                 reason = "deadline_exhausted"
@@ -4561,17 +4637,25 @@ class ResearchToolRepository:
                 usage["search_dispatches"] = entries
                 run.usage_snapshot = _usage_with_resource_pools(run, usage)
             await self._append_event(
-                session, run,
-                event_type="search.dispatch.reserved" if reason == "reserved"
+                session,
+                run,
+                event_type="search.dispatch.reserved"
+                if reason == "reserved"
                 else "search.dispatch.blocked",
                 public_summary="Search 发出前配额决策已持久化。",
-                refs={"question_id": target.question_id, "gap_id": str(target.gap_id),
-                      "dispatch_ref": key, "reason": reason,
-                      "feedback_id": str(target.feedback_id) if target.feedback_id else None},
-                metrics={"logical_usage_before": used,
-                         "logical_usage_after": usage.get("logical_queries", used),
-                         "logical_limit": limit,
-                         "provider_allowance": allowance if reason == "reserved" else 0},
+                refs={
+                    "question_id": target.question_id,
+                    "gap_id": str(target.gap_id),
+                    "dispatch_ref": key,
+                    "reason": reason,
+                    "feedback_id": str(target.feedback_id) if target.feedback_id else None,
+                },
+                metrics={
+                    "logical_usage_before": used,
+                    "logical_usage_after": usage.get("logical_queries", used),
+                    "logical_limit": limit,
+                    "provider_allowance": allowance if reason == "reserved" else 0,
+                },
             )
             return SearchDispatchReservation(reason == "reserved", reason, key, allowance)
 
@@ -4587,31 +4671,164 @@ class ResearchToolRepository:
         if entry.get("state") != "RESERVED_NO_REPLAY":
             return False
         allowance = _as_int(entry.get("provider_allowance", 0))
-        if provider_requests < 0 or provider_requests > allowance:
+        previous = _as_int(entry.get("provider_requests", 0))
+        if provider_requests < 0 or previous + provider_requests > allowance:
             raise RuntimeError("SEARCH_ADAPTER_EXCEEDED_REQUEST_ALLOWANCE")
-        entry.update(state=state, provider_requests=provider_requests,
-                     settled_at=datetime.now(UTC).isoformat())
+        pending = state == "CONTINUING"
+        entry.update(
+            state="RESERVED_NO_REPLAY" if pending else state,
+            provider_requests=previous + provider_requests,
+            settled_at=datetime.now(UTC).isoformat(),
+        )
         entries[target.search_dispatch_ref] = entry
         usage["search_dispatches"] = entries
-        released = provider_requests if state == "UNKNOWN_NO_REPLAY" else allowance
+        released = (
+            provider_requests if pending or state == "UNKNOWN_NO_REPLAY" else allowance - previous
+        )
         usage["search_provider_requests_reserved"] = max(
             0, _as_int(usage.get("search_provider_requests_reserved", 0)) - released
         )
         run.usage_snapshot = _usage_with_resource_pools(run, usage)
         return True
 
+    async def finish_search_opportunity(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        diagnostics: dict[str, object],
+    ) -> None:
+        """Close the held dispatch only after downstream eligibility is known."""
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            self._settle_search_dispatch(run, target, provider_requests=0, state="SUCCEEDED")
+            entry = dict(run.usage_snapshot.get("search_dispatches", {})).get(
+                target.search_dispatch_ref, {}
+            )
+            unknown = entry.get("state") in {"RESERVED_NO_REPLAY", "UNKNOWN_NO_REPLAY"}
+            if unknown:
+                diagnostics = {
+                    **diagnostics,
+                    "stop_reason": "search_outcome_unknown_no_replay",
+                }
+            tool_call = await session.get(ResearchToolCallRow, target.tool_call_id)
+            if tool_call is not None and not unknown:
+                tool_call.result_refs = {
+                    **dict(tool_call.result_refs or {}),
+                    "downstream_pending": False,
+                    "usable_source_count": diagnostics["usable_count"],
+                    "search_opportunity_stop_reason": diagnostics["stop_reason"],
+                }
+            await self._append_event(
+                session,
+                run,
+                event_type=(
+                    "search.opportunity.stopped_unknown"
+                    if unknown
+                    else "search.opportunity.completed"
+                ),
+                public_summary="逻辑 Search 已按下游可用来源结果结束。",
+                refs=diagnostics,
+            )
+
+    async def record_search_opportunity_diagnostic(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        diagnostics: dict[str, object],
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            usage = run.usage_snapshot
+            logical = _as_int(usage.get("logical_queries", 0))
+            provider = _as_int(usage.get("search_provider_requests", 0))
+            diagnostics = {
+                **diagnostics,
+                "logical_budget_before": max(
+                    0, logical - int(bool(diagnostics.get("logical_search_budget_charged")))
+                ),
+                "logical_budget_after": logical,
+                "logical_budget_limit": _as_int(run.budget_snapshot.get("max_searches", 0)),
+                "provider_budget_before": provider - _as_int(diagnostics["provider_requests"]),
+                "provider_budget_after": provider,
+                "provider_budget_limit": _as_int(
+                    run.budget_snapshot.get("max_provider_requests", 0)
+                ),
+            }
+            await self._append_event(
+                session,
+                run,
+                event_type="search.downstream.assessed",
+                public_summary="已核对 Provider 候选的 Reader/triage 可用性。",
+                refs=diagnostics,
+            )
+
+    async def reader_cache_entry(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        url: str,
+        reserve: bool = False,
+    ) -> dict[str, object] | None:
+        """Run-scoped, lock-protected read intent; unknown reads are not replayable."""
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            usage = dict(run.usage_snapshot)
+            entries = dict(usage.get("reader_body_cache", {}))
+            key = normalize_source_url(url)
+            entry = entries.get(key)
+            if entry is None and reserve:
+                entries[key] = {"state": "IN_FLIGHT_NO_REPLAY"}
+                usage["reader_body_cache"] = entries
+                run.usage_snapshot = _usage_with_resource_pools(run, usage)
+            return dict(entry) if isinstance(entry, dict) else None
+
+    async def store_reader_cache_entry(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        requested_url: str,
+        entry: dict[str, object],
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            usage = dict(run.usage_snapshot)
+            entries = dict(usage.get("reader_body_cache", {}))
+            entries[normalize_source_url(requested_url)] = entry
+            if entry.get("state") == "READABLE":
+                entries[normalize_source_url(str(entry["final_url"]))] = entry
+            usage["reader_body_cache"] = entries
+            run.usage_snapshot = _usage_with_resource_pools(run, usage)
+
     async def record_feedback_query_guard(
-        self, run_id: UUID, *, worker_task_id: str, target: ResearchTarget,
-        query: str, topic: bool, event: bool, reason: str,
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        query: str,
+        topic: bool,
+        event: bool,
+        reason: str,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             await self._append_event(
-                session, run, event_type="feedback.query.anchored",
+                session,
+                run,
+                event_type="feedback.query.anchored",
                 public_summary="Feedback 查询主题与事件锚点已核对。",
-                refs={"question_id": target.question_id, "gap_id": str(target.gap_id),
-                      "query_intent": target.feedback_trigger_reason, "final_query": query,
-                      "reason": reason},
+                refs={
+                    "question_id": target.question_id,
+                    "gap_id": str(target.gap_id),
+                    "query_intent": target.feedback_trigger_reason,
+                    "final_query": query,
+                    "reason": reason,
+                },
                 metrics={"topic_anchor_present": topic, "event_anchor_present": event},
             )
 
@@ -4687,16 +4904,32 @@ class ResearchToolRepository:
         provider_productive: int = 0,
         latency_ms: int = 0,
         executed_provider: str | None = None,
+        dispatch_pending: bool = False,
     ) -> set[str] | None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             tool_call = await session.get(ResearchToolCallRow, target.tool_call_id)
             if tool_call is None:
                 raise ResearchLeaseLostError("tool call disappeared")
+            dispatch = dict(run.usage_snapshot.get("search_dispatches", {})).get(
+                target.search_dispatch_ref, {}
+            )
+            first_batch = not dispatch.get("batches_recorded", 0)
             if not reused and not self._settle_search_dispatch(
-                run, target, provider_requests=provider_requests, state="SUCCEEDED"
+                run,
+                target,
+                provider_requests=provider_requests,
+                state="CONTINUING" if dispatch_pending else "SUCCEEDED",
             ):
                 return set()
+            if dispatch_pending and target.search_dispatch_ref is not None:
+                pending_usage = dict(run.usage_snapshot)
+                entries = dict(pending_usage["search_dispatches"])
+                entry = dict(entries[target.search_dispatch_ref])
+                entry["batches_recorded"] = _as_int(entry.get("batches_recorded", 0)) + 1
+                entries[target.search_dispatch_ref] = entry
+                pending_usage["search_dispatches"] = entries
+                run.usage_snapshot = pending_usage
             if reused:
                 reused_recorded_urls: set[str] | None = None
                 query_hash = hashlib.sha256(
@@ -4865,7 +5098,7 @@ class ResearchToolRepository:
                     tool_call_id=tool_call.id,
                     query=target.query,
                     normalized_hash=query_hash,
-                    provider="searxng",
+                    provider=executed_provider or "searxng",
                     status="succeeded",
                     result_count=len(results),
                     created_at=now,
@@ -4980,7 +5213,11 @@ class ResearchToolRepository:
                 new_recorded_urls.add(normalized_result_url)
             query_row.result_count = len(existing_urls)
             tool_call.status = "succeeded"
-            tool_call.result_refs = {"search_query_id": str(query_row.id), "count": len(results)}
+            tool_call.result_refs = {
+                "search_query_id": str(query_row.id),
+                "count": len(results),
+                "downstream_pending": dispatch_pending,
+            }
             tool_call.finished_at = datetime.now(UTC)
             usage = dict(run.usage_snapshot)
             if target.search_dispatch_ref is None:
@@ -5009,6 +5246,7 @@ class ResearchToolRepository:
                 usage,
                 family=target.query_family,
                 reused=False,
+                count_logical=first_batch,
                 provider_requests=provider_requests,
                 timeouts=provider_timeouts,
                 fallbacks=provider_fallbacks,
@@ -5037,7 +5275,7 @@ class ResearchToolRepository:
                 session,
                 run,
                 event_type="search.completed",
-                public_summary=f"搜索完成, 获得 {len(results)} 个候选结果。",
+                public_summary=f"Provider 返回 {len(results)} 个候选; 不代表下游正文可用。",
                 refs={
                     "search_query_id": str(query_row.id),
                     "question_id": target.question_id,
@@ -5145,9 +5383,13 @@ class ResearchToolRepository:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
             if not self._settle_search_dispatch(
-                run, target, provider_requests=provider_requests,
-                state="UNKNOWN_NO_REPLAY" if (
-                    error_code == "SEARCH_DEADLINE_EXHAUSTED" or provider_timeouts > 0
+                run,
+                target,
+                provider_requests=provider_requests,
+                state="UNKNOWN_NO_REPLAY"
+                if (
+                    error_code == "SEARCH_DEADLINE_EXHAUSTED"
+                    or provider_timeouts > 0
                     or (details is not None and details.get("failure_type") == "timeout")
                 )
                 else "FAILED",
@@ -5168,7 +5410,8 @@ class ResearchToolRepository:
                 usage_snapshot["logical_queries"] = (
                     _as_int(
                         usage_snapshot.get("logical_queries", usage_snapshot.get("searches", 0) - 1)
-                    ) + 1
+                    )
+                    + 1
                 )
             usage_snapshot["search_provider_requests"] = _as_int(
                 usage_snapshot.get("search_provider_requests", 0)
@@ -5593,11 +5836,15 @@ class ResearchToolRepository:
         async with self._sessions() as session, session.begin():
             await self._locked_run(session, run_id, worker_task_id)
             url_hash = hashlib.sha256(normalize_source_url(page.final_url).encode()).hexdigest()
-            existing = await session.scalar(select(ResearchSourceRow.id).where(
-                ResearchSourceRow.run_id == run_id,
-                or_(ResearchSourceRow.url_hash == url_hash,
-                    ResearchSourceRow.content_hash == page.content_hash),
-            ))
+            existing = await session.scalar(
+                select(ResearchSourceRow.id).where(
+                    ResearchSourceRow.run_id == run_id,
+                    or_(
+                        ResearchSourceRow.url_hash == url_hash,
+                        ResearchSourceRow.content_hash == page.content_hash,
+                    ),
+                )
+            )
             return existing if existing is not None else proposed_id
 
     async def record_extraction_started(
@@ -7598,6 +7845,7 @@ class ResearchToolRepository:
                     target=target,
                     evidence_ids=tuple(inserted_evidence_ids),
                 )
+            await sync_accepted_evidence_count(session, run)
             usage_snapshot = dict(run.usage_snapshot)
             usage_snapshot["pages_extracted"] = (
                 _as_int(usage_snapshot.get("pages_extracted", usage_snapshot.get("pages", 0))) + 1
@@ -8001,7 +8249,8 @@ class ResearchToolRepository:
                         "schema_valid_candidate_count": None,
                         "pre_validation_dropped_count": None,
                         "zero_candidate_reason": "empty_model_output"
-                        if detail_code == "PARSE_EMPTY_RESPONSE" else {
+                        if detail_code == "PARSE_EMPTY_RESPONSE"
+                        else {
                             "MODEL_OUTPUT_TRUNCATED": "model_output_truncated",
                             "MODEL_OUTPUT_INVALID": "structured_output_parse_failed",
                             "EVIDENCE_OUTPUT_SCHEMA_INVALID": "candidate_schema_invalid",
@@ -8034,6 +8283,7 @@ class ResearchToolRepository:
         url: str,
         error_code: str,
         latency_ms: int = 0,
+        reused: bool = False,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -8047,7 +8297,7 @@ class ResearchToolRepository:
             owners_raw = usage_snapshot.get("page_slots_reserved_by_worker", {})
             owners = dict(owners_raw) if isinstance(owners_raw, dict) else {}
             owned = _as_int(owners.get(worker_task_id, 0))
-            settled = 1 if not owners else min(1, max(0, owned))
+            settled = 0 if reused else (1 if not owners else min(1, max(0, owned)))
             if owners:
                 owners[worker_task_id] = max(0, owned - settled)
                 if owners[worker_task_id] == 0:
@@ -8059,9 +8309,9 @@ class ResearchToolRepository:
             # A failed HTTP attempt consumes the separate attempt pool, but
             # does not consume the successful-page evidence budget. This keeps
             # transient 403/timeout failures from starving readable sources.
-            usage_snapshot["page_fetch_attempts"] = (
-                _as_int(usage_snapshot.get("page_fetch_attempts", 0)) + 1
-            )
+            usage_snapshot["page_fetch_attempts"] = _as_int(
+                usage_snapshot.get("page_fetch_attempts", 0)
+            ) + int(not reused)
             usage_snapshot["page_fetch_latency_ms"] = _as_int(
                 usage_snapshot.get("page_fetch_latency_ms", 0)
             ) + max(0, latency_ms)
@@ -8097,7 +8347,11 @@ class ResearchToolRepository:
                     "url": url[:1000],
                     "error_code": error_code[:100],
                 },
-                metrics={"latency_ms": max(0, latency_ms), "fetch_budget_consumed": True},
+                metrics={
+                    "latency_ms": max(0, latency_ms),
+                    "fetch_budget_consumed": not reused,
+                    "physical_fetch_performed": not reused,
+                },
             )
             normalized_reason = normalize_evidence_formation_reason(error_code)
             await self._append_formation_diagnostic(
@@ -8219,9 +8473,7 @@ class ResearchToolRepository:
                         continue_research=bool(metrics.get("continue_research", True)),
                         decision=decision,
                         stop_reason=(
-                            str(stop_reason_value)
-                            if stop_reason_value is not None
-                            else None
+                            str(stop_reason_value) if stop_reason_value is not None else None
                         ),
                         question_status=str(metrics.get("question_status", "active")),
                         coverage=float(metrics.get("coverage", 0.0)),
@@ -8633,6 +8885,31 @@ class ResearchToolRepository:
                         "missing_reasons": missing_reasons,
                     }
                 )
+            event_rows = (
+                await session.execute(
+                    select(ResearchEvidenceRow, ResearchSourceRow)
+                    .join(ResearchSourceRow, ResearchSourceRow.id == ResearchEvidenceRow.source_id)
+                    .where(
+                        ResearchEvidenceRow.run_id == run_id, ResearchEvidenceRow.accepted.is_(True)
+                    )
+                )
+            ).all()
+            event_coverage = project_event_coverage(
+                run.normalized_goal,
+                [
+                    {
+                        "evidence_id": str(e.id),
+                        "exact_quote": e.exact_quote,
+                        "relation": e.relation,
+                        "source_url": s.canonical_url,
+                        "source_owner_key": s.source_owner_key,
+                    }
+                    for e, s in event_rows
+                ],
+            )
+            if event_coverage["targets"]:
+                reconcile_coverage_map(coverage_map, event_coverage)
+                weighted_coverage = sum(d["coverage"] * (4 - d["priority"]) for d in coverage_map)
             coverage = round(weighted_coverage / total_weight, 4) if total_weight else 0.0
             covered_questions = sum(
                 1 for evidence_count, _ in counts_by_question.values() if evidence_count > 0
@@ -8882,6 +9159,7 @@ class ResearchToolRepository:
                 for dimension in coverage_map
                 if int(dimension["priority"]) == 1 and float(dimension["coverage"]) < 1.0
             )
+            critical_gaps = max(critical_gaps, event_coverage["critical_unresolved_count"])
             unresolved_gap_count = sum(
                 1 for dimension in coverage_map if float(dimension["coverage"]) < 1.0
             )
@@ -9226,6 +9504,8 @@ class ResearchToolRepository:
             }
             run.quality_snapshot = {
                 "coverage": coverage,
+                "event_coverage": event_coverage,
+                "research_complete": False,
                 "information_gain": information_gain.score,
                 "low_information_gain_streak": low_information_gain_streak,
                 "low_information_gain_streak_by_question": previous_streaks,
@@ -9435,6 +9715,7 @@ class ResearchToolRepository:
                 and not unresolved_conflict_ids
                 and low_information_gain_streak >= _LOW_INFORMATION_GAIN_STREAK_TO_STOP
             )
+            run.quality_snapshot = {**run.quality_snapshot, "research_complete": quality_met}
             all_first_attempted = all(item.status != "pending" for item in plan_items)
             source_space_map = run.usage_snapshot.get("source_space_exhausted_by_question", {})
             source_space_exhausted = (
@@ -9909,6 +10190,7 @@ class ResearchToolRepository:
         reason: str,
         summary: str,
     ) -> None:
+        accepted_count = await sync_accepted_evidence_count(session, run)
         now = datetime.now(UTC)
         run.status = RunStatus.RUNNING.value
         run.phase = RunPhase.WRITING.value
@@ -9920,10 +10202,8 @@ class ResearchToolRepository:
             session,
             run,
             event_type="report.writing_started",
-            public_summary=_writing_start_summary(
-                reason, accepted_evidence=_as_int(run.usage_snapshot.get("accepted_evidence", 0))
-            ),
-            refs={"reason": reason},
+            public_summary=_writing_start_summary(reason, accepted_evidence=accepted_count),
+            refs={"reason": reason, "accepted_evidence": accepted_count},
         )
         await self._finalize_run_closure_feedback(
             session,
@@ -10245,12 +10525,15 @@ def _update_query_family_usage(
     fallbacks: int,
     usable_results: int,
     latency_ms: int,
+    count_logical: bool = True,
 ) -> None:
     raw = usage.get("query_family_stats", {})
     stats = dict(raw) if isinstance(raw, dict) else {}
     current_raw = stats.get(family, {})
     current = dict(current_raw) if isinstance(current_raw, dict) else {}
-    current["logical_queries"] = _as_int(current.get("logical_queries", 0)) + int(not reused)
+    current["logical_queries"] = _as_int(current.get("logical_queries", 0)) + int(
+        not reused and count_logical
+    )
     current["cache_reuses"] = _as_int(current.get("cache_reuses", 0)) + int(reused)
     current["provider_requests"] = _as_int(current.get("provider_requests", 0)) + max(
         0, provider_requests
@@ -10337,10 +10620,7 @@ def _query_family_order(
             or required.required_time_version_scope_condition_refs
         ):
             preferred = QueryFamily.SCOPE
-        elif (
-            required.required_owner_independence
-            or required.source_characteristics
-        ):
+        elif required.required_owner_independence or required.source_characteristics:
             preferred = QueryFamily.AUTHORITATIVE
 
     order = list(QUERY_FAMILIES)
@@ -10503,7 +10783,9 @@ def _writing_start_summary(reason: str | None, *, accepted_evidence: int) -> str
                 _budget_stop_summary(reason).split(";", 1)[0]
                 + "; 尚无有效证据, 进入收尾检查, 不保证生成报告。"
             )
-        return _budget_stop_summary(reason)
+        return _budget_stop_summary(reason) + (
+            f" 已形成 {accepted_evidence} 条有效证据; 核心覆盖不足时仅生成受限制报告。"
+        )
     if reason == "stagnation":
         if accepted_evidence <= 0:
             return "边际信息增益过低; 尚无有效证据, 进入收尾检查, 不保证生成报告。"
@@ -10918,7 +11200,7 @@ def _select_unmet_requirement(
     return dimension_key, criterion
 
 
-def _source_hint_for_requirement(criterion: str) -> str:
+def _source_hint_for_requirement(criterion: str, *, question: str = "") -> str:
     """Map an unmet dimension to a source genre before repeating a search.
 
     This is deliberately a small deterministic vocabulary rather than a domain
@@ -10929,6 +11211,8 @@ def _source_hint_for_requirement(criterion: str) -> str:
 
     normalized = criterion.casefold()
     chinese = any("\u4e00" <= char <= "\u9fff" for char in criterion)
+    if query_intent(question or criterion) == "factual_date_event":
+        return "官方 公告 日期 原始报道" if chinese else "official announcement date press release"
     if any(
         token in normalized
         for token in ("市场", "market", "预测", "forecast", "趋势", "trend", "增长", "growth")

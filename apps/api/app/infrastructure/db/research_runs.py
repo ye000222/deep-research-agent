@@ -10,6 +10,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
+from app.domain.event_coverage import ensure_event_plan, project_event_coverage
 from app.domain.identifiers import uuid7
 from app.domain.planning import (
     ResearchPlan,
@@ -1165,6 +1166,7 @@ class ResearchRunRepository:
             ):
                 return False
             plan = enforce_plan_scope(plan, run.normalized_goal)
+            plan = ensure_event_plan(plan)
             plan = fit_plan_to_budget(
                 plan,
                 max_iterations=int(run.budget_snapshot.get("max_iterations", 0) or 0),
@@ -1235,6 +1237,8 @@ class ResearchRunRepository:
             }
             run.quality_snapshot = {
                 **run.quality_snapshot,
+                "event_coverage": project_event_coverage(run.normalized_goal, []),
+                "research_complete": False,
                 "risk_state": {
                     "version": "claim_gap.v2",
                     "plan_version": plan_version,

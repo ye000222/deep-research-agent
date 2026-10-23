@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
+from app.domain.query_expansion import query_intent
 from app.domain.research_tools import SearchResult
 from app.domain.source_policy import is_stable_read_url, normalize_source_url, source_owner_key
 from app.tools.errors import ToolExecutionError
@@ -1362,7 +1363,12 @@ def _strategies_for_query(
     """Route commercial and market questions to public web results first."""
 
     combined = f"{default_query}\n{alternate_query}".casefold()
-    if not any(marker in combined for marker in _GENERAL_FIRST_QUERY_MARKERS):
+    general_intent = query_intent(default_query) in {
+        "factual_date_event", "entity_status", "policy_regulation", "definition",
+    }
+    if not general_intent and not any(
+        marker in combined for marker in _GENERAL_FIRST_QUERY_MARKERS
+    ):
         return _SEARCH_STRATEGIES
     general = [
         entry

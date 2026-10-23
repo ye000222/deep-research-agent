@@ -16,10 +16,12 @@ from app.domain.reports import ReportCitationView, ReportSectionView, ReportView
 from app.domain.research_budget import build_resource_pool_snapshot
 from app.domain.research_runs import RunPhase, RunStatus
 from app.infrastructure.db.analysis_models import AnalysisArtifactRow, AnalysisInputRow
+from app.infrastructure.db.evidence_counts import sync_accepted_evidence_count
 from app.infrastructure.db.evidence_graph_models import (
     ResearchSourceChunkRow,
     ResearchSourceSnapshotRow,
 )
+from app.infrastructure.db.model_budget_models import ModelBudgetReservationRow
 from app.infrastructure.db.report_models import ReportCitationRow, ReportRow, ReportSectionRow
 from app.infrastructure.db.research_models import ResearchEvidenceRow, ResearchSourceRow
 from app.infrastructure.db.run_models import AgentEventRow, ResearchPlanItemRow, ResearchRunRow
@@ -59,6 +61,8 @@ class ReportEvidenceCard:
     analysis_operation: str | None = None
     analysis_formula: str | None = None
     analysis_result: dict[str, Any] | None = None
+    relation: str = "supports"
+    source_owner_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +128,9 @@ def _canonical_research_stop_reason(run: ResearchRunRow) -> str | None:
     if usage.get("model_budget_guarded"):
         return "token_budget_exhausted"
     for concrete, used_key, limit_key in checks:
-        if as_int(budget.get(limit_key)) > 0 and as_int(
-            usage_for_check.get(used_key)
-        ) >= as_int(budget.get(limit_key)):
+        if as_int(budget.get(limit_key)) > 0 and as_int(usage_for_check.get(used_key)) >= as_int(
+            budget.get(limit_key)
+        ):
             return concrete
     started_at = run.started_at or run.created_at
     deadline = as_int(budget.get("max_wall_clock_seconds"))
@@ -300,6 +304,8 @@ class ReportRepository:
                         analysis_operation=analysis_operations.get(evidence.id),
                         analysis_formula=analysis_formulas.get(evidence.id),
                         analysis_result=analysis_results.get(evidence.id),
+                        relation=evidence.relation,
+                        source_owner_key=source.source_owner_key,
                     )
                     for evidence, source, snapshot, chunk in evidence_rows
                 ),
@@ -327,6 +333,20 @@ class ReportRepository:
                 ),
                 worker_task_id,
             )
+            accepted_count = await sync_accepted_evidence_count(session, run)
+            technical_success = bool(
+                accepted_count
+                and verification_result["verified"]
+                and run.usage_snapshot.get("searches", run.usage_snapshot.get("logical_queries", 0))
+                and run.usage_snapshot.get("pages_fetched", 0)
+                and run.usage_snapshot.get("extraction_calls", 0)
+            )
+            verification_result = {
+                **verification_result,
+                "technical_e2e_success": technical_success,
+                "research_complete": technical_success
+                and bool(verification_result.get("research_complete")),
+            }
             version = (
                 int(
                     await session.scalar(
@@ -347,7 +367,7 @@ class ReportRepository:
                 final_markdown=final_markdown,
                 limitations=limitations,
                 verification_result=verification_result,
-                status="verified",
+                status="verified" if verification_result["verified"] else "verification_failed",
                 created_at=now,
                 updated_at=now,
             )
@@ -395,10 +415,9 @@ class ReportRepository:
                 **run.usage_snapshot,
                 "writer": writer_usage,
                 "writer_mode": writer_mode,
+                "writer_diagnostics": verification_result.get("writer", {}),
             }
-            max_verification_calls = int(
-                run.budget_snapshot.get("max_verification_calls", 0) or 0
-            )
+            max_verification_calls = int(run.budget_snapshot.get("max_verification_calls", 0) or 0)
             verification_calls = int(updated_usage.get("verification_calls", 0) or 0)
             if max_verification_calls > 0 and verification_calls >= max_verification_calls:
                 updated_usage["verification_budget_exhausted"] = True
@@ -413,18 +432,28 @@ class ReportRepository:
             updated_usage["research_stop_reason"] = research_stop_reason
             allocation = run.budget_snapshot.get("allocation", {})
             initial_writer_reserve = int(
-                allocation.get("writer_tokens_initial", 0)
-                if isinstance(allocation, dict)
-                else 0
+                allocation.get("writer_tokens_initial", 0) if isinstance(allocation, dict) else 0
             )
             writer_actual = int(
-                writer_usage.get("total_tokens", 0)
-                if isinstance(writer_usage, dict)
-                else 0
+                writer_usage.get("total_tokens", 0) if isinstance(writer_usage, dict) else 0
             )
+            held_writer_tokens = int(
+                await session.scalar(
+                    select(
+                        func.coalesce(func.sum(ModelBudgetReservationRow.reserved_total), 0)
+                    ).where(
+                        ModelBudgetReservationRow.run_id == run_id,
+                        ModelBudgetReservationRow.question_id == "__writer__",
+                        ModelBudgetReservationRow.status.in_(("reserved", "uncertain")),
+                    )
+                )
+                or 0
+            )
+            writer_uncertain = held_writer_tokens > 0
+            updated_usage["writer_pending_tokens"] = held_writer_tokens
             if initial_writer_reserve:
                 updated_usage["writer_token_reserve_released"] = max(
-                    0, initial_writer_reserve - writer_actual
+                    0, initial_writer_reserve - writer_actual - held_writer_tokens
                 )
             ledger_raw = updated_usage.get("budget_ledger", [])
             budget_ledger = list(ledger_raw) if isinstance(ledger_raw, list) else []
@@ -434,14 +463,18 @@ class ReportRepository:
                     "phase": "writing",
                     "allocated_tokens": initial_writer_reserve,
                     "actual_tokens": writer_actual,
-                    "status": "settled" if writer_usage is not None else "deterministic_fallback",
+                    "status": (
+                        "uncertain_no_refund"
+                        if writer_uncertain
+                        else "settled"
+                        if writer_usage is not None
+                        else "deterministic_fallback"
+                    ),
                     "report_version": version,
                 }
             )
             verification_tokens = int(
-                allocation.get("verification_tokens", 0)
-                if isinstance(allocation, dict)
-                else 0
+                allocation.get("verification_tokens", 0) if isinstance(allocation, dict) else 0
             )
             released_verification_tokens, verification_ledger_entry = (
                 _verification_budget_ledger_entry(
@@ -462,6 +495,9 @@ class ReportRepository:
             run.usage_snapshot = updated_usage
             run.quality_snapshot = {
                 **run.quality_snapshot,
+                "event_coverage": verification_result.get("event_coverage", {}),
+                "research_complete": verification_result.get("research_complete", False),
+                "technical_e2e_success": technical_success,
                 "citation_completeness": verification_result["citation_completeness"],
                 "numeric_citation_rate": verification_result["numeric_citation_rate"],
                 "report_verified": verification_result["verified"],
@@ -500,7 +536,11 @@ class ReportRepository:
                     if completed_with_limitations
                     else "研究报告已生成并完成验证。"
                 ),
-                refs={"report_id": str(report.id), "status": run.status},
+                refs={
+                    "report_id": str(report.id),
+                    "status": run.status,
+                    "accepted_evidence": accepted_count,
+                },
                 metrics=None,
             )
         return await self.get_for_run_by_id(run_id)

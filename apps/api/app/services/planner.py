@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from app.context.manager import ContextBudgetManager
 from app.core.stage_timing import timed_call
 from app.domain.context import ContextCandidate, ContextItemType
+from app.domain.event_coverage import EVENTS, event_types
 from app.domain.memory import MemoryItemView
 from app.domain.planning import (
     CompactResearchPlanDraft,
@@ -115,6 +116,14 @@ class PlannerService:
             f"研究目标: {binding.goal}\n"
             "请定义研究范围、子问题和完成标准。"
         )
+        required_events = event_types(binding.goal)
+        if required_events:
+            task_brief += (
+                "\n必需事件覆盖目标, 各节点必须独立验收且保留完整年份: "
+                + ", ".join(f"{key}({label})" for key, (label, _) in EVENTS.items()
+                            if key in required_events)
+                + "。问题可合并, 但不能用其他事件替代缺失节点。"
+            )
         memory_candidates = tuple(
             ContextCandidate(
                 item_type=ContextItemType.MEMORY,
