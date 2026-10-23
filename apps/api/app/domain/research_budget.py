@@ -315,7 +315,7 @@ def build_resource_pool_snapshot(
             "requests",
             "max_provider_requests",
             "search_provider_requests",
-            None,
+            "search_provider_requests_reserved",
         ),
         (
             "pages_fetched",

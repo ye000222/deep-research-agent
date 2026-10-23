@@ -616,6 +616,15 @@ class ResearchTarget:
     execution_attempt_ref: UUID | None = None
     work_execution_bounds: tuple[tuple[str, str], ...] = ()
     gap_execution_context: GapResearchExecutionContext | None = None
+    search_dispatch_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SearchDispatchReservation:
+    allowed: bool
+    reason: str
+    dispatch_ref: str = ""
+    provider_allowance: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -4261,6 +4270,18 @@ class ResearchToolRepository:
             (f"{question_id}:d{index}", str(criterion))
             for index, criterion in enumerate(question.evidence_requirements, start=1)
         )
+        remaining_provider_requests = max(
+            0, _as_int(run.budget_snapshot.get("max_provider_requests", 0))
+            - _as_int(run.usage_snapshot.get("search_provider_requests", 0))
+            - _as_int(run.usage_snapshot.get("search_provider_requests_reserved", 0)),
+        )
+        unattempted_questions = _as_int(await session.scalar(
+            select(func.count()).select_from(ResearchPlanItemRow).where(
+                ResearchPlanItemRow.run_id == run.id,
+                ResearchPlanItemRow.plan_version == run.plan_version,
+                ResearchPlanItemRow.status == "pending",
+            )
+        ))
         return ResearchTarget(
             plan_version=run.plan_version,
             question_id=question_id,
@@ -4273,7 +4294,9 @@ class ResearchToolRepository:
             acceptance_dimensions=dimensions,
             priority=question.priority,
             query_family=QueryFamily.SCOPE.value,
-            provider_request_allowance=1,
+            provider_request_allowance=_fair_provider_request_allowance(
+                remaining_provider_requests, unattempted_questions, per_query_cap=3
+            ),
             baseline_model_tokens=_model_tokens(run),
             baseline_pages_fetched=_as_int(run.usage_snapshot.get("pages_fetched", 0)),
             baseline_pages_extracted=_as_int(run.usage_snapshot.get("pages_extracted", 0)),
@@ -4476,6 +4499,122 @@ class ResearchToolRepository:
             metrics=metrics,
         )
 
+    async def reserve_search_dispatch(
+        self, run_id: UUID, *, worker_task_id: str, target: ResearchTarget
+    ) -> SearchDispatchReservation:
+        """Charge once BEFORE HTTP under the Run row lock, with no crash refund.
+
+        One in-flight Search per Run; an unclosed intent cannot be replayed by
+        another process or target. Fallbacks share its bounded HTTP allowance.
+        """
+        key = (
+            f"feedback:{target.query_execution_id}"
+            if target.query_execution_id is not None
+            else f"{target.tool_call_id}:{target.attempt_index}:{target.gap_attempt_index}"
+        )
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            usage = dict(run.usage_snapshot)
+            entries = dict(usage.get("search_dispatches", {}))
+            used = _as_int(usage.get("logical_queries", usage.get("searches", 0)))
+            limit = min(
+                _as_int(run.budget_snapshot.get(
+                    "max_searches", run.budget_snapshot.get("max_logical_queries", 15)
+                )),
+                _as_int(run.budget_snapshot.get(
+                    "max_logical_queries", run.budget_snapshot.get("max_searches", 15)
+                )),
+            )
+            reason = "reserved"
+            if key in entries:
+                reason = "search_dispatch_no_replay"
+            elif any(e.get("state") in {"RESERVED_NO_REPLAY", "UNKNOWN_NO_REPLAY"}
+                     for e in entries.values()):
+                reason = "search_dispatch_in_flight_or_unknown"
+            elif _deadline_at(run) is not None and _deadline_remaining_seconds(run) <= 0:
+                reason = "deadline_exhausted"
+            elif max(used, _as_int(usage.get("searches", 0))) >= limit:
+                reason = "search_budget_exhausted"
+            remaining = max(
+                0,
+                _as_int(run.budget_snapshot.get("max_provider_requests", 18))
+                - _as_int(usage.get("search_provider_requests", 0))
+                - _as_int(usage.get("search_provider_requests_reserved", 0)),
+            )
+            allowance = min(remaining, max(0, target.provider_request_allowance))
+            if reason == "reserved" and allowance <= 0:
+                reason = "provider_request_budget_exhausted"
+            if reason == "reserved":
+                entries[key] = {
+                    "state": "RESERVED_NO_REPLAY",
+                    "tool_call_id": str(target.tool_call_id),
+                    "question_id": target.question_id,
+                    "query_hash": hashlib.sha256(target.query.encode()).hexdigest(),
+                    "provider_allowance": allowance,
+                    "reserved_at": datetime.now(UTC).isoformat(),
+                }
+                usage["searches"] = max(used, _as_int(usage.get("searches", 0))) + 1
+                usage["logical_queries"] = usage["searches"]
+                usage["search_provider_requests_reserved"] = (
+                    _as_int(usage.get("search_provider_requests_reserved", 0)) + allowance
+                )
+                usage["search_dispatches"] = entries
+                run.usage_snapshot = _usage_with_resource_pools(run, usage)
+            await self._append_event(
+                session, run,
+                event_type="search.dispatch.reserved" if reason == "reserved"
+                else "search.dispatch.blocked",
+                public_summary="Search 发出前配额决策已持久化。",
+                refs={"question_id": target.question_id, "gap_id": str(target.gap_id),
+                      "dispatch_ref": key, "reason": reason,
+                      "feedback_id": str(target.feedback_id) if target.feedback_id else None},
+                metrics={"logical_usage_before": used,
+                         "logical_usage_after": usage.get("logical_queries", used),
+                         "logical_limit": limit,
+                         "provider_allowance": allowance if reason == "reserved" else 0},
+            )
+            return SearchDispatchReservation(reason == "reserved", reason, key, allowance)
+
+    @staticmethod
+    def _settle_search_dispatch(
+        run: ResearchRunRow, target: ResearchTarget, *, provider_requests: int, state: str
+    ) -> bool:
+        if target.search_dispatch_ref is None:
+            return True  # Historical imports/tests do not issue provider requests.
+        usage = dict(run.usage_snapshot)
+        entries = dict(usage.get("search_dispatches", {}))
+        entry = dict(entries.get(target.search_dispatch_ref, {}))
+        if entry.get("state") != "RESERVED_NO_REPLAY":
+            return False
+        allowance = _as_int(entry.get("provider_allowance", 0))
+        if provider_requests < 0 or provider_requests > allowance:
+            raise RuntimeError("SEARCH_ADAPTER_EXCEEDED_REQUEST_ALLOWANCE")
+        entry.update(state=state, provider_requests=provider_requests,
+                     settled_at=datetime.now(UTC).isoformat())
+        entries[target.search_dispatch_ref] = entry
+        usage["search_dispatches"] = entries
+        released = provider_requests if state == "UNKNOWN_NO_REPLAY" else allowance
+        usage["search_provider_requests_reserved"] = max(
+            0, _as_int(usage.get("search_provider_requests_reserved", 0)) - released
+        )
+        run.usage_snapshot = _usage_with_resource_pools(run, usage)
+        return True
+
+    async def record_feedback_query_guard(
+        self, run_id: UUID, *, worker_task_id: str, target: ResearchTarget,
+        query: str, topic: bool, event: bool, reason: str,
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            await self._append_event(
+                session, run, event_type="feedback.query.anchored",
+                public_summary="Feedback 查询主题与事件锚点已核对。",
+                refs={"question_id": target.question_id, "gap_id": str(target.gap_id),
+                      "query_intent": target.feedback_trigger_reason, "final_query": query,
+                      "reason": reason},
+                metrics={"topic_anchor_present": topic, "event_anchor_present": event},
+            )
+
     async def record_search_query_started(
         self,
         run_id: UUID,
@@ -4554,6 +4693,10 @@ class ResearchToolRepository:
             tool_call = await session.get(ResearchToolCallRow, target.tool_call_id)
             if tool_call is None:
                 raise ResearchLeaseLostError("tool call disappeared")
+            if not reused and not self._settle_search_dispatch(
+                run, target, provider_requests=provider_requests, state="SUCCEEDED"
+            ):
+                return set()
             if reused:
                 reused_recorded_urls: set[str] | None = None
                 query_hash = hashlib.sha256(
@@ -4840,10 +4983,11 @@ class ResearchToolRepository:
             tool_call.result_refs = {"search_query_id": str(query_row.id), "count": len(results)}
             tool_call.finished_at = datetime.now(UTC)
             usage = dict(run.usage_snapshot)
-            usage["searches"] = int(usage.get("searches", 0)) + 1
-            usage["logical_queries"] = (
-                _as_int(usage.get("logical_queries", usage.get("searches", 0) - 1)) + 1
-            )
+            if target.search_dispatch_ref is None:
+                usage["searches"] = int(usage.get("searches", 0)) + 1
+                usage["logical_queries"] = (
+                    _as_int(usage.get("logical_queries", usage.get("searches", 0) - 1)) + 1
+                )
             usage["search_provider_requests"] = _as_int(
                 usage.get("search_provider_requests", 0)
             ) + max(0, provider_requests)
@@ -5000,6 +5144,15 @@ class ResearchToolRepository:
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
+            if not self._settle_search_dispatch(
+                run, target, provider_requests=provider_requests,
+                state="UNKNOWN_NO_REPLAY" if (
+                    error_code == "SEARCH_DEADLINE_EXHAUSTED" or provider_timeouts > 0
+                    or (details is not None and details.get("failure_type") == "timeout")
+                )
+                else "FAILED",
+            ):
+                return
             tool_call = await session.get(ResearchToolCallRow, target.tool_call_id)
             if tool_call is not None:
                 tool_call.status = "failed"
@@ -5010,13 +5163,13 @@ class ResearchToolRepository:
             usage_snapshot["search_provider_failures"] = (
                 int(usage_snapshot.get("search_provider_failures", 0)) + 1
             )
-            usage_snapshot["searches"] = _as_int(usage_snapshot.get("searches", 0)) + 1
-            usage_snapshot["logical_queries"] = (
-                _as_int(
-                    usage_snapshot.get("logical_queries", usage_snapshot.get("searches", 0) - 1)
+            if target.search_dispatch_ref is None:
+                usage_snapshot["searches"] = _as_int(usage_snapshot.get("searches", 0)) + 1
+                usage_snapshot["logical_queries"] = (
+                    _as_int(
+                        usage_snapshot.get("logical_queries", usage_snapshot.get("searches", 0) - 1)
+                    ) + 1
                 )
-                + 1
-            )
             usage_snapshot["search_provider_requests"] = _as_int(
                 usage_snapshot.get("search_provider_requests", 0)
             ) + max(0, provider_requests)
@@ -6250,6 +6403,23 @@ class ResearchToolRepository:
         need -> action -> intent -> plan -> candidate chain.
         """
 
+        question = await session.scalar(
+            select(ResearchPlanItemRow).where(
+                ResearchPlanItemRow.run_id == run.id,
+                ResearchPlanItemRow.plan_version == run.plan_version,
+                ResearchPlanItemRow.question_id == requirement.question_id,
+            )
+        )
+        feedback = replace(
+            feedback,
+            metadata={
+                **feedback.metadata,
+                "current_question": getattr(question, "question", ""),
+                "original_query": run.normalized_goal,
+                "missing_requirement": requirement.criterion or feedback.missing_requirement,
+            },
+        )
+
         await self._append_event(
             session,
             run,
@@ -7010,6 +7180,7 @@ class ResearchToolRepository:
                             "source_reliability": item.source_reliability,
                             "relevance": evidence_candidate.relevance,
                             "confidence": evidence_candidate.confidence,
+                            **item.entailment_diagnostics,
                         },
                     ),
                 )

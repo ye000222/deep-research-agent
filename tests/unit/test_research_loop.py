@@ -453,6 +453,7 @@ class FakeRepository:
             gap_id=uuid4(),
             tool_call_id=uuid4(),
             source_id_seed=uuid4(),
+            provider_request_allowance=3,
         )
         self.extraction_failures: list[str] = []
         self.finished = False

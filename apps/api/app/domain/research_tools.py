@@ -89,6 +89,7 @@ class ScoredEvidence(BaseModel):
     input_quality: dict[str, str] | None = None
     canonical_span: CanonicalEvidenceSpan | None = None
     localization_status: LocalizationStatus | None = None
+    entailment_diagnostics: dict[str, str] = Field(default_factory=dict)
 
 
 class EvidenceView(BaseModel):

@@ -57,6 +57,9 @@ class ResearchContext:
     #: V2.4 Step 2: typed proposition-scoped advisory metadata. It is kept
     #: separate from legacy free-text hints and omitted from legacy payloads.
     proposition_gap_intents: tuple[GapResearchIntent, ...] = ()
+    current_question: str | None = None
+    original_query: str | None = None
+    missing_requirement: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.proposition_gap_intents, tuple):
@@ -83,6 +86,9 @@ class ResearchContext:
             or self.missing_source_count
             or self.target_claim_id
             or self.proposition_gap_intents
+            or self.current_question
+            or self.original_query
+            or self.missing_requirement
         )
 
     @property
@@ -108,6 +114,9 @@ class ResearchContext:
                 intent.model_dump(mode="json")
                 for intent in self.proposition_gap_intents
             ]
+        for name in ("current_question", "original_query", "missing_requirement"):
+            if getattr(self, name):
+                result[name] = getattr(self, name)
         return result
 
     @classmethod
@@ -142,6 +151,9 @@ class ResearchContext:
             missing_source_count=_int(metadata, MISSING_SOURCE_COUNT_KEY),
             target_claim_id=_text(metadata, TARGET_CLAIM_ID_KEY),
             proposition_gap_intents=typed_intents,
+            current_question=_text(metadata, "current_question"),
+            original_query=_text(metadata, "original_query"),
+            missing_requirement=_text(metadata, "missing_requirement"),
         )
 
 

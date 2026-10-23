@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from app.domain.feedback_query import bind_feedback_query
 from app.domain.gap_closure import GapClosureStatus, GapRequirement
 from app.domain.query_plan_validation import (
     QueryPlanValidation,
@@ -127,6 +128,16 @@ class QueryCandidateGenerator:
             # Phase 14.1: only append the missing-evidence hints; the base
             # expression, strategy mapping, and ranking inputs stay untouched.
             query_text = apply_query_hints(query_text, context.query_hints)
+            if context.current_question or context.original_query:
+                anchored = bind_feedback_query(
+                    query_text,
+                    current_question=context.current_question or "",
+                    original_query=context.original_query or "",
+                    requirement=context.missing_requirement or "",
+                )
+                if not anchored.allowed:
+                    return ()
+                query_text = anchored.query
         return (
             QueryCandidate(
                 query_candidate_id=uuid5(

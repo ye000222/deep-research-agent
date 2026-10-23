@@ -22,6 +22,7 @@ from app.domain.adaptive_scheduler import (
     source_role_fits_claim,
 )
 from app.domain.controlled_tools import ControlledToolName, EvidenceSearchInput, ToolDecisionRequest
+from app.domain.feedback_query import bind_feedback_query
 from app.domain.identifiers import uuid7
 from app.domain.provider_adapter import SearchProviderAdapter, SearchRequestContext
 from app.domain.provider_health import ProviderHealthState
@@ -555,7 +556,7 @@ class ResearchLoopService:
         target: ResearchTarget,
         telemetry: SimpleNamespace,
     ) -> tuple[list[SearchResult], str]:
-        """One query, at most two distinct adapters, sharing one request allowance."""
+        """One reserved query, bounded distinct adapters sharing its HTTP allowance."""
         selector = getattr(self._repository, "select_provider_for_target", None)
         visited: list[str] = []
         metrics = (
@@ -566,7 +567,8 @@ class ResearchLoopService:
             "last_unresponsive_response_count",
             "last_productive_response_count",
         )
-        for index in range(2):
+        max_adapters = min(3, len(self._search_adapters))
+        for index in range(max_adapters):
             if _deadline_expired(target):
                 raise TimeoutError
             if callable(selector):
@@ -635,7 +637,9 @@ class ResearchLoopService:
                 and remaining_requests > 1
                 and any(name != selected for name in self._search_adapters)
             ):
-                provider_allowance -= 1  # keep one existing slot for independent fallback
+                provider_allowance = max(
+                    1, remaining_requests - min(max_adapters - 1, remaining_requests - 1)
+                )  # keep existing HTTP slots for distinct fallback providers
             source = getattr(adapter, "execution_source", adapter)
             visited.append(selected)
             fallback = index > 0 or decision.fallback_used
@@ -675,7 +679,7 @@ class ResearchLoopService:
             if telemetry.last_request_count > target.provider_request_allowance:
                 raise RuntimeError("SEARCH_ADAPTER_EXCEEDED_REQUEST_ALLOWANCE")
             can_continue = (
-                index == 0
+                index + 1 < max_adapters
                 and error is not None
                 and error.retryable
                 and telemetry.last_request_count < target.provider_request_allowance
@@ -710,6 +714,22 @@ class ResearchLoopService:
         worker_task_id: str,
         target: ResearchTarget,
     ) -> ResearchAttemptResult:
+        if target.feedback_id is not None:
+            anchored = bind_feedback_query(
+                target.query, current_question=target.question,
+                original_query=target.original_goal,
+                requirement=" ".join(text for _, text in target.acceptance_dimensions),
+            )
+            recorder = getattr(self._repository, "record_feedback_query_guard", None)
+            if callable(recorder):
+                await recorder(
+                    run_id, worker_task_id=worker_task_id, target=target,
+                    query=anchored.query, topic=anchored.topic_anchor_present,
+                    event=anchored.event_anchor_present, reason=anchored.reason,
+                )
+            if not anchored.allowed:
+                return ResearchAttemptResult(0, 0, anchored.reason)
+            target = replace(target, query=anchored.query)
         event_cursor_reader = getattr(self._repository, "research_event_cursor", None)
         iteration_start_seq: int | None = None
         if callable(event_cursor_reader):
@@ -766,6 +786,21 @@ class ResearchLoopService:
             or target.query_already_executed
             or (cached_candidates and target.gap_attempt_index % 2 == 0)
         )
+        dispatch_guard = getattr(self._repository, "reserve_search_dispatch", None)
+        if not reuse_only and callable(dispatch_guard):
+            reservation = await dispatch_guard(
+                run_id, worker_task_id=worker_task_id, target=target
+            )
+            if not reservation.allowed:
+                if reservation.reason == "search_budget_exhausted" and cached_candidates:
+                    reuse_only = True
+                else:
+                    return ResearchAttemptResult(0, 0, reservation.reason)
+            else:
+                target = replace(
+                    target, search_dispatch_ref=reservation.dispatch_ref,
+                    provider_request_allowance=reservation.provider_allowance,
+                )
         query_started_recorder = getattr(
             self._repository,
             "record_search_query_started",

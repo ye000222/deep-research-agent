@@ -257,7 +257,6 @@ _LOW_VALUE_RE = re.compile(
 # such as ``3D``, ``2D`` or ``3C``. Those tokens are common in qualitative
 # research criteria and must not become numeric-scope requirements.
 _NUMBER_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:19|20)\d{2}(?![A-Za-z0-9])|"
     r"(?<![A-Za-z0-9])[-+]?\d+(?:[.,]\d+)?\s*(?:亿美元|亿元|万元|人民币|美元|欧元|英镑|%|\uff05|ms|s|秒|kg|吨|万|亿|元)?(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
@@ -517,19 +516,41 @@ def source_role_fits_claim(*, claim_type: str, source_role: str) -> bool:
 
 
 def claim_quote_entails(claim: str, quote: str) -> bool:
+    return claim_quote_comparison(claim, quote)[0]
+
+
+def claim_quote_comparison(claim: str, quote: str) -> tuple[bool, dict[str, str]]:
+    from app.domain.entailment_signals import event_conflicts, normalize_quote_facts
+
+    left, right = normalize_quote_facts(claim), normalize_quote_facts(quote)
     claim_tokens = _tokens(claim)
     quote_tokens = _tokens(quote)
-    claim_numbers = {_scope_number(item) for item in _NUMBER_RE.findall(claim)}
-    quote_numbers = {_scope_number(item) for item in _NUMBER_RE.findall(quote)}
+    claim_numbers = {_scope_number(item) for item in _NUMBER_RE.findall(left.residual)}
+    quote_numbers = {_scope_number(item) for item in _NUMBER_RE.findall(right.residual)}
+    required = set(left.signals) | {f"number:{n}:{unit}" for n, unit in claim_numbers}
+    observed = set(right.signals) | {f"number:{n}:{unit}" for n, unit in quote_numbers}
+    missing = sorted(required - observed)
+    conflicts = event_conflicts(claim, quote)
+    facts_supported = not missing and not conflicts and not any(
+        fact.startswith("invalid_") for fact in required | observed
+    )
+    diagnostics = {
+        "normalized_claim_signals": repr(sorted(required)[:64]),
+        "normalized_quote_signals": repr(sorted(observed)[:64]),
+        "unmatched_required_facts": repr([*missing, *conflicts][:64]),
+        "normalization_applied": repr(sorted(set(left.applied + right.applied))),
+    }
+    # A fact-only date/time expression has no lexical subject to compare.
+    fact_only = bool(required) and not re.search(r"[a-zA-Z\u3400-\u9fff]", left.residual)
     if _different_dominant_scripts(claim, quote):
         # A lexical entailment check is undefined for a translated claim and
         # its source-language quotation.  This path is reached only after the
         # caller has proved that the quotation occurs in the fetched source;
         # keep numeric assertions strict and let the existing relevance,
         # confidence, role and score gates validate the extracted card.
-        return bool(quote_tokens) and claim_numbers.issubset(quote_numbers)
+        return bool(quote_tokens) and facts_supported, diagnostics
     lexical = len(claim_tokens & quote_tokens) / max(1, min(10, len(claim_tokens)))
-    return lexical >= 0.45 and claim_numbers.issubset(quote_numbers)
+    return (fact_only or lexical >= 0.45) and facts_supported, diagnostics
 
 
 def _different_dominant_scripts(left: str, right: str) -> bool:

@@ -72,6 +72,9 @@ class ResearchNeed:
     required_source_count: int | None = None
     missing_source_count: int | None = None
     target_claim_id: str | None = None
+    current_question: str | None = None
+    original_query: str | None = None
+    missing_requirement: str | None = None
 
     def __post_init__(self) -> None:
         if not self.description.strip():
@@ -101,6 +104,9 @@ class ResearchNeed:
             "required_source_count": self.required_source_count,
             "missing_source_count": self.missing_source_count,
             "target_claim_id": self.target_claim_id,
+            **{name: getattr(self, name) for name in
+               ("current_question", "original_query", "missing_requirement")
+               if getattr(self, name)},
         }
 
     @property
@@ -117,6 +123,9 @@ class ResearchNeed:
             required_source_count=self.required_source_count,
             missing_source_count=self.missing_source_count,
             target_claim_id=self.target_claim_id,
+            current_question=self.current_question,
+            original_query=self.original_query,
+            missing_requirement=self.missing_requirement,
         )
 
 
@@ -170,6 +179,9 @@ class ResearchNeedGenerator:
             required_source_count=context.required_source_count,
             missing_source_count=context.missing_source_count,
             target_claim_id=context.target_claim_id,
+            current_question=context.current_question,
+            original_query=context.original_query,
+            missing_requirement=context.missing_requirement,
         )
         return (need,)
 
