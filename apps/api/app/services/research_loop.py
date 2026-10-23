@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -545,6 +546,162 @@ class ResearchLoopService:
             return target
         return replace(target, query=enrichment.enriched_query)
 
+    async def _routed_search(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        telemetry: SimpleNamespace,
+    ) -> tuple[list[SearchResult], str]:
+        """One query, at most two distinct adapters, sharing one request allowance."""
+        selector = getattr(self._repository, "select_provider_for_target", None)
+        visited: list[str] = []
+        metrics = (
+            "last_request_count",
+            "last_timeout_count",
+            "last_fallback_count",
+            "last_healthy_response_count",
+            "last_unresponsive_response_count",
+            "last_productive_response_count",
+        )
+        for index in range(2):
+            if _deadline_expired(target):
+                raise TimeoutError
+            if callable(selector):
+                decision = await selector(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                    target=target,
+                    **({"excluded_providers": tuple(visited)} if visited else {}),
+                )
+            else:
+                decision = ProviderSelectionDecision(
+                    "SearXNG" if not visited else None,
+                    tuple(visited),
+                    "health_router_unavailable_default_provider",
+                    ProviderHealthState.UNKNOWN,
+                    False,
+                )
+            selected = decision.selected_provider
+            if selected is None or selected in visited:
+                raise ToolExecutionError(
+                    "SEARCH_PROVIDER_DEGRADED",
+                    retryable=True,
+                    details={
+                        "failure_type": "circuit_open",
+                        "provider": "",
+                        "context": {"strategy": "health_routing_stop", "reason": decision.reason},
+                    },
+                )
+            recorder = getattr(self._repository, "record_provider_execution_started", None)
+            if callable(recorder):
+                await recorder(
+                    run_id, worker_task_id=worker_task_id, target=target, decision=decision
+                )
+            telemetry.selected_provider = selected
+            telemetry.attempted_provider = None
+            telemetry.latest_request_count = 0
+            adapter = self._search_adapters.get(selected)
+            if adapter is None:
+                error = ToolExecutionError(
+                    "SEARCH_PROVIDER_DEGRADED",
+                    retryable=False,
+                    details={
+                        "provider": selected,
+                        "failure_type": "unavailable",
+                        "context": {
+                            "strategy": "adapter_dispatch_missing",
+                            "fallback_attempted": False,
+                        },
+                    },
+                )
+                completed = getattr(self._repository, "record_provider_execution_completed", None)
+                if callable(completed):
+                    await completed(
+                        run_id, worker_task_id=worker_task_id, target=target,
+                        provider=selected, provider_requests=0,
+                        fallback=index > 0 or decision.fallback_used, error=error,
+                    )
+                raise error
+            remaining_requests = target.provider_request_allowance - telemetry.last_request_count
+            if remaining_requests <= 0:
+                raise ToolExecutionError("SEARCH_PROVIDER_BUDGET_EXHAUSTED", retryable=False)
+            provider_allowance = remaining_requests
+            if (
+                index == 0
+                and selected == "SearXNG"
+                and remaining_requests > 1
+                and any(name != selected for name in self._search_adapters)
+            ):
+                provider_allowance -= 1  # keep one existing slot for independent fallback
+            source = getattr(adapter, "execution_source", adapter)
+            visited.append(selected)
+            fallback = index > 0 or decision.fallback_used
+            error = None
+            interrupted = False
+            try:
+                results = await adapter.search(
+                    target.query,
+                    limit=_MAX_SEARCH_RESULTS,
+                    exclude_domains=target.search_excluded_owner_keys,
+                    exclude_urls=target.search_excluded_urls,
+                    request_context=SearchRequestContext(
+                        provider_request_allowance=provider_allowance,
+                        alternate_query=target.alternate_query or None,
+                    ),
+                )
+                if not results:
+                    raise ToolExecutionError("SEARCH_PROVIDER_DEGRADED", retryable=True)
+            except ToolExecutionError as exc:
+                error = exc
+            except asyncio.CancelledError:
+                interrupted = True
+                error = ToolExecutionError("SEARCH_DEADLINE_EXHAUSTED", retryable=False)
+            finally:
+                count = _provider_request_count(source, default=1)
+                telemetry.latest_request_count = count
+                telemetry.attempted_provider = selected if count > 0 else None
+                if fallback:
+                    telemetry.fallback_requests = getattr(telemetry, "fallback_requests", 0) + count
+                for metric in metrics:
+                    value = (
+                        count
+                        if metric == "last_request_count"
+                        else _provider_metric(source, metric)
+                    )
+                    setattr(telemetry, metric, getattr(telemetry, metric, 0) + value)
+            if telemetry.last_request_count > target.provider_request_allowance:
+                raise RuntimeError("SEARCH_ADAPTER_EXCEEDED_REQUEST_ALLOWANCE")
+            can_continue = (
+                index == 0
+                and error is not None
+                and error.retryable
+                and telemetry.last_request_count < target.provider_request_allowance
+                and not _deadline_expired(target)
+            )
+            completed = getattr(self._repository, "record_provider_execution_completed", None)
+            if callable(completed):
+                await completed(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                    target=target,
+                    provider=selected,
+                    provider_requests=count,
+                    fallback=fallback,
+                    error=error,
+                    will_fallback=can_continue,
+                )
+                if can_continue:
+                    telemetry.health_recorded_provider = selected
+            if interrupted:
+                raise asyncio.CancelledError
+            if error is None:
+                return results, selected
+            if not can_continue:
+                raise error
+        raise AssertionError("bounded search dispatch did not terminate")
+
     async def _research_target(
         self,
         run_id: UUID,
@@ -571,10 +728,7 @@ class ResearchLoopService:
             question_id=target.question_id,
             minimum_call=minimum_call.total_tokens,
         )
-        if (
-            not initial_budget.allowed
-            or initial_budget.max_call_tokens < minimum_call.total_tokens
-        ):
+        if not initial_budget.allowed or initial_budget.max_call_tokens < minimum_call.total_tokens:
             # A fairness yield is temporary and must never be persisted as
             # question exhaustion. The scheduler owns fairness; the evaluator
             # records a non-consuming yield if a legacy caller still returns
@@ -650,102 +804,15 @@ class ResearchLoopService:
                 if remaining <= 0:
                     return ResearchAttemptResult(0, 0, "deadline_exhausted")
                 if isinstance(self._search, SearXNGSearchProvider):
-                    # Phase 12.2: Router is authoritative for provider selection.
-                    # The repository may not expose the router in unit-test
-                    # fakes, so fall back to a synthetic HEALTHY SearXNG
-                    # decision that preserves the pre-12.2 execution shape
-                    # (still single-provider, still no Bing side-switch here).
-                    selector = getattr(
-                        self._repository, "select_provider_for_target", None
-                    )
-                    decision: ProviderSelectionDecision | None = None
-                    if callable(selector):
-                        decision = await selector(
-                            run_id,
-                            worker_task_id=worker_task_id,
-                            target=target,
-                        )
-                    if decision is None:
-                        decision = ProviderSelectionDecision(
-                            selected_provider="SearXNG",
-                            excluded_providers=(),
-                            reason="health_router_unavailable_default_provider",
-                            health_state=ProviderHealthState.UNKNOWN,
-                            fallback_used=False,
-                            feedback_execution_id=target.feedback_execution_id,
-                        )
-                    execution_recorder = getattr(
-                        self._repository,
-                        "record_provider_execution_started",
-                        None,
-                    )
-                    if callable(execution_recorder) and decision.selected_provider:
-                        await execution_recorder(
-                            run_id,
-                            worker_task_id=worker_task_id,
-                            target=target,
-                            decision=decision,
-                        )
-                    if decision.selected_provider is None:
-                        # F.2: All providers unavailable or the switch budget
-                        # is exhausted. Emit a bounded tool failure so the
-                        # evaluator records a provider_error outcome, and never
-                        # crash the worker.
-                        raise ToolExecutionError(
-                            "SEARCH_PROVIDER_DEGRADED",
-                            retryable=True,
-                            details={
-                                "provider": "",
-                                "failure_type": "circuit_open",
-                                "context": {
-                                    "strategy": "health_routing_stop",
-                                    "reason": decision.reason,
-                                    "query": target.query[:500],
-                                    "fallback_attempted": False,
-                                    "fallback_provider": None,
-                                    "fallback_success": False,
-                                },
-                                "failures": [],
-                            },
-                        )
-                    selected = decision.selected_provider or ""
-                    adapter = self._search_adapters.get(selected)
-                    if adapter is None:
-                        # The Router selected a provider that is not wired into
-                        # the dispatch map. Never substitute another provider
-                        # (no silent fallback): stop as a bounded provider error.
-                        raise ToolExecutionError(
-                            "SEARCH_PROVIDER_DEGRADED",
-                            retryable=True,
-                            details={
-                                "provider": selected,
-                                "failure_type": "circuit_open",
-                                "context": {
-                                    "strategy": "adapter_dispatch_missing",
-                                    "reason": "selected_provider_has_no_adapter",
-                                    "query": target.query[:500],
-                                    "fallback_attempted": False,
-                                    "fallback_provider": None,
-                                    "fallback_success": False,
-                                },
-                                "failures": [],
-                            },
-                        )
-                    executed_provider = selected
-                    executed_source = getattr(adapter, "execution_source", adapter)
-                    request_context = SearchRequestContext(
-                        provider_request_allowance=target.provider_request_allowance,
-                        alternate_query=target.alternate_query or None,
-                    )
-                    results = await timed_call(
+                    executed_source = SimpleNamespace(last_request_count=0, attempted_provider=None)
+                    results, executed_provider = await timed_call(
                         "search.request",
                         asyncio.wait_for(
-                            adapter.search(
-                                target.query,
-                                limit=_MAX_SEARCH_RESULTS,
-                                exclude_domains=target.search_excluded_owner_keys,
-                                exclude_urls=target.search_excluded_urls,
-                                request_context=request_context,
+                            self._routed_search(
+                                run_id,
+                                worker_task_id=worker_task_id,
+                                target=target,
+                                telemetry=executed_source,
                             ),
                             timeout=remaining,
                         ),
@@ -772,28 +839,72 @@ class ResearchLoopService:
                     executed_source, "last_productive_response_count"
                 )
             except TimeoutError:
+                await self._repository.record_tool_failure(
+                    run_id,
+                    worker_task_id=worker_task_id,
+                    target=target,
+                    error_code="SEARCH_DEADLINE_EXHAUSTED",
+                    retryable=False,
+                    details={
+                        "failure_type": "timeout",
+                        "provider": getattr(executed_source, "selected_provider", None),
+                        "context": {
+                            "fallback_attempted": getattr(executed_source, "fallback_requests", 0)
+                            > 0,
+                        },
+                    },
+                    provider_requests=_provider_request_count(executed_source, default=0),
+                    executed_provider=getattr(executed_source, "attempted_provider", None),
+                    latency_ms=int((time.monotonic() - search_started) * 1000),
+                )
                 return ResearchAttemptResult(0, 0, "deadline_exhausted")
             except ToolExecutionError as exc:
                 search_latency_ms = int((time.monotonic() - search_started) * 1_000)
                 provider_requests = _provider_request_count(executed_source, default=0)
                 provider_timeouts = _provider_metric(executed_source, "last_timeout_count")
                 provider_fallbacks = _provider_metric(executed_source, "last_fallback_count")
-                provider_healthy = _provider_metric(
-                    executed_source, "last_healthy_response_count"
-                )
+                provider_healthy = _provider_metric(executed_source, "last_healthy_response_count")
                 provider_unresponsive = _provider_metric(
                     executed_source, "last_unresponsive_response_count"
                 )
                 provider_productive = _provider_metric(
                     executed_source, "last_productive_response_count"
                 )
+                selected_provider = getattr(executed_source, "selected_provider", executed_provider)
+                executed_provider = getattr(
+                    executed_source, "attempted_provider", executed_provider
+                )
+                details = dict(exc.details or {})
+                if not details.get("provider") and selected_provider is not None:
+                    details["provider"] = selected_provider
+                context = dict(details.get("context") or {})
+                context.update(
+                    {
+                        "selected_provider": selected_provider,
+                        "attempted_provider": getattr(
+                            executed_source, "attempted_provider",
+                            executed_provider if provider_requests > 0 else None,
+                        ),
+                        "fallback_attempted": getattr(executed_source, "fallback_requests", 0) > 0,
+                    }
+                )
+                details["context"] = context
+                if isinstance(self._search, SearXNGSearchProvider):
+                    details["metrics"] = {
+                        **dict(details.get("metrics") or {}),
+                        "provider_requests": provider_requests,
+                        "fallback_attempts": provider_fallbacks,
+                        "healthy_responses": provider_healthy,
+                        "unresponsive_responses": provider_unresponsive,
+                        "productive_responses": provider_productive,
+                    }
                 await self._repository.record_tool_failure(
                     run_id,
                     worker_task_id=worker_task_id,
                     target=target,
                     error_code=exc.code,
                     retryable=exc.retryable,
-                    details=exc.details,
+                    details=details,
                     provider_requests=provider_requests,
                     provider_timeouts=provider_timeouts,
                     provider_fallbacks=provider_fallbacks,
@@ -802,6 +913,11 @@ class ResearchLoopService:
                     provider_productive=provider_productive,
                     latency_ms=search_latency_ms,
                     executed_provider=executed_provider,
+                    health_already_recorded=(
+                        getattr(executed_source, "health_recorded_provider", None)
+                        == selected_provider
+                        and selected_provider is not None
+                    ),
                 )
                 if exc.retryable:
                     # SearXNG's internal fallback strategies are exhausted, but
@@ -1088,6 +1204,7 @@ class ResearchLoopService:
         zero_yield_pages = 0
         question_budget_exhausted = False
         question_budget_yielded = False
+        unaccepted_extraction_completed = False
         model_budget_exhausted = False
         zero_candidate_seen = False
         attempted_pages: set[tuple[str, str]] = set()
@@ -1350,6 +1467,11 @@ class ResearchLoopService:
                 node="evidence_extractor",
                 attempt_id=attempt_id,
                 minimum_call_tokens=minimum_call.total_tokens,
+                continuation_page=(
+                    {"url": page.final_url, "content_hash": page.content_hash}
+                    if unaccepted_extraction_completed
+                    else None
+                ),
                 max_output=min(model_budget.max_call_tokens // 4, 4_000),
                 estimated_input=(
                     model_budget.max_call_tokens - min(model_budget.max_call_tokens // 4, 4_000)
@@ -1593,6 +1715,7 @@ class ResearchLoopService:
                 await record_recovery_failure("evidence_persistence_failed")
                 raise
             accepted += page_accepted
+            unaccepted_extraction_completed = accepted == 0
             persisted_evidence_refs.extend(page_evidence_refs)
             structured_extraction_failures = 0
             if page_candidate_count == 0:

@@ -420,7 +420,17 @@ function runMessage(run: ResearchRun, events: AgentEvent[] = []): string {
       return `${summary} 诊断：网页已读取，但证据抽取模型全部超时或网络失败。${suffix}`;
     }
     if (detail.includes("EVIDENCE_VALIDATION_EMPTY")) {
-      return `${summary} 诊断：网页已读取，但候选证据没有通过原文定位、来源范围或安全校验。${suffix}`;
+      const failure = [...events].reverse().find((event) => event.event_type === "run.failed");
+      const cause = failure?.refs.failure_cause;
+      const causes: Record<string, string> = {
+        evidence_relevance_below_threshold: "候选证据与当前研究问题相关性不足",
+        evidence_confidence_below_threshold: "候选证据置信度不足",
+        evidence_score_below_threshold: "候选证据综合质量不足",
+        quote_not_found_in_source: "候选引文无法在来源正文中定位",
+        extraction_returned_no_candidates: "证据抽取已完成，但没有返回候选证据",
+      };
+      const diagnosis = typeof cause === "string" ? causes[cause] : undefined;
+      return `${summary} 诊断：网页已读取；${diagnosis ?? "候选证据未通过验证，请查看逐条拒绝原因"}。${suffix}`;
     }
     if (detail.includes("PAGE_BUDGET_OVERRUN")) {
       return `${summary} 诊断：页面预算在外部读取前未能获得足够槽位；已保留当前证据并可从检查点恢复。${suffix}`;

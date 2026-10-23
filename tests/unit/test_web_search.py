@@ -748,7 +748,7 @@ async def test_direct_fallback_records_success_and_failure() -> None:
     ) as client:
         provider = SearXNGSearchProvider(client, "http://searxng")
         results = await provider.search(
-            "industrial inspection", limit=1, max_provider_requests=1
+            "industrial inspection", limit=1, max_provider_requests=2
         )
 
     assert results
@@ -766,7 +766,7 @@ async def test_direct_fallback_records_success_and_failure() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(failed_handler)) as client:
         provider = SearXNGSearchProvider(client, "http://searxng")
         with pytest.raises(ToolExecutionError) as caught:
-            await provider.search("industrial inspection", limit=1, max_provider_requests=1)
+            await provider.search("industrial inspection", limit=1, max_provider_requests=2)
 
     details = caught.value.details
     assert details["failure_type"] == "fallback_failure"

@@ -708,6 +708,7 @@ def decide_question_borrow(
     expected_utility: float,
     low_gain_streak: int,
     has_untried_query_family: bool = False,
+    source_continuation: bool = False,
     utility_threshold: float = 0.005,
 ) -> QuestionBorrowDecision:
     """Apply the V2 first-pass, state, risk, utility, and cap contract."""
@@ -722,7 +723,10 @@ def decide_question_borrow(
     else:
         if research_state.research_opportunity == ResearchOpportunityState.NOT_STARTED:
             return QuestionBorrowDecision(False, "first_pass_floor_protected")
-        if research_state.recovery_eligibility == RecoveryEligibilityState.NOT_EVALUATED:
+        if research_state.recovery_eligibility == RecoveryEligibilityState.NOT_EVALUATED and not (
+            source_continuation
+            and research_state.research_opportunity == ResearchOpportunityState.ACTIVE
+        ):
             return QuestionBorrowDecision(False, "first_pass_floor_protected")
         if research_state.recovery_eligibility == RecoveryEligibilityState.DEFERRED:
             return QuestionBorrowDecision(False, "first_pass_floor_protected")

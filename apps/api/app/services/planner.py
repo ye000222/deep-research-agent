@@ -22,7 +22,7 @@ from app.domain.planning import (
     materialize_research_plan,
     normalize_research_plan_draft_payload,
 )
-from app.domain.planning_scope import PlanScopeError, enforce_plan_scope
+from app.domain.planning_scope import PlanScopeError, enforce_plan_scope, question_scope_error
 from app.domain.providers import (
     CanonicalModelRequest,
     CanonicalModelResult,
@@ -446,6 +446,16 @@ class PlannerService:
 
 def _scoped_plan(goal: str, draft: Any, usage: TokenUsage) -> ResearchPlan:
     original = materialize_research_plan(goal, draft)
+    for index, question in enumerate(original.questions, 1):
+        reason = question_scope_error(goal, question)
+        if reason is not None:
+            # Index and deterministic reason suffice; never log generated
+            # question text or a user-controlled identifier as a secret channel.
+            logging.getLogger(__name__).info(
+                "Planner scope rejected question_index=%d reason_code=%s",
+                index,
+                reason,
+            )
     try:
         scoped = enforce_plan_scope(original, goal)
     except PlanScopeError as exc:

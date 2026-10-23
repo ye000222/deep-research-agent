@@ -122,6 +122,9 @@ class ExhaustedRetryRepository:
     async def acquire_for_execution(self, *args: object, **kwargs: object) -> bool:
         return True
 
+    async def get_run_state_inputs(self, *args: object) -> dict[str, object]:
+        return {"orchestrator_version": "V2_LEGACY"}
+
     async def defer_retryable_search_error(self, *args: object, **kwargs: object) -> None:
         # Four durable retries already occurred before this worker invocation.
         return None
@@ -245,6 +248,8 @@ async def test_exhausted_provider_retry_persists_current_terminal_failure(
             searxng_base_url="http://unused",
             artifact_root="artifacts",
             evidence_aware_context_enabled=True,
+            semantic_runtime_mode="OFF",
+            proposition_gap_work_scheduling_enabled=False,
         ),
     )
     monkeypatch.setattr(worker_tasks, "PostgresRuntime", FakeDatabase)

@@ -309,6 +309,25 @@ class SearXNGSearchProvider:
     def events(self) -> list[dict[str, object]]:
         return list(self._events)
 
+    def _reset_request_metrics(self) -> None:
+        for name in (
+            "_last_request_count",
+            "_last_timeout_count",
+            "_last_fallback_count",
+            "_last_healthy_response_count",
+            "_last_unresponsive_response_count",
+            "_last_productive_response_count",
+            "_last_network_error_count",
+            "_last_http_error_count",
+            "_last_empty_response_count",
+            "_last_invalid_response_count",
+            "_last_fallback_attempt_count",
+            "_last_fallback_success_count",
+            "_last_circuit_open_count",
+        ):
+            setattr(self, name, 0)
+        self._failure_events = []
+
     async def search(
         self,
         query: str,
@@ -323,10 +342,10 @@ class SearXNGSearchProvider:
         """Run one SearXNG search under the current provider routing rules.
 
         ``single_provider_only`` (Phase 12.2): when True, the SearXNG adapter
-        stops owning provider selection. The internal circuit-open early
-        return and the direct-Bing transport fallback are both skipped so the
-        upstream :class:`ProviderRouter` is the sole authority on when to
-        switch provider. Non-stop behavior (query strategy, hedged requests,
+        stops owning provider selection. Direct-Bing transport fallback is
+        skipped so the upstream router alone selects the next provider. Each
+        transport still enforces its own circuit before sending HTTP. Internal
+        behavior (query strategy, hedged requests,
         engine-specific cooldowns that stay inside a single SearXNG attempt)
         is intentionally preserved so this phase does not change search
         strategy.
@@ -346,6 +365,14 @@ class SearXNGSearchProvider:
         self._last_circuit_open_count = 0
         self._failure_events = []
         normalized = " ".join(query.split())
+        total_request_limit = max_provider_requests
+        if (
+            not single_provider_only
+            and max_provider_requests is not None
+            and max_provider_requests > 1
+            and (urlsplit(self._base_url).hostname or "") in {"searxng", "localhost", "127.0.0.1"}
+        ):
+            max_provider_requests -= 1
         normalized_alternate = " ".join((alternate_query or "").split()) or normalized
         normalized_excluded_owners = frozenset(
             domain.casefold().strip().lstrip(".")
@@ -367,7 +394,7 @@ class SearXNGSearchProvider:
         if not normalized:
             raise ToolExecutionError("SEARCH_QUERY_INVALID", retryable=False)
         now = time.monotonic()
-        if now < self._circuit_open_until and not single_provider_only:
+        if now < self._circuit_open_until:
             self._last_circuit_open_count += 1
             raise ToolExecutionError(
                 "SEARCH_PROVIDER_DEGRADED",
@@ -595,6 +622,11 @@ class SearXNGSearchProvider:
             if compact_query:
                 fallback_queries.append(compact_query)
             for fallback_query in dict.fromkeys(fallback_queries):
+                if (
+                    total_request_limit is not None
+                    and self._last_request_count >= total_request_limit
+                ):
+                    break
                 candidates = await self._direct_bing_fallback(
                     fallback_query,
                     limit=limit,
@@ -672,7 +704,7 @@ class SearXNGSearchProvider:
                 failure_type="circuit_open",
                 strategy="direct_bing_fallback",
                 query=query,
-                fallback_attempted=True,
+                fallback_attempted=False,
                 fallback_provider=_FALLBACK_PROVIDER_NAME,
                 fallback_success=False,
             )
@@ -680,6 +712,7 @@ class SearXNGSearchProvider:
 
         self._last_fallback_attempt_count += 1
         self._last_fallback_count += 1
+        self._last_request_count += 1
 
         try:
             response = await self._fallback_client.get(
@@ -813,17 +846,20 @@ class SearXNGSearchProvider:
         limit: int = 8,
         exclude_domains: tuple[str, ...] = (),
         exclude_urls: tuple[str, ...] = (),
+        max_provider_requests: int | None = None,
     ) -> list[SearchResult]:
         """Invoke Bing as the sole provider (Phase 12.2 router-authoritative mode).
 
         The :class:`ProviderRouter` may pick Bing directly when SearXNG is
         ``UNAVAILABLE``. In that path the outer ``ProviderExecutor`` calls this
-        method instead of :meth:`search`, so we bypass the internal Bing
-        cooldown check (which is a duplicate source of truth now owned by
-        :class:`ProviderHealthTracker`). Downstream URL safety, page-fetch,
+        method instead of :meth:`search`. Both router health and the transport's
+        own Bing cooldown remain enforced. Downstream URL safety, page-fetch,
         extraction, and evidence checks remain unchanged.
         """
 
+        self._reset_request_metrics()
+        if max_provider_requests is not None and max_provider_requests <= 0:
+            raise ToolExecutionError("SEARCH_PROVIDER_BUDGET_EXHAUSTED", retryable=False)
         normalized = " ".join(query.split())
         if not normalized:
             raise ToolExecutionError("SEARCH_QUERY_INVALID", retryable=False)
@@ -835,14 +871,12 @@ class SearXNGSearchProvider:
         normalized_excluded_urls = frozenset(
             normalize_source_url(url) for url in exclude_urls if url
         )
-        self._last_request_count += 1
-        self._last_fallback_attempt_count += 1
         results = await self._direct_bing_fallback(
             normalized,
             limit=limit,
             excluded_urls=normalized_excluded_urls,
             excluded_owners=normalized_excluded_owners,
-            bypass_circuit=True,
+            bypass_circuit=False,
         )
         if not results:
             raise ToolExecutionError(
@@ -851,11 +885,13 @@ class SearXNGSearchProvider:
                 details=self._failure_details(
                     {
                         "provider": _FALLBACK_PROVIDER_NAME,
-                        "failure_type": "empty_response",
+                        "failure_type": (
+                            self._last_failure_type if self._failure_events else "unavailable"
+                        ),
                         "context": {
                             "strategy": "bing_only",
                             "query": normalized[:500],
-                            "fallback_attempted": False,
+                            "fallback_attempted": self._last_request_count > 0,
                             "fallback_provider": None,
                             "fallback_success": False,
                             "single_provider_only": True,
@@ -1216,10 +1252,7 @@ class SearXNGSearchProvider:
     def _mark_provider_degraded(self, provider: str, failure_type: str) -> None:
         state = self._provider_states[provider]
         now = time.monotonic()
-        if (
-            state["state"] == _PROVIDER_COOLDOWN
-            and _state_float(state["cooldown_until"]) > now
-        ):
+        if state["state"] == _PROVIDER_COOLDOWN and _state_float(state["cooldown_until"]) > now:
             return
         streak = _state_int(state["failure_streak"]) + 1
         state["failure_streak"] = streak

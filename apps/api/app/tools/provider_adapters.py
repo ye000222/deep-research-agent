@@ -78,12 +78,14 @@ class BingAdapter:
         exclude_urls: tuple[str, ...] = (),
         request_context: SearchRequestContext | None = None,
     ) -> list[SearchResult]:
-        del request_context  # Bing HTML fallback has no per-request budget input.
         return await self._provider.bing_only_search(
             query,
             limit=limit,
             exclude_domains=exclude_domains,
             exclude_urls=exclude_urls,
+            max_provider_requests=(
+                request_context.provider_request_allowance if request_context else None
+            ),
         )
 
 

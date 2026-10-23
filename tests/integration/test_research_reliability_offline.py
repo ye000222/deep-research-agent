@@ -87,7 +87,17 @@ class Reader:
         )
 
     def consume_events(self, url):
-        return []  # persistence still records fetch/read/extraction lifecycle
+        return (
+            [
+                {
+                    "event_type": "source.readable",
+                    "requested_url": url,
+                    "final_url": url + "/canonical" if self.redirect else url,
+                }
+            ]
+            if not (self.second_short and url == URLS[1])
+            else []
+        )
 
 
 class Gateway:

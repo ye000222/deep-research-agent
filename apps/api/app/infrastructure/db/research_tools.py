@@ -194,6 +194,7 @@ from app.infrastructure.db.run_models import (
     ResearchRunRow,
     WorkAttemptRow,
 )
+from app.tools.errors import ToolExecutionError
 
 _SEARCH_QUERY_SEPARATOR_RE = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
 
@@ -1330,6 +1331,123 @@ class ResearchToolRepository:
             usage["page_slots_reserved"] = max(0, reserved - released)
             run.usage_snapshot = _usage_with_resource_pools(run, usage)
 
+    async def _source_continuation_gate(
+        self,
+        session: AsyncSession,
+        run: ResearchRunRow,
+        *,
+        question_id: str,
+        page: Mapping[str, str],
+        minimum_call: int,
+        requested: int,
+        available: int,
+    ) -> tuple[bool, str, int]:
+        """One durable extra-source opportunity, never a second first-pass grant."""
+        if _deadline_at(run) is not None and _deadline_remaining_seconds(run) <= 0:
+            return False, "deadline_exhausted", 0
+        accepted_evidence = await session.scalar(
+            select(func.count(ResearchEvidenceRow.id)).where(
+                ResearchEvidenceRow.run_id == run.id,
+                ResearchEvidenceRow.question_id == question_id,
+                ResearchEvidenceRow.accepted.is_(True),
+            )
+        )
+        if accepted_evidence:
+            return False, "source_continuation_already_supported", 0
+        event_rows = (
+            await session.execute(
+                select(AgentEventRow.event_type, AgentEventRow.refs).where(
+                    AgentEventRow.run_id == run.id,
+                    AgentEventRow.event_type.in_(
+                        ("evidence.extracted", "source.readable", "evidence.extraction_started")
+                    ),
+                )
+            )
+        ).all()
+        plan_items = (
+            await session.scalars(
+                select(ResearchPlanItemRow).where(
+                    ResearchPlanItemRow.run_id == run.id,
+                    ResearchPlanItemRow.plan_version == run.plan_version,
+                )
+            )
+        ).all()
+        url = normalize_source_url(page.get("url", ""))
+        content_hash = page.get("content_hash", "")
+        if not url or not re.fullmatch(r"[a-fA-F0-9]{64}", content_hash):
+            return False, "source_continuation_identity_invalid", 0
+        own_events = [
+            (kind, refs)
+            for kind, refs in event_rows
+            if isinstance(refs, dict) and refs.get("question_id") == question_id
+        ]
+        if not any(kind == "evidence.extracted" for kind, _ in own_events):
+            return False, "source_continuation_extraction_not_completed", 0
+        if not any(
+            kind == "source.readable"
+            and normalize_source_url(str(refs.get("final_url", ""))) == url
+            for kind, refs in own_events
+        ):
+            return False, "source_continuation_not_readable", 0
+        if any(
+            kind == "evidence.extraction_started"
+            and (
+                normalize_source_url(str(refs.get("final_url", ""))) == url
+                or refs.get("content_hash") == content_hash
+            )
+            for kind, refs in own_events
+        ):
+            return False, "source_continuation_already_attempted", 0
+        prior_grant = await session.scalar(
+            select(AgentEventRow.run_seq)
+            .where(
+                AgentEventRow.run_id == run.id,
+                AgentEventRow.event_type == "budget.source_continuation_reserved",
+                AgentEventRow.refs["question_id"].as_string() == question_id,
+            )
+            .limit(1)
+        )
+        if prior_grant is not None:
+            return False, "source_continuation_limit", 0
+        rows = (
+            await session.scalars(
+                select(ModelBudgetReservationRow).where(
+                    ModelBudgetReservationRow.run_id == run.id,
+                    ModelBudgetReservationRow.node == "evidence_extractor",
+                )
+            )
+        ).all()
+        own_rows = [row for row in rows if row.question_id == question_id]
+        # Released/uncertain/abandoned attempts never manufacture a new grant.
+        if len(own_rows) != 1 or own_rows[0].status != "settled":
+            return False, "source_continuation_prior_outcome_not_settled", 0
+        allocation = run.budget_snapshot.get("allocation", {})
+        floors = allocation.get("question_token_floors", {})
+        completed = {
+            refs.get("question_id")
+            for kind, refs in event_rows
+            if kind == "evidence.extracted" and isinstance(refs, dict)
+        }
+        future_reserve = 0
+        for item in plan_items:
+            if item.question_id == question_id or item.question_id in completed:
+                continue
+            committed = sum(
+                (
+                    row.actual_total
+                    if row.status == "settled" and row.actual_total is not None
+                    else row.reserved_total
+                )
+                for row in rows
+                if row.question_id == item.question_id
+                and row.status in {"reserved", "uncertain", "settled"}
+            )
+            floor = max(minimum_call, _as_int(floors.get(item.question_id, 0)))
+            future_reserve += max(0, floor - committed)
+        if available - requested < future_reserve:
+            return False, "source_continuation_future_first_pass_reserve", future_reserve
+        return True, "bounded_source_continuation", future_reserve
+
     async def reserve_model_tokens(
         self,
         run_id: UUID,
@@ -1342,6 +1460,7 @@ class ResearchToolRepository:
         max_output: int,
         lease_until: datetime | None = None,
         minimum_call_tokens: int | None = None,
+        continuation_page: Mapping[str, str] | None = None,
     ) -> ModelTokenReservation:
         """Atomically reserve tokens for one provider attempt before it starts.
 
@@ -1365,6 +1484,8 @@ class ResearchToolRepository:
                 return ModelTokenReservation(False, 0, existing.status, "attempt_already_terminal")
             maximum = int(run.budget_snapshot.get("max_tokens", 0) or 0)
             borrowed_question_tokens = 0
+            continuation_allowed = False
+            future_reserve = 0
             recovery_context: dict[str, object] | None = None
             if maximum > 0:
                 available = (
@@ -1422,6 +1543,39 @@ class ResearchToolRepository:
                     return ModelTokenReservation(
                         False, 0, "insufficient_budget", "protected_token_pools"
                     )
+                if continuation_page is not None and node == "evidence_extractor":
+                    (
+                        continuation_allowed,
+                        continuation_reason,
+                        future_reserve,
+                    ) = await self._source_continuation_gate(
+                        session,
+                        run,
+                        question_id=question_id,
+                        page=continuation_page,
+                        minimum_call=minimum_call_tokens or requested,
+                        requested=requested,
+                        available=min(
+                            available - protected_reserve,
+                            pool_limit - pool_committed[pool_name] if pool_limit > 0 else available,
+                        ),
+                    )
+                    if not continuation_allowed:
+                        await self._append_event(
+                            session,
+                            run,
+                            event_type="budget.question_borrow_denied",
+                            public_summary="后续来源未满足有界预算或执行状态要求。",
+                            refs={"question_id": question_id},
+                            metrics={
+                                "allowed": False,
+                                "reason": continuation_reason,
+                                "future_question_reserve_tokens": future_reserve,
+                            },
+                        )
+                        return ModelTokenReservation(
+                            False, 0, "question_budget_yielded", continuation_reason
+                        )
                 question_limits = (
                     allocation.get("question_token_budgets", {})
                     if isinstance(allocation, dict)
@@ -1762,6 +1916,7 @@ class ResearchToolRepository:
                             expected_utility=utility,
                             low_gain_streak=low_streak,
                             has_untried_query_family=has_untried_query_family,
+                            source_continuation=continuation_allowed,
                         )
                         if not borrow_decision.allowed:
                             usage = dict(run.usage_snapshot)
@@ -1863,6 +2018,23 @@ class ResearchToolRepository:
                             tokens_reserved=0,
                             reason=borrow_decision.reason,
                         )
+            if continuation_allowed:
+                await self._append_event(
+                    session,
+                    run,
+                    event_type="budget.source_continuation_reserved",
+                    public_summary="已为另一份合格已读来源预留一次有界抽取机会。",
+                    refs={
+                        "question_id": question_id,
+                        "attempt_id": str(attempt_id),
+                        "url": continuation_page["url"],
+                        "content_hash": continuation_page["content_hash"],
+                    },
+                    metrics={
+                        "future_question_reserve_tokens": future_reserve,
+                        "requested_tokens": requested,
+                    },
+                )
             now = datetime.now(UTC)
             session.add(
                 ModelBudgetReservationRow(
@@ -4824,6 +4996,7 @@ class ResearchToolRepository:
         provider_productive: int = 0,
         latency_ms: int = 0,
         executed_provider: str | None = None,
+        health_already_recorded: bool = False,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -4966,14 +5139,15 @@ class ResearchToolRepository:
             failing_candidate = (
                 provider if provider in candidates else (candidates[0] if candidates else provider)
             )
-            await self._record_provider_health_and_routing(
-                session,
-                run,
-                target,
-                failing_provider=failing_candidate,
-                failure_type=failure_type,
-                succeeding_providers=(),
-            )
+            if not health_already_recorded:
+                await self._record_provider_health_and_routing(
+                    session,
+                    run,
+                    target,
+                    failing_provider=failing_candidate,
+                    failure_type=failure_type,
+                    succeeding_providers=(),
+                )
             await self._append_event(
                 session,
                 run,
@@ -5054,6 +5228,7 @@ class ResearchToolRepository:
             provider_switches_used=_as_int(updated_usage.get("provider_retry_count", 0)),
         )
         routing_refs: dict[str, object] = {
+            "decision_scope": "next_attempt_only",
             "provider_name": decision.selected_provider or "",
             "selected_provider": decision.selected_provider or "",
             "previous_state": None,
@@ -5118,6 +5293,7 @@ class ResearchToolRepository:
         *,
         worker_task_id: str,
         target: ResearchTarget,
+        excluded_providers: tuple[str, ...] = (),
     ) -> ProviderSelectionDecision:
         """Return the current health-aware provider selection for one attempt.
 
@@ -5143,7 +5319,61 @@ class ResearchToolRepository:
                 is_feedback=target.feedback_id is not None,
                 feedback_execution_id=target.feedback_execution_id,
                 provider_switches_used=_as_int(run.usage_snapshot.get("provider_retry_count", 0)),
+                already_excluded=excluded_providers,
             )
+
+    async def record_provider_execution_completed(
+        self,
+        run_id: UUID,
+        *,
+        worker_task_id: str,
+        target: ResearchTarget,
+        provider: str,
+        provider_requests: int,
+        fallback: bool,
+        error: ToolExecutionError | None = None,
+        will_fallback: bool = False,
+    ) -> None:
+        """A selection is not proof of HTTP; persist the adapter's actual count."""
+        async with self._sessions() as session, session.begin():
+            run = await self._locked_run(session, run_id, worker_task_id)
+            await self._append_event(
+                session,
+                run,
+                event_type="provider.execution.completed",
+                public_summary="Provider 执行尝试已结束, 已记录实际 HTTP 调用数。",
+                refs={
+                    "question_id": target.question_id,
+                    "selected_provider": provider,
+                    "attempted_provider": provider if provider_requests > 0 else None,
+                    "fallback_attempted": fallback and provider_requests > 0,
+                    "fallback_result": (
+                        "not_attempted"
+                        if provider_requests == 0
+                        else "failed"
+                        if error is not None
+                        else "succeeded"
+                    )
+                    if fallback
+                    else "not_applicable",
+                    "error_code": error.code if error is not None else None,
+                },
+                metrics={"provider_requests": provider_requests},
+            )
+            # Intermediate failure affects routing, but is not another logical
+            # query and must not charge the query/HTTP counters twice.
+            if error is not None and will_fallback:
+                await self._record_provider_health_and_routing(
+                    session,
+                    run,
+                    target,
+                    failing_provider=provider,
+                    failure_type=classify_provider_failure(
+                        error_code=error.code,
+                        details=error.details,
+                    ),
+                    succeeding_providers=(),
+                )
 
     async def record_provider_execution_started(
         self,
@@ -5169,7 +5399,7 @@ class ResearchToolRepository:
                 session,
                 run,
                 event_type="provider.execution.started",
-                public_summary="Provider Executor 按路由决策发起真实调用。",
+                public_summary="Provider 执行尝试开始; 实际 HTTP 调用由完成事件确认。",
                 refs={
                     "provider_name": decision.selected_provider,
                     "selected_provider": decision.selected_provider,

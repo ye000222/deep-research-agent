@@ -67,7 +67,7 @@ async def test_bing_fallback_success_does_not_recover_searxng() -> None:
         results = await provider.search(
             "industrial inspection",
             limit=1,
-            max_provider_requests=1,
+            max_provider_requests=2,
         )
 
     assert results

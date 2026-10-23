@@ -561,10 +561,27 @@ class ReportRepository:
                 )
                 or 0
             )
+            rejection_counts = {
+                str(reason or "unclassified_validation_rejection"): int(count)
+                for reason, count in (
+                    await session.execute(
+                        select(ResearchEvidenceRow.rejection_reason, func.count())
+                        .where(
+                            ResearchEvidenceRow.run_id == run_id,
+                            ResearchEvidenceRow.accepted.is_(False),
+                        )
+                        .group_by(ResearchEvidenceRow.rejection_reason)
+                    )
+                ).all()
+            }
             if readable or started or pages or completed:
                 if completed or pages:
                     detail_code = "EVIDENCE_VALIDATION_EMPTY"
-                    cause = "no_candidate_passed_provenance_validation"
+                    cause = (
+                        next(iter(rejection_counts))
+                        if len(rejection_counts) == 1
+                        else "evidence_validation_rejected"
+                    )
                     if completed and candidate_total == 0:
                         cause = "extraction_returned_no_candidates"
                 else:
@@ -606,6 +623,7 @@ class ReportRepository:
                     "extraction_started": started,
                     "extraction_completed": completed,
                     "candidate_evidence": candidate_total,
+                    "validation_rejections": rejection_counts,
                 },
             )
 

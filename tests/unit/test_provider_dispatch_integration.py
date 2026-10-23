@@ -13,6 +13,7 @@ requires:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -67,6 +68,7 @@ class DispatchRepository(FakeRepository):
 
     def __init__(self, decision: ProviderSelectionDecision) -> None:
         super().__init__()
+        self.target = replace(self.target, provider_request_allowance=3)
         self._decision = decision
         self.execution_started_providers: list[str] = []
         self.recorded_search_providers: list[str | None] = []
