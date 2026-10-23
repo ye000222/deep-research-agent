@@ -30,6 +30,7 @@ from app.domain.recovery_execution import RecoveryContext
 from app.domain.research_context_enricher import ResearchContextEnricher
 from app.domain.research_tools import ReadPage, SearchResult
 from app.domain.source_policy import is_stable_read_url, normalize_source_url, source_owner_key
+from app.domain.source_text_quality import assess_text_quality
 from app.infrastructure.artifacts import LocalArtifactStore
 from app.infrastructure.db.research_tools import (
     IterationEvaluation,
@@ -1379,15 +1380,17 @@ class ResearchLoopService:
                 target.cheap_triage_enabled
                 or zero_candidate_seen
                 or len(page.clean_text.strip()) < 300
+                or not assess_text_quality(page.clean_text).accepted
             ):
                 triage = cheap_triage(
-                    question="\n".join(filter(None, (target.original_goal, target.question))),
+                    question=target.question,
                     criteria=tuple(criterion for _key, criterion in target.acceptance_dimensions),
                     query_hints=tuple(
                         value for value in (target.query, target.alternate_query) if value
                     ),
                     text=page.clean_text,
                     url=page.final_url,
+                    title=page.title,
                 )
                 if not triage.accepted:
                     await record_selection_event(
@@ -1644,6 +1647,7 @@ class ResearchLoopService:
                         detail_code=exc.detail_code,
                         usage=exc.usage,
                         attempt_id=attempt_id,
+                        output_diagnostics=exc.diagnostics,
                     )
                 except Exception:
                     await cleanup_attempt(attempt_id, uncertain=True)

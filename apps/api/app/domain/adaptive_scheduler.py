@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import urlsplit
 
+from app.domain.passage_relevance import events, passage_score
+from app.domain.source_text_quality import assess_text_quality
+
 
 class QueryFamily(StrEnum):
     SCOPE = "scope"
@@ -237,6 +240,7 @@ class TriageResult:
     score: float
     reason: str
     source_role: str
+    evidence_role: str = "background_only"
 
 
 _INJECTION_RE = re.compile(
@@ -266,12 +270,15 @@ def cheap_triage(
     query_hints: tuple[str, ...] = (),
     text: str,
     url: str,
+    title: str = "",
 ) -> TriageResult:
     """Reject obvious low-yield pages without invoking a model."""
 
     role = classify_source_role(url, text=text[:2_000])
     if len(text.strip()) < 300:
         return TriageResult(False, 0.0, "body_too_short", role)
+    if not assess_text_quality(text).accepted:
+        return TriageResult(False, 0.0, "corrupt_text", role)
     if _INJECTION_RE.search(text[:20_000]):
         return TriageResult(False, 0.0, "prompt_injection_detected", role)
     if _LOW_VALUE_RE.search(text[:4_000]) and len(text) < 2_000:
@@ -280,7 +287,12 @@ def cheap_triage(
     # English. Include the exact bilingual search anchors that retrieved the
     # page; otherwise a relevant paper is deterministically rejected before
     # the model ever sees it.
-    objective = _tokens(" ".join((question, *criteria, *query_hints)))
+    # Question grammar is not a topical requirement. Keep this normalization
+    # local to triage: never change the validator's entailment/token rules.
+    objective = _tokens(" ".join((question, *criteria, *query_hints))) - {
+        "which", "what", "when", "where", "how", "is", "are", "was", "were",
+        "the", "a", "an", "to", "of", "for", "does", "did", "do", "can", "please",
+    }
     observed = _tokens(text[:40_000])
     overlap = len(objective & observed) / max(1, min(12, len(objective)))
     traceability = 1.0 if _traceability_markers(text) >= 2 else 0.6
@@ -296,8 +308,16 @@ def cheap_triage(
         "aggregator": 0.35,
     }.get(role, 0.55)
     score = round(min(1.0, 0.65 * overlap + 0.20 * traceability + 0.15 * role_score), 4)
+    relevance, evidence_role = passage_score(text, question)
+    if events(question):
+        if evidence_role in {"direct", "supporting"}:
+            # Title can help ranking only after the body supplies task signals.
+            title_score, _ = passage_score(title, question)
+            score = round(max(score, 0.8 * relevance + 0.2 * title_score), 4)
+        else:
+            score = min(score, relevance)
     return TriageResult(
-        score >= 0.42, score, "accepted" if score >= 0.42 else "topic_mismatch", role
+        score >= 0.42, score, "accepted" if score >= 0.42 else "topic_mismatch", role, evidence_role
     )
 
 

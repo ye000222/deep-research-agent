@@ -23,6 +23,7 @@ from app.domain.document_evidence_context import (
     SourceLocatorType,
 )
 from app.domain.research_tools import ReadPage
+from app.domain.source_text_quality import assess_text_quality, decode_html
 from app.tools.errors import ToolExecutionError
 
 _MAX_DOWNLOAD_BYTES = 2_000_000
@@ -247,6 +248,7 @@ class PublicWebReader:
             citation_abstract = ""
             source_segments: tuple[DocumentSourceSegment, ...] = ()
             truncation_reason: str | None = None
+            decoding: dict[str, str | bool | float] = {}
             events.append(
                 self._event(
                     "source.parse_started",
@@ -264,7 +266,7 @@ class PublicWebReader:
                     if pdf_page_limit_hit:
                         truncation_reason = "PDF_PAGE_LIMIT"
                 else:
-                    html = body.decode(encoding, errors="replace")
+                    html, decoding = decode_html(body, encoding)
                     metadata_parser = _MetadataParser()
                     metadata_parser.feed(html[:200_000])
                     try:
@@ -382,6 +384,20 @@ class PublicWebReader:
                 )
                 self._finish_events(requested_url, events)
                 raise ToolExecutionError("WEBPAGE_EXTRACTION_EMPTY", retryable=False)
+            quality = assess_text_quality(substantive_text)
+            if not quality.accepted:
+                events.append(
+                    self._event(
+                        "source.content_quality_rejected",
+                        requested_url=requested_url,
+                        current_url=current,
+                        stage="content",
+                        reason="corrupt_text",
+                        metrics={**decoding, **quality.metrics()},
+                    )
+                )
+                self._finish_events(requested_url, events)
+                raise ToolExecutionError("WEBPAGE_TEXT_QUALITY_REJECTED", retryable=False)
             events.append(
                 self._event(
                     "source.content_quality_passed",
@@ -391,6 +407,8 @@ class PublicWebReader:
                     metrics={
                         "clean_chars": len(clean_extracted),
                         "substantive_chars": len(substantive_text),
+                        **decoding,
+                        **quality.metrics(),
                     },
                 )
             )

@@ -1,7 +1,9 @@
 """Original-text windows with offsets and deterministic query-aware MMR ranks."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from app.domain.passage_relevance import passage_score
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,35 @@ class SourceWindow:
     heading: str | None = None
     char_start: int = -1
     char_end: int = -1
+
+
+def pack_source_windows(
+    windows: list[SourceWindow], *, max_tokens: int, limit: int = 8
+) -> list[SourceWindow]:
+    """Token-aware, verbatim packing. Never summarize or join noncontiguous quotes."""
+    selected: list[SourceWindow] = []
+    remaining = max(0, max_tokens)
+    for window in windows:
+        if len(selected) >= limit or remaining <= 0:
+            break
+        if any(window.start < other.end and other.start < window.end for other in selected):
+            continue
+        # Same estimator as ContextBudgetManager; allow for separators.
+        available_chars = max(0, (remaining - 1) * 3)
+        content = window.content[:available_chars]
+        if len(content) < min(90, len(window.content)):
+            continue
+        selected.append(
+            replace(
+                window,
+                end=window.start + len(content),
+                content=content,
+                char_start=window.start,
+                char_end=window.start + len(content),
+            )
+        )
+        remaining -= (len(content) + 2) // 3 + 1
+    return selected
 
 
 def terms(text: str) -> set[str]:
@@ -122,6 +153,7 @@ def select_relevant_blocks(
     *,
     limit: int = 64,
     expand_neighbors: int = 0,
+    ranked: bool = False,
 ) -> list[SourceWindow]:
     """Block-aware relevance selection with table-heading and neighbor support.
 
@@ -134,6 +166,14 @@ def select_relevant_blocks(
     if limit <= 0:
         raise ValueError("positive limit required")
     blocks = _split_blocks(text)
+    if ranked:
+        # Scan the entire canonical document, not the first N paragraphs.
+        # Oversized paragraphs must not swallow the context budget as one item.
+        blocks = [
+            (start + offset, min(end, start + offset + 900), content[offset : offset + 900])
+            for start, end, content in blocks
+            for offset in range(0, len(content), 800)
+        ]
     if not blocks:
         return []
     queries = [terms(q) for q in objectives if q.strip()]
@@ -152,17 +192,16 @@ def select_relevant_blocks(
         ]
     block_terms = [terms(blocks[i][2]) for i in range(len(blocks))]
     relevance = [
-        max((len(block_terms[i] & q) / max(1, len(q)) for q in queries), default=0.0)
+        max((passage_score(blocks[i][2], q)[0] for q in objectives), default=0.0)
+        if ranked
+        else max((len(block_terms[i] & q) / max(1, len(q)) for q in queries), default=0.0)
         for i in range(len(blocks))
     ]
 
     def overlap(i: int, selected: list[int]) -> float:
         bi = block_terms[i]
         return max(
-            (
-                len(bi & block_terms[j]) / max(1, len(bi | block_terms[j]))
-                for j in selected
-            ),
+            (len(bi & block_terms[j]) / max(1, len(bi | block_terms[j])) for j in selected),
             default=0.0,
         )
 
@@ -197,5 +236,7 @@ def select_relevant_blocks(
             char_start=blocks[i][0],
             char_end=blocks[i][1],
         )
-        for i in sorted(selected)
+        for i in (
+            sorted(selected, key=lambda i: (-relevance[i], i)) if ranked else sorted(selected)
+        )
     ]

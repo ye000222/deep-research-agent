@@ -13,8 +13,8 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
-from app.context.manager import ContextBudgetManager
-from app.context.source_selector import select_relevant_blocks
+from app.context.manager import ContextBudgetManager, allocate_budget, estimate_tokens
+from app.context.source_selector import pack_source_windows, select_relevant_blocks
 from app.core.config import get_settings
 from app.core.stage_timing import stage_timer, timed_call
 from app.domain.adaptive_scheduler import (
@@ -39,6 +39,7 @@ from app.domain.document_evidence_context import (
     processing_chunk_for_range,
 )
 from app.domain.evidence_input_quality import assess_candidate, select_supporting_quote
+from app.domain.passage_relevance import passage_score
 from app.domain.providers import (
     CanonicalModelRequest,
     ContentPart,
@@ -65,7 +66,7 @@ _COMPACT_OUTPUT_TOKENS = 1_800
 _COMPACT_INPUT_TOKENS = 3_000
 _MIN_RETRY_TOKEN_BUDGET = 2_400
 _EXTRACTOR_MIN_OUTPUT_TOKENS = 768
-_EXTRACTOR_VERSION = "evidence_extractor.v3"
+_EXTRACTOR_VERSION = "evidence_extractor.v4.passage_input"
 _MIN_ACCEPTED_EVIDENCE_SCORE = 0.78
 _MIN_SOURCE_RELIABILITY = 0.65
 _MIN_EVIDENCE_RELEVANCE = 0.80
@@ -277,11 +278,35 @@ class EvidenceExtractorService:
                 page.clean_text,
                 (question, *(criterion for _, criterion in acceptance_dimensions)),
                 limit=_MAX_SOURCE_CONTEXT_CHUNKS,
-                expand_neighbors=1,
+                expand_neighbors=0,
+                ranked=True,
             )
             if binding.relevant_chunks_enabled
             else []
         )
+        if relevant_windows:
+            source_input_cap = (
+                allocate_budget(
+                    context_window=binding.context_window,
+                    requested_output_tokens=output_tokens,
+                    provider_max_output_tokens=binding.max_output_tokens,
+                    max_input_tokens=input_token_cap,
+                ).input_budget
+                if self._contexts is not None
+                else input_token_cap
+            )
+            protected_tokens = sum(
+                estimate_tokens(value)
+                for value in (
+                    instructions,
+                    task_brief,
+                    json.dumps(response_contract, ensure_ascii=False),
+                )
+            )
+            relevant_windows = pack_source_windows(
+                relevant_windows,
+                max_tokens=max(0, source_input_cap - protected_tokens - 8),
+            )
         if relevant_windows and self._contexts is None:
             chosen = relevant_windows[:4]
             selected_chunks = tuple(
@@ -338,7 +363,11 @@ class EvidenceExtractorService:
                     ContextCandidate(
                         item_type=ContextItemType.SOURCE_CHUNK,
                         content=chunk,
-                        rank_score=max(0.01, 1.0 - index * 0.01),
+                        rank_score=(
+                            max(0.01, relevant_windows[index].score)
+                            if relevant_windows
+                            else max(0.01, 1.0 - index * 0.01)
+                        ),
                         source_ref_type="source",
                         # Context manifests should refer to the persisted source
                         # entity, not an unbounded URL. Keep the URL fallback for
@@ -519,9 +548,13 @@ class EvidenceExtractorService:
                 except ModelGatewayError as retry_exc:
                     raise _combined_gateway_error(exc, retry_exc) from retry_exc
         usage = _combine_optional_usage(prior_usage, result.usage)
+        initial_raw_count = _raw_candidate_count(result.parsed_object)
+        final_raw_count = initial_raw_count
+        output_repaired = False
         try:
             batch = EvidenceBatch.model_validate(result.parsed_object)
         except ValidationError as exc:
+            output_repaired = True
             strategy = result.capability_strategy.get("structured_output", "")
             if strategy.endswith("_regenerated_once"):
                 raise ModelGatewayError(
@@ -585,6 +618,7 @@ class EvidenceExtractorService:
                 raise ModelGatewayError(
                     "EVIDENCE_OUTPUT_SCHEMA_INVALID", retryable=False, usage=usage
                 ) from repair_exc
+            final_raw_count = _raw_candidate_count(repair_result.parsed_object)
 
         if (
             not batch.items
@@ -648,6 +682,7 @@ class EvidenceExtractorService:
                 truncated = len(selected_text) < len(page.clean_text)
                 if rescue_batch.items:
                     batch = rescue_batch
+                    final_raw_count = _raw_candidate_count(rescue_result.parsed_object)
 
         with stage_timer("evidence.local_validation", run_id=run_id):
             scored = self._score_batch(
@@ -703,7 +738,32 @@ class EvidenceExtractorService:
             "processing_coverage_complete": _windows_cover_document(
                 selected_windows, len(page.clean_text)
             ),
-            "processing_window_manifest": _processing_window_manifest(selected_windows),
+            "processing_window_manifest": _processing_window_manifest(
+                selected_windows, document_text=page.clean_text
+            ),
+            "selected_passage_count": len(selected_windows),
+            "selected_tokens_estimate": estimate_tokens(selected_text),
+            "passage_ranking_scores": json.dumps(
+                [round(passage_score(w.text, question)[0], 4) for w in selected_windows]
+            ),
+            "input_passage_low_relevance": max(
+                (passage_score(w.text, question)[0] for w in selected_windows), default=0.0
+            )
+            < 0.3,
+            "extraction_output_parse_status": "repaired_schema_valid"
+            if output_repaired
+            else "schema_valid",
+            "raw_candidate_count": final_raw_count,
+            "initial_raw_candidate_count": initial_raw_count,
+            "schema_valid_candidate_count": len(batch.items),
+            "pre_validation_dropped_count": 0,
+            "zero_candidate_reason": (
+                "not_applicable"
+                if batch.items
+                else "no_claim_found"
+                if final_raw_count == 0
+                else "unknown"
+            ),
             **localized_counts,
         }
         return scored, usage, manifest
@@ -830,11 +890,22 @@ class EvidenceExtractorService:
 
     async def _timed_model_request(self, **kwargs: Any) -> Any:
         request = kwargs["request"]
-        return await timed_call(
-            "llm.evidence_request",
-            self._gateway.generate_structured(**kwargs),
-            run_id=request.metadata.get("run_id"),
-        )
+        try:
+            return await timed_call(
+                "llm.evidence_request",
+                self._gateway.generate_structured(**kwargs),
+                run_id=request.metadata.get("run_id"),
+            )
+        except ModelGatewayError as exc:
+            exc.diagnostics["zero_candidate_reason"] = {
+                "MODEL_OUTPUT_TRUNCATED": "model_output_truncated",
+                "MODEL_OUTPUT_INVALID": "structured_output_parse_failed",
+                "EVIDENCE_OUTPUT_SCHEMA_INVALID": "candidate_schema_invalid",
+                "MODEL_EMPTY_RESPONSE": "empty_model_output",
+            }.get(exc.code, "unknown")
+            if exc.detail_code == "PARSE_EMPTY_RESPONSE":
+                exc.diagnostics["zero_candidate_reason"] = "empty_model_output"
+            raise
 
     @staticmethod
     def _cache_key(
@@ -904,17 +975,41 @@ class EvidenceExtractorService:
         reason: str,
         max_input_tokens: int = _COMPACT_INPUT_TOKENS,
     ) -> tuple[CanonicalModelRequest, str]:
+        instructions = (
+            f"{EXTRACTOR_INSTRUCTIONS}\n"
+            "这是紧凑补救抽取: 仅返回与问题直接相关的 1 至 2 条证据。"
+            '如果没有逐字证据, 返回 {"items": []}。'
+        )
+        compact_input_cap = (
+            allocate_budget(
+                context_window=binding.context_window,
+                requested_output_tokens=output_tokens,
+                provider_max_output_tokens=binding.max_output_tokens,
+                max_input_tokens=max_input_tokens,
+            ).input_budget
+            if self._contexts is not None
+            else max_input_tokens
+        )
+        protected_tokens = sum(
+            estimate_tokens(value)
+            for value in (
+                instructions,
+                task_brief,
+                json.dumps(EvidenceBatch.model_json_schema(), ensure_ascii=False),
+            )
+        )
         compact_text = _select_compact_source_text(
             page.clean_text,
             question=question,
             acceptance_dimensions=acceptance_dimensions,
+            max_tokens=max(0, min(2000, compact_input_cap - protected_tokens - 8)),
         )
         manifest_id = uuid4()
         if self._contexts is not None:
             candidates = [
                 ContextCandidate(
                     item_type=ContextItemType.INSTRUCTION,
-                    content=EXTRACTOR_INSTRUCTIONS,
+                    content=instructions,
                     rank_score=1.0,
                     protected=True,
                     selected_reason_code="node_policy_required",
@@ -957,11 +1052,6 @@ class EvidenceExtractorService:
             manifest_id = envelope.manifest_id
             selected = envelope.selected_by_type(ContextItemType.SOURCE_CHUNK)
             compact_text = "\n".join(item.content for item in selected)
-        instructions = (
-            f"{EXTRACTOR_INSTRUCTIONS}\n"
-            "这是紧凑补救抽取: 仅返回与问题直接相关的 1 至 2 条证据。"
-            '如果没有逐字证据, 返回 {"items": []}。'
-        )
         return (
             CanonicalModelRequest(
                 task_kind="evidence_extraction_compact",
@@ -1143,29 +1233,32 @@ def _scope_mismatch(candidate: object, dimensions: dict[str, str]) -> bool:
     return any(token not in observed_text for token in required)
 
 
+def _raw_candidate_count(payload: object) -> int:
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        return len(payload["items"])
+    return -1  # unavailable, not a fabricated empty list
+
+
 def _select_compact_source_text(
     text: str,
     *,
     question: str,
     acceptance_dimensions: tuple[tuple[str, str], ...],
+    max_tokens: int = 2000,
 ) -> str:
-    chunks = [
-        text[index : index + _SOURCE_CONTEXT_CHUNK_CHARS]
-        for index in range(0, len(text), _SOURCE_CONTEXT_CHUNK_CHARS)
-    ]
-    if not chunks:
-        return text
-    objective = " ".join([question, *(criterion for _key, criterion in acceptance_dimensions)])
-    objective_tokens = _relevance_tokens(objective)
-    ranked = sorted(
-        enumerate(chunks),
-        key=lambda entry: (
-            -len(objective_tokens & _relevance_tokens(entry[1])),
-            entry[0],
-        ),
+    windows = select_relevant_blocks(
+        text,
+        (question, *(value for _, value in acceptance_dimensions)),
+        ranked=True,
     )
-    selected_indexes = sorted(index for index, _chunk in ranked[:_COMPACT_SOURCE_CHUNKS])
-    return "\n".join(chunks[index] for index in selected_indexes)
+    return "\n".join(
+        w.content
+        for w in pack_source_windows(
+            windows,
+            max_tokens=max_tokens,
+            limit=_COMPACT_SOURCE_CHUNKS,
+        )
+    )
 
 
 def _compact_mapped_windows(
@@ -1177,27 +1270,46 @@ def _compact_mapped_windows(
     source_id: UUID | None,
 ) -> tuple[MappedTextWindow, ...]:
     del source_id  # document identity already binds the source and snapshot.
-    chunk_count = (document.canonical_text_length + _SOURCE_CONTEXT_CHUNK_CHARS - 1) // (
-        _SOURCE_CONTEXT_CHUNK_CHARS
-    )
-    chunks = build_processing_chunks(
-        document,
-        chunk_chars=_SOURCE_CONTEXT_CHUNK_CHARS,
-        max_chunks=max(1, chunk_count),
-    )
-    objective = " ".join([question, *(criterion for _, criterion in acceptance_dimensions)])
-    objective_tokens = _relevance_tokens(objective)
-    ranked = sorted(
-        enumerate(chunks),
-        key=lambda entry: (
-            -len(objective_tokens & _relevance_tokens(entry[1].text)),
-            entry[0],
+    windows = pack_source_windows(
+        select_relevant_blocks(
+            document.canonical_text,
+            (question, *(value for _, value in acceptance_dimensions)),
+            ranked=True,
         ),
+        max_tokens=2000,
+        limit=_COMPACT_SOURCE_CHUNKS,
     )
     selected = tuple(
-        chunks[index]
-        for index in sorted(index for index, _chunk in ranked[:_COMPACT_SOURCE_CHUNKS])
+        processing_chunk_for_range(
+            document,
+            start=window.start,
+            end=window.end,
+            ordinal=index,
+            chunking_version="compact-ranked.v2",
+        )
+        for index, window in enumerate(windows)
     )
+    # A smaller compact budget can keep only a verbatim prefix of the ranked
+    # selection. Rebuild each retained range, never map a rewritten summary.
+    full_text = "\n".join(chunk.text for chunk in selected)
+    if selected_text and full_text.startswith(selected_text):
+        retained = []
+        remaining = len(selected_text)
+        for chunk in selected:
+            if remaining <= 0:
+                break
+            size = min(len(chunk.text), remaining)
+            retained.append(
+                processing_chunk_for_range(
+                    document,
+                    start=chunk.canonical_start,
+                    end=chunk.canonical_start + size,
+                    ordinal=len(retained),
+                    chunking_version="compact-ranked.v2",
+                )
+            )
+            remaining -= size + 1
+        selected = tuple(retained)
     if "\n".join(chunk.text for chunk in selected) != selected_text:
         return (
             MappedTextWindow(
@@ -1222,10 +1334,12 @@ def _mapped_context_item(
         if chunk is not None:
             # Context compression keeps provenance refs but changes text. The
             # canonical mapper rejects the mismatch rather than guessing offsets.
+            offset = chunk.text.find(content)
+            contiguous = offset >= 0 and chunk.text.find(content, offset + 1) < 0
             return MappedTextWindow(
                 text=content,
-                canonical_start=chunk.canonical_start,
-                canonical_end=chunk.canonical_end,
+                canonical_start=chunk.canonical_start + offset if contiguous else -1,
+                canonical_end=chunk.canonical_start + offset + len(content) if contiguous else -1,
                 chunk_ref=chunk.chunk_ref,
                 selection_reason=selection_reason,
             )
@@ -1238,7 +1352,9 @@ def _mapped_context_item(
     )
 
 
-def _processing_window_manifest(windows: tuple[MappedTextWindow, ...]) -> str:
+def _processing_window_manifest(
+    windows: tuple[MappedTextWindow, ...], *, document_text: str = ""
+) -> str:
     return json.dumps(
         [
             {
@@ -1247,13 +1363,24 @@ def _processing_window_manifest(windows: tuple[MappedTextWindow, ...]) -> str:
                 "canonical_end": window.canonical_end,
                 "selection_reason": window.selection_reason,
                 "mapping_status": "MAPPED" if window.canonical_start >= 0 else "UNMAPPED",
+                "input_rank": rank,
+                "section_heading": _preceding_heading(document_text, window.canonical_start),
             }
-            for window in windows
+            for rank, window in enumerate(windows, 1)
         ],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _preceding_heading(text: str, start: int) -> str | None:
+    if start < 0:
+        return None
+    for line in reversed(text[max(0, start - 300) : start].splitlines()[-4:]):
+        if line.strip() and len(line.strip()) <= 80:
+            return line.strip()
+    return None
 
 
 def _attach_canonical_spans(
@@ -1274,11 +1401,16 @@ def _attach_canonical_spans(
         ambiguous += result.status is LocalizationStatus.AMBIGUOUS
         unmapped += result.status is LocalizationStatus.UNMAPPED_INPUT
         not_found += result.status is LocalizationStatus.NOT_FOUND
-        attached.append(
-            item.model_copy(
-                update={"canonical_span": result.span, "localization_status": result.status}
+        update = {"canonical_span": result.span, "localization_status": result.status}
+        if item.accepted and result.status is not LocalizationStatus.LOCATED:
+            update.update(
+                accepted=False,
+                rejection_reason={
+                    LocalizationStatus.AMBIGUOUS: "quote_localization_ambiguous",
+                    LocalizationStatus.UNMAPPED_INPUT: "quote_localization_unmapped",
+                }.get(result.status, "quote_not_in_selected_passages"),
             )
-        )
+        attached.append(item.model_copy(update=update))
     return attached, {
         "canonical_span_localized_count": localized,
         "canonical_span_ambiguous_count": ambiguous,

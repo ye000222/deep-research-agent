@@ -6864,6 +6864,21 @@ class ResearchToolRepository:
                             "document_representation_complete"
                         ),
                         "selected_text_length": context_manifest.get("selected_chars"),
+                        **{
+                            key: context_manifest.get(key)
+                            for key in (
+                                "selected_passage_count",
+                                "selected_tokens_estimate",
+                                "passage_ranking_scores",
+                                "input_passage_low_relevance",
+                                "extraction_output_parse_status",
+                                "raw_candidate_count",
+                                "initial_raw_candidate_count",
+                                "schema_valid_candidate_count",
+                                "pre_validation_dropped_count",
+                                "zero_candidate_reason",
+                            )
+                        },
                         "chunk_count": context_manifest.get("chunk_count"),
                         "selected_chunk_count": context_manifest.get("selected_chunk_count"),
                         "processing_chunk_count": context_manifest.get("processing_chunk_count"),
@@ -7626,6 +7641,7 @@ class ResearchToolRepository:
         detail_code: str | None = None,
         usage: TokenUsage | None = None,
         attempt_id: UUID | None = None,
+        output_diagnostics: Mapping[str, object] | None = None,
     ) -> None:
         async with self._sessions() as session, session.begin():
             run = await self._locked_run(session, run_id, worker_task_id)
@@ -7764,8 +7780,8 @@ class ResearchToolRepository:
                 },
                 metrics={
                     "source_chars": len(page.clean_text),
-                    "selected_chars": min(len(page.clean_text), 14_000),
-                    "truncated": len(page.clean_text) > 14_000,
+                    "selected_chars": (output_diagnostics or {}).get("selected_chars"),
+                    "truncated": None,
                 },
             )
             await self._append_event(
@@ -7804,6 +7820,37 @@ class ResearchToolRepository:
                     reason_codes=(() if normalized_reason is None else (normalized_reason,)),
                     raw_reason=error_code,
                     upstream_refs=(candidate.candidate_id, str(source_id)),
+                    facts={
+                        "extraction_output_parse_status": "failed",
+                        "selected_passage_count": None,
+                        "selected_chars": None,
+                        "selected_tokens_estimate": None,
+                        "passage_ranking_scores": None,
+                        "raw_candidate_count": None,
+                        "schema_valid_candidate_count": None,
+                        "pre_validation_dropped_count": None,
+                        "zero_candidate_reason": "empty_model_output"
+                        if detail_code == "PARSE_EMPTY_RESPONSE" else {
+                            "MODEL_OUTPUT_TRUNCATED": "model_output_truncated",
+                            "MODEL_OUTPUT_INVALID": "structured_output_parse_failed",
+                            "EVIDENCE_OUTPUT_SCHEMA_INVALID": "candidate_schema_invalid",
+                            "MODEL_EMPTY_RESPONSE": "empty_model_output",
+                        }.get(error_code, "unknown"),
+                        **{
+                            key: value
+                            for key, value in (output_diagnostics or {}).items()
+                            if key
+                            in {
+                                "selected_passage_count",
+                                "selected_chars",
+                                "selected_tokens_estimate",
+                                "raw_candidate_count",
+                                "schema_valid_candidate_count",
+                                "pre_validation_dropped_count",
+                            }
+                            and isinstance(value, int)
+                        },
+                    },
                 ),
             )
 
